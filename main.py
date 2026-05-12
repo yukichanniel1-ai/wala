@@ -2773,13 +2773,15 @@ def _tg_send_buttons(token: str, chat_id, text: str, buttons: list, parse_mode: 
 def _tg_answer_callback(token: str, callback_id: str, text: str = ""):
     """Acknowledge an inline button press (removes the loading spinner)."""
     try:
-        _tg_session.post(
+        r = _tg_session.post(
             f"https://api.telegram.org/bot{token}/answerCallbackQuery",
             json={"callback_query_id": callback_id, "text": text},
-            timeout=10,
+            timeout=5,
         )
+        if r.status_code != 200:
+            logger.warning(f"[BOT] answerCallbackQuery HTTP {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        logger.debug(f"[BOT] answerCallbackQuery error (non-critical): {e}")
+        logger.warning(f"[BOT] answerCallbackQuery error: {e}")
 
 
 def _tg_delete_message(token: str, chat_id, message_id: int):
@@ -4949,8 +4951,8 @@ def _handle_proxy_upload(token: str, chat_id, from_user: dict, message: dict):
     document = message.get("document")
     text     = message.get("text", "").strip()
 
-    # ── /done — finish accumulation and save ──────────────────
-    if text.lower() in ("/done", "done"):
+    # ── /done or /proxy_done — finish accumulation and save ───
+    if text.lower() in ("/done", "done", "/proxy_done"):
         _flush_proxy_accumulator(token, chat_id)
         return
 
@@ -5341,10 +5343,17 @@ def _handle_callback_query(token: str, cq: dict):
     """Handle all inline button presses."""
     cq_id     = cq["id"]
     from_user = cq.get("from", {})
-    chat_id   = cq["message"]["chat"]["id"]
+    message   = cq.get("message")
     data      = cq.get("data", "")
 
+    # Always answer the callback FIRST to remove loading spinner
     _tg_answer_callback(token, cq_id)
+
+    if not message:
+        logger.warning(f"[BOT] Callback query with no message — cq_id={cq_id} data={data!r}")
+        return
+    chat_id = message["chat"]["id"]
+    logger.info(f"[BOT] 🔘 callback data={data!r} from={from_user.get('id')} chat={chat_id}")
 
     # ── Admin panel button routing ─────────────────────────────
     if data == "admin:genkey":
@@ -5426,7 +5435,7 @@ def _handle_callback_query(token: str, cq: dict):
         keys = _load_keys()
         now  = time.time()
         kb   = _build_deletekey_keyboard(keys, sel, now)
-        _tg_edit_message(token, chat_id, cq["message"]["message_id"],
+        _tg_edit_message(token, chat_id, message["message_id"],
             _deletekey_header(keys, sel, now), kb)
         return
 
@@ -5450,7 +5459,7 @@ def _handle_callback_query(token: str, cq: dict):
         elif action == "none":
             sel.clear()
         kb = _build_deletekey_keyboard(keys, sel, now)
-        _tg_edit_message(token, chat_id, cq["message"]["message_id"],
+        _tg_edit_message(token, chat_id, message["message_id"],
             _deletekey_header(keys, sel, now), kb)
         return
 
@@ -5473,7 +5482,7 @@ def _handle_callback_query(token: str, cq: dict):
         for k in deleted:
             lines.append(f"  🔑 <code>{k}</code>")
         lines.append(f"\n📊 <b>Remaining keys: {len(keys)}</b>")
-        _tg_edit_message(token, chat_id, cq["message"]["message_id"],
+        _tg_edit_message(token, chat_id, message["message_id"],
             "\n".join(lines), [])
         return
 
@@ -5481,7 +5490,7 @@ def _handle_callback_query(token: str, cq: dict):
     if data == "dk_cancel":
         if not _is_owner(from_user): return
         _deletekey_selection.pop(chat_id, None)
-        _tg_edit_message(token, chat_id, cq["message"]["message_id"],
+        _tg_edit_message(token, chat_id, message["message_id"],
             "❌ <b>Delete cancelled.</b> No keys were removed.", [])
         return
 
@@ -5582,14 +5591,14 @@ def _handle_callback_query(token: str, cq: dict):
             saved = _get_saved_profile(str(target_id))
             uname = saved.get("username", "") if saved else ""
             label = f"@{uname}" if uname else f"id:{target_id}"
-            _tg_edit_message(token, chat_id, cq["message"]["message_id"],
+            _tg_edit_message(token, chat_id, message["message_id"],
                 f"🛑 <b>Stop signal sent to {label}!</b>\n\n"
                 f"The checker will stop after the current batch finishes.",
                 []
             )
         else:
             _tg_answer_callback(token, cq_id, "ℹ️ That checker already stopped.")
-            _tg_edit_message(token, chat_id, cq["message"]["message_id"],
+            _tg_edit_message(token, chat_id, message["message_id"],
                 "ℹ️ <b>That checker has already finished or stopped.</b>", [])
         return
 
@@ -5603,7 +5612,7 @@ def _handle_callback_query(token: str, cq: dict):
             if not evt.is_set():
                 evt.set()
                 stopped_count += 1
-        _tg_edit_message(token, chat_id, cq["message"]["message_id"],
+        _tg_edit_message(token, chat_id, message["message_id"],
             f"☢️ <b>Stop ALL sent!</b>\n\n"
             f"Sent stop signal to <b>{stopped_count}</b> running checker(s).\n"
             f"They will stop after their current batch finishes.",
@@ -5613,7 +5622,7 @@ def _handle_callback_query(token: str, cq: dict):
 
     # ── Stop: cancel (dismiss panel) ──────────────────────────
     if data == "stop_cancel":
-        _tg_edit_message(token, chat_id, cq["message"]["message_id"],
+        _tg_edit_message(token, chat_id, message["message_id"],
             "✅ <b>Cancelled.</b> Checkers keep running.", [])
         return
 
@@ -5716,6 +5725,26 @@ def handle_bot_update(token: str, update: dict, _unused_config):
             pass
 
 
+def _parse_command(text: str):
+    """
+    Parse a Telegram command from text.
+    Returns (command, args) tuple. Command is lowercase without @botname suffix.
+    e.g. '/start@MyBot hello' -> ('start', 'hello')
+         '/generate_key 1d'   -> ('generate_key', '1d')
+         'hello'              -> ('', 'hello')
+    """
+    if not text or not text.startswith("/"):
+        return ("", text)
+    parts = text.split(None, 1)  # split on first whitespace
+    cmd_part = parts[0].lower()   # e.g. '/start@mybot'
+    args = parts[1] if len(parts) > 1 else ""
+    # Strip the leading '/' and any @botname suffix
+    cmd_part = cmd_part[1:]  # remove '/'
+    if "@" in cmd_part:
+        cmd_part = cmd_part.split("@")[0]
+    return (cmd_part, args.strip())
+
+
 def _handle_bot_update_inner(token: str, update: dict, _unused_config):
     # ── Inline button presses ──────────────────────────────────
     if update.get("callback_query"):
@@ -5729,6 +5758,10 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
     chat_id   = msg["chat"]["id"]
     from_user = msg.get("from", {})
     text      = msg.get("text", "").strip()
+    cmd, cmd_args = _parse_command(text)
+
+    if cmd:
+        logger.info(f"[BOT] 📩 cmd={cmd!r} args={cmd_args!r} from={from_user.get('id')} chat={chat_id}")
 
     # ── Intercept text replies for genkey wizard ───────────────
     if _is_owner(from_user) and chat_id in _genkey_wizard:
@@ -5776,28 +5809,27 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
             return
 
     # ── /stop — shows interactive stop panel ──────────────────
-    if text.startswith("/stop"):
+    if cmd == "stop":
         _handle_stop_panel(token, chat_id, from_user)
         return
 
     # ── Owner-only commands ────────────────────────────────────
-    if text.startswith("/help"):
+    if cmd == "help":
         _handle_help(token, chat_id, from_user)
         return
 
-    if text.startswith("/generate_key"):
-        args = text[len("/generate_key"):].strip()
-        _handle_gen_key(token, chat_id, from_user, args)
+    if cmd == "generate_key":
+        _handle_gen_key(token, chat_id, from_user, cmd_args)
         return
 
-    if text.startswith("/upload_proxy"):
+    if cmd == "upload_proxy":
         _proxy_accumulator.pop(chat_id, None)   # clear any old session
         _proxy_msg_ids.pop(chat_id, None)
         _bot_state[chat_id] = "AWAIT_PROXY"
         _handle_proxy_upload(token, chat_id, from_user, msg)
         return
 
-    if text.startswith("/proxy_done"):
+    if cmd == "proxy_done":
         if not _is_owner(from_user):
             _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
             return
@@ -5813,15 +5845,15 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
                 "Use /upload_proxy first to paste proxy lines, then /proxy_done to save them.")
         return
 
-    if text.startswith("/proxystatus"):
+    if cmd == "proxystatus":
         _handle_proxy_status(token, chat_id, from_user)
         return
 
-    if text.startswith("/add_coowner"):
+    if cmd == "add_coowner":
         if not _is_primary_owner(from_user):
             _tg_send(token, chat_id, "🚫 <b>Primary owner only command.</b>")
             return
-        args = text[len("/add_coowner"):].strip()
+        args = cmd_args
         if not args:
             # Show current co-owners and instructions
             if COOWNER_IDS:
@@ -5856,11 +5888,11 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
             f"👥 Total co-owners: <b>{len(COOWNER_IDS)}</b>")
         return
 
-    if text.startswith("/remove_coowner"):
+    if cmd == "remove_coowner":
         if not _is_primary_owner(from_user):
             _tg_send(token, chat_id, "🚫 <b>Primary owner only command.</b>")
             return
-        args = text[len("/remove_coowner"):].strip()
+        args = cmd_args
         if not args:
             if COOWNER_IDS:
                 colist = "\n".join(f"  • <code>{uid}</code>" for uid in sorted(COOWNER_IDS))
@@ -5886,11 +5918,11 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
             f"👥 Remaining co-owners: <b>{len(COOWNER_IDS)}</b>")
         return
 
-    if text.startswith("/serverstatus"):
+    if cmd == "serverstatus":
         _handle_server_status(token, chat_id, from_user)
         return
 
-    if text.startswith("/resetconfig"):
+    if cmd == "resetconfig":
         if not _is_owner(from_user):
             _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
             return
@@ -5902,7 +5934,7 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
             "Restart the bot — it will ask for your token and owner ID again.")
         return
 
-    if text.startswith("/stopall"):
+    if cmd == "stopall":
         if not _is_owner(from_user):
             _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
             return
@@ -5919,14 +5951,12 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
             _tg_send(token, chat_id, "ℹ️ No checkers are currently running.")
         return
 
-    if text.startswith("/statuskey"):
-        args = text[len("/statuskey"):].strip()
-        _handle_status_key(token, chat_id, from_user, args)
+    if cmd == "statuskey":
+        _handle_status_key(token, chat_id, from_user, cmd_args)
         return
 
-    if text.startswith("/deletekey"):
-        args = text[len("/deletekey"):].strip()
-        _handle_delete_key(token, chat_id, from_user, args)
+    if cmd == "deletekey":
+        _handle_delete_key(token, chat_id, from_user, cmd_args)
         return
 
     # ── Proxy file upload state ────────────────────────────────
@@ -5936,7 +5966,7 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
             _proxy_msg_ids.pop(chat_id, None)   # clear tracker, not a pasted session
             _handle_proxy_upload(token, chat_id, from_user, msg)
             _bot_state.pop(chat_id, None)
-        elif text and text.lower() in ("/done", "done", "/proxy_done"):
+        elif cmd in ("done", "proxy_done") or text.lower() == "done":
             # Flush accumulated lines — will auto-delete tracked messages
             user_msg_id = msg.get("message_id")
             if user_msg_id:
@@ -5965,12 +5995,12 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
     # ── /start — always allowed, no key required ─────────────
     # CRITICAL: /start must never be blocked — it is how new users
     # arrive and how they reach /redeem to get a key.
-    if text.startswith("/start"):
+    if cmd == "start":
         _handle_start(token, chat_id, from_user)
         return
 
     # ── /reset — always allowed (lets users clear broken state) ─
-    if text.startswith("/reset"):
+    if cmd == "reset":
         key_id = str(from_user.get("id", chat_id))
         uname  = from_user.get("username", "")
         _saved_users.pop(key_id, None)
@@ -5985,9 +6015,8 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
         return
 
     # ── /redeem — always allowed (users need this to get access) ─
-    if text.startswith("/redeem"):
-        args = text[len("/redeem"):].strip()
-        _handle_redeem(token, chat_id, from_user, args)
+    if cmd == "redeem":
+        _handle_redeem(token, chat_id, from_user, cmd_args)
         return
 
     # ── Waiting for user to type their key (no access needed) ──
@@ -5995,10 +6024,9 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
         if text and not text.startswith("/"):
             _bot_state.pop(chat_id, None)
             _handle_redeem(token, chat_id, from_user, text.strip())
-        elif text and text.startswith("/redeem"):
+        elif cmd == "redeem":
             _bot_state.pop(chat_id, None)
-            args = text[len("/redeem"):].strip()
-            _handle_redeem(token, chat_id, from_user, args)
+            _handle_redeem(token, chat_id, from_user, cmd_args)
         else:
             _tg_send(token, chat_id,
                 "🔑 Just type your key and send it, or use:\n"
@@ -6068,6 +6096,7 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
 def start_bot_polling(token: str, _unused=None):
     offset = 0
     consecutive_errors = 0
+    _update_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="BotUpdate")
 
     def _create_poll_session():
         """Create a fresh polling session with keep-alive."""
@@ -6078,6 +6107,13 @@ def start_bot_polling(token: str, _unused=None):
         return s
 
     poll_session = _create_poll_session()
+
+    def _safe_handle(upd):
+        """Process a single update in the thread pool — never blocks polling."""
+        try:
+            handle_bot_update(token, upd, None)
+        except Exception as e:
+            logger.error(f"[BOT] Update error: {e}", exc_info=True)
 
     def _poll():
         nonlocal offset, poll_session, consecutive_errors
@@ -6112,10 +6148,7 @@ def start_bot_polling(token: str, _unused=None):
                     continue
                 for upd in payload.get("result", []):
                     offset = upd["update_id"] + 1
-                    try:
-                        handle_bot_update(token, upd, None)
-                    except Exception as e:
-                        logger.error(f"[BOT] Update error: {e}")
+                    _update_executor.submit(_safe_handle, upd)
             except requests.exceptions.Timeout:
                 # Long-poll timeout is normal — just loop again immediately
                 continue
