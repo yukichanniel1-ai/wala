@@ -494,6 +494,100 @@ class GeoRotator:
 # Singleton — created once, shared everywhere
 geo_rotator = GeoRotator()
 
+# ══════════════════════════════════════════════════════════════
+#  RAW PROXY AUTO-FETCH
+#  Periodically fetches proxies from external URL sources,
+#  deduplicates against the current pool, and saves new ones.
+# ══════════════════════════════════════════════════════════════
+RAW_PROXY_SOURCES = [
+    "https://worker-production-a615.up.railway.app/",
+]
+RAW_PROXY_FETCH_INTERVAL = 300  # 5 minutes
+RAW_PROXY_SAVE_FILE = os.path.join(PROXY_FOLDER, "raw_fetched_proxies.txt")
+
+def _fetch_raw_proxies():
+    """
+    Background worker: fetches raw proxy lists from configured URLs every 5 minutes.
+    Only new, unique proxies are appended to raw_fetched_proxies.txt.
+    """
+    log = logging.getLogger(__name__)
+    log.info(f"[RAW-PROXY] Auto-fetch started — {len(RAW_PROXY_SOURCES)} source(s), "
+             f"interval {RAW_PROXY_FETCH_INTERVAL}s")
+
+    os.makedirs(PROXY_FOLDER, exist_ok=True)
+    normalizer = geo_rotator._normalize_proxy
+
+    while not shutdown_event.is_set():
+        total_new = 0
+        total_fetched = 0
+        total_dupes = 0
+
+        for url in RAW_PROXY_SOURCES:
+            try:
+                resp = requests.get(url, timeout=30)
+                resp.raise_for_status()
+                lines = [l.strip() for l in resp.text.splitlines()
+                         if l.strip() and not l.strip().startswith("#")]
+            except Exception as e:
+                log.warning(f"[RAW-PROXY] Failed to fetch {url}: {e}")
+                continue
+
+            total_fetched += len(lines)
+
+            # Load existing proxies from the save file to avoid duplicates
+            existing = set()
+            if os.path.exists(RAW_PROXY_SAVE_FILE):
+                try:
+                    with open(RAW_PROXY_SAVE_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                        existing = {l.strip() for l in f if l.strip() and not l.strip().startswith("#")}
+                except OSError:
+                    pass
+
+            # Also check the entire geo_rotator pool for duplicates
+            with geo_rotator._lock:
+                pool_set = set(geo_rotator._proxies)
+
+            new_proxies = []
+            dupes = 0
+            for raw_line in lines:
+                normalized = normalizer(raw_line)
+                if not normalized:
+                    continue
+                if normalized in existing or normalized in pool_set:
+                    dupes += 1
+                    continue
+                new_proxies.append(normalized)
+                existing.add(normalized)
+                pool_set.add(normalized)
+
+            total_dupes += dupes
+
+            if new_proxies:
+                try:
+                    with open(RAW_PROXY_SAVE_FILE, "a", encoding="utf-8") as f:
+                        for p in new_proxies:
+                            f.write(p + "\n")
+                    total_new += len(new_proxies)
+                except OSError as e:
+                    log.error(f"[RAW-PROXY] Failed to write {RAW_PROXY_SAVE_FILE}: {e}")
+
+        if total_new > 0:
+            try:
+                geo_rotator._load_all_files()
+            except Exception as e:
+                log.error(f"[RAW-PROXY] Failed to reload proxy pool: {e}")
+
+            log.info(f"[RAW-PROXY] +{total_new} new proxies added "
+                     f"(fetched {total_fetched}, {total_dupes} dupes skipped) "
+                     f"| pool now: {geo_rotator.total}")
+        else:
+            log.debug(f"[RAW-PROXY] No new proxies this cycle "
+                      f"(fetched {total_fetched}, {total_dupes} dupes)")
+
+        # Wait for next cycle (interruptible by shutdown)
+        shutdown_event.wait(RAW_PROXY_FETCH_INTERVAL)
+
+
 def signal_handler(signum, frame):
     """Handle SIGINT (Ctrl+C) and SIGTERM (process manager shutdown) gracefully."""
     sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
@@ -6336,6 +6430,9 @@ def main():
             except Exception:
                 pass
     threading.Thread(target=_railway_heartbeat, daemon=True, name="RailwayHeartbeat").start()
+
+    # ── Raw proxy auto-fetch (every 5 minutes from external sources) ──
+    threading.Thread(target=_fetch_raw_proxies, daemon=True, name="RawProxyFetcher").start()
 
     bot_console.print(
         "[bold green]🤖 Bot is running![/bold green]\n"
