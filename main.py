@@ -3568,7 +3568,9 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
         f"🎮 <b>Level:</b> <code>{lvl_label}</code>  "
         f"🔍 <b>Hits:</b> <code>{cf_map[d['clean_filter']]}</code>\n"
         f"📩 <b>Sending hits to:</b> <code>{hits_id}</code>\n"
-        f"📦 <b>Limit:</b> <code>{limit_display}</code>\n\n"
+        f"📦 <b>Limit:</b> <code>{limit_display}</code>\n"
+        f"🧵 <b>Threads:</b> <code>{VIP_THREADS_PER_USER if (_is_vip_user(chat_id) or chat_id == OWNER_ID or chat_id in COOWNER_IDS) else MAX_THREADS_PER_USER}</code>"
+        f"{'  ⭐ VIP' if (_is_vip_user(chat_id) or chat_id == OWNER_ID or chat_id in COOWNER_IDS) else ''}\n\n"
         f"<i>Hits will appear as they come in... Send /stop to cancel.</i>"
     )
 
@@ -3890,7 +3892,11 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
         return {}, result_folder
 
     total            = len(accounts)
-    MAX_THREADS      = MAX_THREADS_PER_USER   # use global setting
+    # ── Pick thread count: VIP/owner get VIP threads, others get normal ──
+    is_vip = _is_vip_user(chat_id) if chat_id else False
+    is_owner = (chat_id == OWNER_ID or chat_id in COOWNER_IDS) if chat_id else False
+    MAX_THREADS = VIP_THREADS_PER_USER if (is_vip or is_owner) else MAX_THREADS_PER_USER
+    logger.info(f"[CHECKER] {label} → {MAX_THREADS} threads ({'VIP' if is_vip else 'owner' if is_owner else 'normal'})")
     cookie_manager   = CookieManager()
     live_stats       = LiveStats()
     live_stats.start_tracking(total)
