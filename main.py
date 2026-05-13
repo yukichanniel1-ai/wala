@@ -102,7 +102,7 @@ MAX_THREADS_PER_USER = 8      # 8 threads per user — faster checking
 # Max users running the checker simultaneously
 MAX_CONCURRENT_USERS = 10     # 10 users supported concurrently
 # VIP users get higher thread count for faster checking
-VIP_THREADS_PER_USER = 10     # VIP users: 10 threads — priority scheduling
+VIP_THREADS_PER_USER = 5      # VIP users: 5 threads
 
 # Global semaphore — enforces MAX_GLOBAL_THREADS hard cap
 _global_thread_sem = threading.Semaphore(MAX_GLOBAL_THREADS)
@@ -2990,6 +2990,7 @@ def _tg_set_commands(token: str):
         {"command": "proxy_done",     "description": "✅ Finish proxy upload & save"},
         {"command": "proxystatus",    "description": "📊 View proxy pool status"},
         {"command": "serverstatus",   "description": "🖥 Server load & limits"},
+        {"command": "setthreads",    "description": "🔧 Set checker threads (e.g. /setthreads 10)"},
         {"command": "add_coowner",    "description": "👥 Add a co-owner by Telegram ID"},
         {"command": "remove_coowner", "description": "👥 Remove a co-owner"},
         {"command": "stopall",        "description": "☢️ Stop ALL running checkers"},
@@ -4400,8 +4401,93 @@ def _handle_server_status(token: str, chat_id, from_user: dict):
         f"⚙️ <b>Limits</b>\n"
         f"  Max concurrent users: <b>{MAX_CONCURRENT_USERS}</b>\n"
         f"  Threads per user: <b>{MAX_THREADS_PER_USER}</b>\n"
-        f"  Total thread cap: <b>{MAX_GLOBAL_THREADS}</b>"
+        f"  VIP threads per user: <b>{VIP_THREADS_PER_USER}</b>\n"
+        f"  Total thread cap: <b>{MAX_GLOBAL_THREADS}</b>\n\n"
+        f"💡 Use /setthreads to change thread counts"
     )
+
+
+# ── /setthreads — owner command to change thread counts ────────
+def _handle_set_threads(token: str, chat_id, from_user: dict, args: str):
+    """
+    /setthreads              — show current settings
+    /setthreads <N>          — set normal threads per user
+    /setthreads vip <N>      — set VIP threads per user
+    /setthreads global <N>   — set global thread cap
+    """
+    global MAX_THREADS_PER_USER, VIP_THREADS_PER_USER, MAX_GLOBAL_THREADS, _global_thread_sem
+
+    if not _is_owner(from_user):
+        _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+        return
+
+    parts = args.strip().lower().split() if args.strip() else []
+
+    # No args — show current settings
+    if not parts:
+        _tg_send(token, chat_id,
+            f"🧵 <b>Thread Settings</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"  👤 Normal: <b>{MAX_THREADS_PER_USER}</b> threads/user\n"
+            f"  ⭐ VIP: <b>{VIP_THREADS_PER_USER}</b> threads/user\n"
+            f"  🌐 Global cap: <b>{MAX_GLOBAL_THREADS}</b> threads\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>Usage:</b>\n"
+            f"  <code>/setthreads 10</code> — set normal to 10\n"
+            f"  <code>/setthreads vip 8</code> — set VIP to 8\n"
+            f"  <code>/setthreads global 40</code> — set global cap to 40")
+        return
+
+    # Parse: /setthreads <N> or /setthreads <type> <N>
+    try:
+        if len(parts) == 1:
+            # /setthreads <N> — set normal threads
+            new_val = int(parts[0])
+            if new_val < 1 or new_val > 50:
+                _tg_send(token, chat_id, "❌ Thread count must be between <code>1</code> and <code>50</code>.")
+                return
+            old_val = MAX_THREADS_PER_USER
+            MAX_THREADS_PER_USER = new_val
+            _tg_send(token, chat_id,
+                f"✅ <b>Normal threads per user:</b> {old_val} → <b>{new_val}</b>\n\n"
+                f"<i>Takes effect for new checkers. Running checkers keep their current threads.</i>")
+
+        elif len(parts) == 2:
+            target = parts[0]
+            new_val = int(parts[1])
+
+            if target == "vip":
+                if new_val < 1 or new_val > 50:
+                    _tg_send(token, chat_id, "❌ VIP thread count must be between <code>1</code> and <code>50</code>.")
+                    return
+                old_val = VIP_THREADS_PER_USER
+                VIP_THREADS_PER_USER = new_val
+                _tg_send(token, chat_id,
+                    f"✅ <b>VIP threads per user:</b> {old_val} → <b>{new_val}</b>\n\n"
+                    f"<i>Takes effect for new checkers.</i>")
+
+            elif target == "global":
+                if new_val < 1 or new_val > 100:
+                    _tg_send(token, chat_id, "❌ Global cap must be between <code>1</code> and <code>100</code>.")
+                    return
+                old_val = MAX_GLOBAL_THREADS
+                MAX_GLOBAL_THREADS = new_val
+                _global_thread_sem = threading.Semaphore(new_val)
+                _tg_send(token, chat_id,
+                    f"✅ <b>Global thread cap:</b> {old_val} → <b>{new_val}</b>\n\n"
+                    f"⚠️ <i>New semaphore created. Running checkers still use old slots.</i>")
+
+            else:
+                _tg_send(token, chat_id,
+                    f"❌ Unknown target: <code>{target}</code>\n"
+                    f"Use: <code>/setthreads [vip|global] &lt;number&gt;</code>")
+        else:
+            _tg_send(token, chat_id,
+                f"❌ Too many arguments.\n"
+                f"Use: <code>/setthreads &lt;number&gt;</code> or <code>/setthreads vip &lt;number&gt;</code>")
+
+    except ValueError:
+        _tg_send(token, chat_id, "❌ Invalid number. Use: <code>/setthreads 10</code>")
 
 
 # ── /statuskey ─────────────────────────────────────────────────
@@ -5443,6 +5529,7 @@ def _handle_help(token: str, chat_id, from_user: dict):
                 ],
                 [
                     {"text": "📊 Server Status",   "callback_data": "admin:serverstatus"},
+                    {"text": "🧵 Set Threads",     "callback_data": "admin:setthreads"},
                 ],
             ]
         )
@@ -5657,6 +5744,11 @@ def _handle_callback_query(token: str, cq: dict):
     if data == "admin:serverstatus":
         if not _is_owner(from_user): return
         _handle_server_status(token, chat_id, from_user)
+        return
+
+    if data == "admin:setthreads":
+        if not _is_owner(from_user): return
+        _handle_set_threads(token, chat_id, from_user, "")
         return
 
     if data == "admin:proxystatus":
@@ -6191,6 +6283,10 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
             _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
             return
         _handle_server_status(token, chat_id, from_user)
+        return
+
+    if cmd == "setthreads":
+        _handle_set_threads(token, chat_id, from_user, cmd_args)
         return
 
     if cmd == "resetconfig":
