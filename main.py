@@ -2570,13 +2570,14 @@ def _cleanup_stale_files():
             except Exception:
                 pass
 
-    # *_results/ folders — unzipped result dirs
-    for d in glob.glob(os.path.join(base, "*_results")):
-        try:
-            shutil.rmtree(d, ignore_errors=True)
-            logger.warning(f"[CLEANUP] Removed stale results folder: {os.path.basename(d)}")
-        except Exception:
-            pass
+    # *_results/ folders — unzipped result dirs (base dir and inside combo/)
+    for pattern in [os.path.join(base, "*_results"), os.path.join(combo_dir, "*_results")]:
+        for d in glob.glob(pattern):
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+                logger.warning(f"[CLEANUP] Removed stale results folder: {os.path.basename(d)}")
+            except Exception:
+                pass
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2693,7 +2694,13 @@ _bot_pending : dict = {}
 # Single reused session for all outbound Telegram API calls
 _tg_session = requests.Session()
 _tg_session.mount("https://", requests.adapters.HTTPAdapter(
-    pool_connections=2, pool_maxsize=4, max_retries=0
+    pool_connections=4, pool_maxsize=10, max_retries=0
+))
+
+# ── Dedicated session ONLY for answerCallbackQuery — never blocked by other calls ──
+_tg_cb_session = requests.Session()
+_tg_cb_session.mount("https://", requests.adapters.HTTPAdapter(
+    pool_connections=2, pool_maxsize=6, max_retries=0
 ))
 
 def _tg_api(token: str, method: str, **kwargs):
@@ -2771,9 +2778,10 @@ def _tg_send_buttons(token: str, chat_id, text: str, buttons: list, parse_mode: 
                    reply_markup=keyboard)
 
 def _tg_answer_callback(token: str, callback_id: str, text: str = ""):
-    """Acknowledge an inline button press (removes the loading spinner)."""
+    """Acknowledge an inline button press (removes the loading spinner).
+    Uses a dedicated session so it's never blocked by other in-flight API calls."""
     try:
-        r = _tg_session.post(
+        r = _tg_cb_session.post(
             f"https://api.telegram.org/bot{token}/answerCallbackQuery",
             json={"callback_query_id": callback_id, "text": text},
             timeout=5,
@@ -3738,7 +3746,7 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
         return {}, ""
 
     base          = os.path.splitext(os.path.basename(filepath))[0]
-    result_folder = f"{base}_results"
+    result_folder = os.path.join(os.path.dirname(os.path.abspath(filepath)), f"{base}_results")
     os.makedirs(result_folder, exist_ok=True)
 
     accounts = []
@@ -5165,7 +5173,6 @@ def _handle_help(token: str, chat_id, from_user: dict):
         )
         used_keys = sum(1 for k in keys.values() if k.get("used_by"))
 
-        saved     = _load_saved_users() if callable(getattr(_load_saved_users, '__call__', None)) else _saved_users
         total_users = len({v.get("hits_id") for v in _saved_users.values() if isinstance(v, dict) and "hits_id" in v})
         active_users = len([c for c, s in _bot_state.items() if s == "RUNNING"])
 
@@ -5173,10 +5180,10 @@ def _handle_help(token: str, chat_id, from_user: dict):
 
         _tg_send_buttons(token, chat_id,
             f"⚙️ <b>Admin Panel</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"👥 <b>Users:</b> {total_users}  (Active: {active_users})\n"
             f"📡 <b>Proxies:</b> {proxy_total} loaded\n"
-            f"🔑 <b>Keys:</b> {total_keys} total · {active_keys} active · {used_keys} used\n\n"
+            f"🔑 <b>Keys:</b> {total_keys} total · {active_keys} active · {used_keys} used\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<i>by @Yukiii_ii</i>",
             [
@@ -5347,7 +5354,12 @@ def _handle_callback_query(token: str, cq: dict):
     data      = cq.get("data", "")
 
     # Always answer the callback FIRST to remove loading spinner
-    _tg_answer_callback(token, cq_id)
+    # Fire in a background thread so it's never delayed by handler logic
+    threading.Thread(
+        target=_tg_answer_callback,
+        args=(token, cq_id),
+        daemon=True
+    ).start()
 
     if not message:
         logger.warning(f"[BOT] Callback query with no message — cq_id={cq_id} data={data!r}")
@@ -6114,7 +6126,7 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
 def start_bot_polling(token: str, _unused=None):
     offset = 0
     consecutive_errors = 0
-    _update_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="BotUpdate")
+    _update_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="BotUpdate")
 
     def _create_poll_session():
         """Create a fresh polling session with keep-alive."""
