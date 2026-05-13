@@ -830,6 +830,8 @@ class LiveStats:
         }
         # Server/region distribution tracking
         self.server_distribution = {}
+        # Country distribution tracking
+        self.country_distribution = {}
 
     def start_tracking(self, total_accounts):
         """Initialize progress tracking with total account count."""
@@ -841,7 +843,7 @@ class LiveStats:
             self.current_speed = 0.0
             self.eta_seconds = None
 
-    def update_stats(self, valid=False, clean=False, has_codm=False, codm_level=0, region=""):
+    def update_stats(self, valid=False, clean=False, has_codm=False, codm_level=0, region="", country=""):
         with self.lock:
             self.total_processed += 1
 
@@ -871,6 +873,10 @@ class LiveStats:
                     if region and region not in ('N/A', '', 'NONE', 'NULL'):
                         r = region.upper().strip()
                         self.server_distribution[r] = self.server_distribution.get(r, 0) + 1
+                    # Track country distribution
+                    if country and country not in ('N/A', '', 'NONE', 'NULL'):
+                        c = country.upper().strip()
+                        self.country_distribution[c] = self.country_distribution.get(c, 0) + 1
                 else:
                     self.no_codm_count += 1
             else:
@@ -917,6 +923,7 @@ class LiveStats:
                 'elapsed': time.time() - self.start_time if self.start_time else 0,
                 'level_distribution': dict(self.level_distribution),
                 'server_distribution': dict(self.server_distribution),
+                'country_distribution': dict(self.country_distribution),
             }
 
     def get_progress_bar(self, width=30):
@@ -1066,6 +1073,20 @@ class LiveStats:
                     pct_srv = (count / total_servers * 100) if total_servers > 0 else 0
                     bar_srv = self._make_bar(count, total_servers, 10)
                     lines.append(f"  {region:<5} : [{bar_srv}] {count} ({pct_srv:.1f}%)")
+                lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+
+            # Country Distribution (only if we have country data)
+            if self.country_distribution:
+                lines.append(f"🌍 Country Distribution")
+                sorted_countries = sorted(self.country_distribution.items(), key=lambda x: x[1], reverse=True)
+                total_countries = sum(v for _, v in sorted_countries)
+                for cname, count in sorted_countries[:15]:
+                    pct_c = (count / total_countries * 100) if total_countries > 0 else 0
+                    bar_c = self._make_bar(count, total_countries, 10)
+                    lines.append(f"  {cname:<5} : [{bar_c}] {count} ({pct_c:.1f}%)")
+                if len(sorted_countries) > 15:
+                    others = sum(v for _, v in sorted_countries[15:])
+                    lines.append(f"  Other : {others} ({others/total_countries*100:.1f}%)")
                 lines.append(f"━━━━━━━━━━━━━━━━━━━━")
 
             return "\n".join(lines)
@@ -2221,7 +2242,8 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
 
         _codm_lvl = codm_info.get('codm_level', 0) if has_codm and codm_info else 0
         _codm_rgn = codm_info.get('region', '') if has_codm and codm_info else ''
-        live_stats.update_stats(valid=True, clean=details['is_clean'], has_codm=has_codm, codm_level=_codm_lvl, region=_codm_rgn)
+        _acc_country = details.get('personal', {}).get('country', '') if details else ''
+        live_stats.update_stats(valid=True, clean=details['is_clean'], has_codm=has_codm, codm_level=_codm_lvl, region=_codm_rgn, country=_acc_country)
         
         username = details.get('username', account)
         email = details.get('email', 'N/A')
@@ -2946,6 +2968,7 @@ def _tg_set_commands(token: str):
     user_commands = [
         {"command": "start",  "description": "▶️ Start or restore your session"},
         {"command": "help",   "description": "📋 Show menu & your config"},
+        {"command": "check",  "description": "📊 Live stats — level, country, server"},
         {"command": "redeem", "description": "🔑 Redeem an access key"},
         {"command": "reset",  "description": "🔄 Clear settings & reconfigure"},
         {"command": "stop",   "description": "🛑 Stop the running checker"},
@@ -2954,6 +2977,7 @@ def _tg_set_commands(token: str):
     # ── Commands visible ONLY to the owner (private chat scope) ──
     admin_commands = [
         {"command": "help",           "description": "⚙️ Admin panel"},
+        {"command": "check",          "description": "📊 Live stats — level, country, server"},
         {"command": "generate_key",   "description": "🔑 Generate a redeem key"},
         {"command": "statuskey",      "description": "📋 View all key statuses"},
         {"command": "deletekey",      "description": "🗑 Delete key(s)"},
@@ -5252,6 +5276,128 @@ def _handle_proxy_status(token: str, chat_id, from_user: dict):
     )
 
 
+# ── /check — show level & country breakdown for active checker ──
+def _handle_check(token: str, chat_id, from_user: dict, sub_cmd: str = ""):
+    """
+    /check         — full overview (level + country + server)
+    /check level   — level distribution only
+    /check country — country distribution only
+    /check server  — server/region distribution only
+    """
+    # Find the user's active checker live_stats
+    bar = _active_bars.get(chat_id, {})
+    ls = bar.get("live_stats")
+
+    if not ls:
+        _tg_send(token, chat_id,
+            "ℹ️ <b>No active checker running.</b>\n\n"
+            "Start a checker first, then use /check to see live stats.")
+        return
+
+    with ls.lock:
+        done = ls.total_processed
+        total = ls.total_accounts
+        pct = (done / total * 100) if total > 0 else 0
+        speed_str = f"{ls.current_speed:.1f}/s" if ls.current_speed > 0 else "..."
+        eta_str = ls.format_time(ls.eta_seconds) if ls.eta_seconds else "N/A"
+        elapsed_str = ls.format_time(time.time() - ls.start_time) if ls.start_time else "0s"
+
+        level_dist = dict(ls.level_distribution)
+        server_dist = dict(ls.server_distribution)
+        country_dist = dict(ls.country_distribution)
+        valid = ls.valid_count
+        invalid = ls.invalid_count
+        clean = ls.clean_count
+        not_clean = ls.not_clean_count
+        has_codm = ls.has_codm_count
+        no_codm = ls.no_codm_count
+
+    sub = sub_cmd.lower().strip()
+
+    # ── Header (always shown) ──────────────────────────────
+    header = (
+        f"📊 <b>Checker Status</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏳ Progress: <code>{done:,}/{total:,}</code> ({pct:.1f}%)\n"
+        f"⚡ Speed: <code>{speed_str}</code> | ETA: <code>{eta_str}</code>\n"
+        f"🕐 Elapsed: <code>{elapsed_str}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Valid: <code>{valid:,}</code> | ❌ Invalid: <code>{invalid:,}</code>\n"
+        f"✨ Clean: <code>{clean:,}</code> | ⚠️ Not Clean: <code>{not_clean:,}</code>\n"
+        f"🎮 CODM: <code>{has_codm:,}</code> | 📭 No CODM: <code>{no_codm:,}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    sections = []
+
+    # ── Level Distribution ──────────────────────────────────
+    if sub in ("", "level", "lvl"):
+        total_with_level = sum(level_dist.values())
+        if total_with_level > 0:
+            lvl_lines = ["📊 <b>Level Distribution</b>"]
+            for rk in ["1-50", "51-100", "101-150", "151-200",
+                        "201-250", "251-300", "301-350", "351+"]:
+                cnt = level_dist.get(rk, 0)
+                p = (cnt / total_with_level * 100) if total_with_level > 0 else 0
+                bar_str = _text_bar(cnt, total_with_level, 10)
+                lvl_lines.append(f"  {rk:<7} : [{bar_str}] {cnt} ({p:.1f}%)")
+            sections.append("\n".join(lvl_lines))
+        elif sub in ("level", "lvl"):
+            sections.append("📊 <i>No level data yet.</i>")
+
+    # ── Country Distribution ────────────────────────────────
+    if sub in ("", "country"):
+        if country_dist:
+            sorted_c = sorted(country_dist.items(), key=lambda x: x[1], reverse=True)
+            total_c = sum(v for _, v in sorted_c)
+            c_lines = ["🌍 <b>Country Distribution</b>"]
+            for cname, cnt in sorted_c[:20]:
+                p = (cnt / total_c * 100) if total_c > 0 else 0
+                bar_str = _text_bar(cnt, total_c, 10)
+                c_lines.append(f"  {cname:<5} : [{bar_str}] {cnt} ({p:.1f}%)")
+            if len(sorted_c) > 20:
+                others = sum(v for _, v in sorted_c[20:])
+                c_lines.append(f"  Other : {others} ({others/total_c*100:.1f}%)")
+            sections.append("\n".join(c_lines))
+        elif sub == "country":
+            sections.append("🌍 <i>No country data yet.</i>")
+
+    # ── Server/Region Distribution ──────────────────────────
+    if sub in ("", "server", "region"):
+        if server_dist:
+            sorted_s = sorted(server_dist.items(), key=lambda x: x[1], reverse=True)
+            total_s = sum(v for _, v in sorted_s)
+            s_lines = ["🌏 <b>Server Distribution</b>"]
+            for region, cnt in sorted_s:
+                p = (cnt / total_s * 100) if total_s > 0 else 0
+                bar_str = _text_bar(cnt, total_s, 10)
+                s_lines.append(f"  {region:<5} : [{bar_str}] {cnt} ({p:.1f}%)")
+            sections.append("\n".join(s_lines))
+        elif sub in ("server", "region"):
+            sections.append("🌏 <i>No server data yet.</i>")
+
+    body = header
+    if sections:
+        body += "\n".join(sections)
+    else:
+        body += "<i>No distribution data yet — check back after more accounts are processed.</i>"
+
+    body += (
+        f"\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>💡 /check level · /check country · /check server</i>"
+    )
+
+    _tg_send(token, chat_id, body)
+
+
+def _text_bar(value: int, maximum: int, width: int = 10) -> str:
+    """Generate a simple text bar like ███░░░░░░░"""
+    if maximum <= 0:
+        return "░" * width
+    filled = int(value / maximum * width)
+    return "█" * filled + "░" * (width - filled)
+
+
 # ── update router ──────────────────────────────────────────────
 # ── /help ──────────────────────────────────────────────────────
 def _handle_help(token: str, chat_id, from_user: dict):
@@ -5917,6 +6063,11 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
     # ── /stop — shows interactive stop panel ──────────────────
     if cmd == "stop":
         _handle_stop_panel(token, chat_id, from_user)
+        return
+
+    # ── /check — live checker stats (level, country, server) ──
+    if cmd == "check":
+        _handle_check(token, chat_id, from_user, cmd_args)
         return
 
     # ── Owner-only commands ────────────────────────────────────
