@@ -2980,6 +2980,7 @@ def _tg_set_commands(token: str):
         {"command": "generate_key",   "description": "🔑 Generate a redeem key"},
         {"command": "statuskey",      "description": "📋 View all key statuses"},
         {"command": "deletekey",      "description": "🗑 Delete key(s)"},
+        {"command": "keysystem",     "description": "🔗 Configure KeyVault API"},
         {"command": "upload_proxy",   "description": "📡 Upload proxy list"},
         {"command": "proxy_done",     "description": "✅ Finish proxy upload & save"},
         {"command": "proxystatus",    "description": "📊 View proxy pool status"},
@@ -4108,7 +4109,7 @@ def _is_vip_user(chat_id) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════
-#  REDEEM KEY SYSTEM
+#  REDEEM KEY SYSTEM  (with KeyVault API integration)
 # ══════════════════════════════════════════════════════════════
 KEYS_FILE = "redeem_keys.json"
 
@@ -4124,6 +4125,263 @@ def _load_keys() -> dict:
 def _save_keys(keys: dict):
     with open(KEYS_FILE, "w", encoding="utf-8") as f:
         json.dump(keys, f, indent=2)
+
+
+# ── KeyVault API Integration ────────────────────────────────────
+class KeySystemAPI:
+    """
+    Client for the KeyVault (Key-system) Next.js API.
+    Falls back to local redeem_keys.json when the API is not configured or unreachable.
+    """
+
+    def __init__(self):
+        cfg = _load_config()
+        self.base_url = (cfg.get("keysystem_url") or "").rstrip("/")
+        self.admin_secret = cfg.get("keysystem_admin_secret") or ""
+        self.enabled = bool(self.base_url)
+
+    def _headers(self) -> dict:
+        h = {"Content-Type": "application/json"}
+        if self.admin_secret:
+            h["x-admin-secret"] = self.admin_secret
+        return h
+
+    def reload_config(self):
+        cfg = _load_config()
+        self.base_url = (cfg.get("keysystem_url") or "").rstrip("/")
+        self.admin_secret = cfg.get("keysystem_admin_secret") or ""
+        self.enabled = bool(self.base_url)
+
+    def generate_key(self, duration_seconds: int, max_users: int, combo_limit: int, count: int = 1) -> list:
+        """
+        Generate key(s) via the KeyVault API.
+        Returns a list of dicts with key info, or empty list on failure.
+        Maps wala fields to KeyVault fields:
+          - duration_seconds -> expiryDays (converted)
+          - max_users -> maxRedemptions
+          - combo_limit -> rateLimit (stored as string)
+        """
+        if not self.enabled:
+            return []
+
+        expiry_days = max(1, duration_seconds // 86400) if duration_seconds >= 86400 else 1
+        # For sub-day durations, we use 1 day as minimum in the API
+        # and track the real expiry locally
+
+        generated = []
+        for _ in range(count):
+            try:
+                payload = {
+                    "label": f"tg-bot-key",
+                    "tier": "vip",
+                    "format": "alphanum",
+                    "expiryDays": expiry_days,
+                    "rateLimit": str(combo_limit) if combo_limit > 0 else "unlimited",
+                    "threads": VIP_THREADS_PER_USER,
+                    "maxRedemptions": max_users if max_users > 0 else None,
+                }
+                resp = requests.post(
+                    f"{self.base_url}/api/keys/generate",
+                    headers=self._headers(),
+                    json=payload,
+                    timeout=15,
+                )
+                if resp.status_code == 201:
+                    data = resp.json()
+                    generated.append(data)
+                else:
+                    logger.warning(f"[KEYSYSTEM] Generate failed: {resp.status_code} {resp.text[:200]}")
+            except Exception as e:
+                logger.warning(f"[KEYSYSTEM] Generate error: {e}")
+        return generated
+
+    def validate_key(self, key_value: str) -> dict:
+        """
+        Validate a key via the KeyVault API.
+        Returns the API response dict, or empty dict on failure/unreachable.
+        Response: {"valid": true/false, "reason": "...", "key": {...}}
+        """
+        if not self.enabled:
+            return {}
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/keys/validate",
+                headers=self._headers(),
+                json={"key": key_value},
+                timeout=15,
+            )
+            return resp.json()
+        except Exception as e:
+            logger.warning(f"[KEYSYSTEM] Validate error: {e}")
+            return {}
+
+    def list_keys(self) -> list:
+        """
+        List all keys from the KeyVault API.
+        Returns a list of key dicts, or empty list on failure.
+        """
+        if not self.enabled:
+            return []
+        try:
+            resp = requests.get(
+                f"{self.base_url}/api/keys/list",
+                headers=self._headers(),
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"[KEYSYSTEM] List error: {e}")
+        return []
+
+    def delete_key(self, key_id: str) -> bool:
+        """
+        Delete a key by its ID via the KeyVault API.
+        Returns True on success.
+        """
+        if not self.enabled:
+            return False
+        try:
+            resp = requests.delete(
+                f"{self.base_url}/api/keys/delete",
+                headers=self._headers(),
+                json={"id": key_id},
+                timeout=15,
+            )
+            return resp.status_code == 200
+        except Exception as e:
+            logger.warning(f"[KEYSYSTEM] Delete error: {e}")
+            return False
+
+    def revoke_key(self, key_id: str) -> bool:
+        """
+        Revoke a key by its ID via the KeyVault API.
+        Returns True on success.
+        """
+        if not self.enabled:
+            return False
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/keys/revoke",
+                headers=self._headers(),
+                json={"id": key_id},
+                timeout=15,
+            )
+            return resp.status_code == 200
+        except Exception as e:
+            logger.warning(f"[KEYSYSTEM] Revoke error: {e}")
+            return False
+
+
+_keysystem_api: KeySystemAPI = None
+
+def _get_keysystem_api() -> KeySystemAPI:
+    """Lazy-init and return the global KeySystemAPI instance."""
+    global _keysystem_api
+    if _keysystem_api is None:
+        _keysystem_api = KeySystemAPI()
+    return _keysystem_api
+
+
+def _handle_keysystem_config(token: str, chat_id, from_user: dict, args: str):
+    """
+    /keysystem              — show current config
+    /keysystem url <URL>    — set KeyVault API URL
+    /keysystem secret <S>   — set admin secret
+    /keysystem status       — test connectivity
+    """
+    api = _get_keysystem_api()
+    parts = args.strip().split(None, 1) if args.strip() else []
+
+    if not parts:
+        status = "✅ Connected" if api.enabled else "❌ Not configured"
+        url_display = api.base_url or "<i>not set</i>"
+        secret_display = "***" if api.admin_secret else "<i>not set</i>"
+        _tg_send(token, chat_id,
+            f"🔑 <b>KeyVault API Config</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📡 <b>Status:</b> {status}\n"
+            f"🌐 <b>URL:</b> {url_display}\n"
+            f"🔐 <b>Secret:</b> {secret_display}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<b>Usage:</b>\n"
+            f"  <code>/keysystem url https://your-app.vercel.app</code>\n"
+            f"  <code>/keysystem secret YOUR_ADMIN_SECRET</code>\n"
+            f"  <code>/keysystem status</code> — test connection")
+        return
+
+    subcmd = parts[0].lower()
+    value = parts[1] if len(parts) > 1 else ""
+
+    if subcmd == "url":
+        if not value:
+            _tg_send(token, chat_id, "❌ Provide a URL: <code>/keysystem url https://...</code>")
+            return
+        cfg = _load_config()
+        cfg["keysystem_url"] = value.rstrip("/")
+        _save_config(cfg)
+        api.reload_config()
+        _tg_send(token, chat_id,
+            f"✅ <b>KeyVault URL set!</b>\n\n"
+            f"🌐 <code>{value}</code>\n\n"
+            f"<i>Use /keysystem status to test the connection.</i>")
+        return
+
+    if subcmd == "secret":
+        if not value:
+            _tg_send(token, chat_id, "❌ Provide the secret: <code>/keysystem secret YOUR_SECRET</code>")
+            return
+        cfg = _load_config()
+        cfg["keysystem_admin_secret"] = value
+        _save_config(cfg)
+        api.reload_config()
+        _tg_send(token, chat_id,
+            f"✅ <b>Admin secret updated!</b>\n\n"
+            f"<i>Use /keysystem status to test the connection.</i>")
+        return
+
+    if subcmd == "status":
+        if not api.enabled:
+            _tg_send(token, chat_id,
+                "❌ <b>KeyVault not configured.</b>\n\n"
+                "Set the URL first: <code>/keysystem url https://your-app.vercel.app</code>")
+            return
+        try:
+            resp = requests.get(
+                f"{api.base_url}/api/keys/list",
+                headers=api._headers(),
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                key_count = len(resp.json())
+                _tg_send(token, chat_id,
+                    f"✅ <b>KeyVault Connected!</b>\n\n"
+                    f"📡 {api.base_url}\n"
+                    f"🔑 {key_count} key(s) in remote store\n\n"
+                    f"<i>Keys generated with /generate_key will now sync to KeyVault.</i>")
+            elif resp.status_code == 401:
+                _tg_send(token, chat_id,
+                    "🔒 <b>Authentication failed.</b>\n\n"
+                    "Check your admin secret: <code>/keysystem secret YOUR_SECRET</code>")
+            else:
+                _tg_send(token, chat_id,
+                    f"⚠️ <b>Unexpected response:</b> HTTP {resp.status_code}\n\n"
+                    f"<code>{resp.text[:200]}</code>")
+        except Exception as e:
+            _tg_send(token, chat_id,
+                f"❌ <b>Connection failed:</b>\n\n"
+                f"<code>{str(e)[:200]}</code>\n\n"
+                f"Check the URL: <code>/keysystem url ...</code>")
+        return
+
+    _tg_send(token, chat_id,
+        "❌ Unknown sub-command.\n\n"
+        "<b>Usage:</b>\n"
+        "  <code>/keysystem</code> — show config\n"
+        "  <code>/keysystem url https://...</code> — set URL\n"
+        "  <code>/keysystem secret ...</code> — set secret\n"
+        "  <code>/keysystem status</code> — test connection")
+
 
 def _gen_key() -> str:
     return uuid.uuid4().hex[:20].upper()
@@ -4288,22 +4546,48 @@ def _ask_genkey_count(token: str, chat_id, duration: int, max_users: int, combo_
 
 
 def _finalize_gen_key(token: str, chat_id, duration: int, combo_limit: int, count: int = 1, max_users: int = 1):
-    """Actually create `count` keys, each allowing up to `max_users` users."""
+    """Actually create `count` keys, each allowing up to `max_users` users.
+    Tries KeyVault API first; falls back to local JSON storage.
+    """
     now     = time.time()
     expires = now + duration
     keys    = _load_keys()
 
     new_keys = []
-    for _ in range(count):
-        k = _gen_key()
-        keys[k] = {
-            "expires":     expires,
-            "combo_limit": combo_limit,
-            "max_users":   max_users,   # 0 = unlimited
-            "used_by":     [],          # list of chat_ids that redeemed
-            "created":     now,
-        }
-        new_keys.append(k)
+    api = _get_keysystem_api()
+
+    # Try KeyVault API first
+    api_keys = []
+    if api.enabled:
+        api_keys = api.generate_key(duration, max_users, combo_limit, count)
+
+    if api_keys:
+        # Keys generated via API — also store locally for user tracking
+        for api_key_data in api_keys:
+            k = api_key_data.get("key", _gen_key())
+            keys[k] = {
+                "expires":     expires,
+                "combo_limit": combo_limit,
+                "max_users":   max_users,
+                "used_by":     [],
+                "created":     now,
+                "api_id":      api_key_data.get("id", ""),
+                "source":      "keyvault",
+            }
+            new_keys.append(k)
+    else:
+        # Fallback: generate locally
+        for _ in range(count):
+            k = _gen_key()
+            keys[k] = {
+                "expires":     expires,
+                "combo_limit": combo_limit,
+                "max_users":   max_users,
+                "used_by":     [],
+                "created":     now,
+                "source":      "local",
+            }
+            new_keys.append(k)
 
     _save_keys(keys)
     _genkey_wizard.pop(chat_id, None)
@@ -4502,6 +4786,32 @@ def _handle_status_key(token: str, chat_id, from_user: dict, args: str):
         return
 
     keys = _load_keys()
+    api = _get_keysystem_api()
+
+    # Sync keys from KeyVault API if enabled
+    if api.enabled:
+        api_keys = api.list_keys()
+        now = time.time()
+        for ak in api_keys:
+            key_value = ak.get("key", "")
+            if key_value and key_value not in keys:
+                expires_at = ak.get("expiresAt")
+                expires = (expires_at / 1000.0) if expires_at else (now + 86400 * 365)
+                rate_limit = ak.get("rateLimit", "1000")
+                combo_limit = int(rate_limit) if rate_limit.isdigit() else 0
+                max_redemptions = ak.get("maxRedemptions")
+                keys[key_value] = {
+                    "expires":     expires,
+                    "combo_limit": combo_limit,
+                    "max_users":   max_redemptions if max_redemptions else 0,
+                    "used_by":     [],
+                    "created":     ak.get("createdAt", now * 1000) / 1000.0,
+                    "api_id":      ak.get("id", ""),
+                    "source":      "keyvault",
+                    "revoked":     ak.get("revoked", False),
+                }
+        _save_keys(keys)
+
     if not keys:
         _tg_send(token, chat_id, "📭 <b>No keys found.</b>\nGenerate one with /generate_key")
         return
@@ -4644,6 +4954,14 @@ def _deletekey_header(keys: dict, selected: set, now: float) -> str:
     )
 
 
+def _delete_key_from_api(entry: dict):
+    """If a key was created via the API, also delete it from KeyVault."""
+    api = _get_keysystem_api()
+    api_id = entry.get("api_id")
+    if api.enabled and api_id:
+        api.delete_key(api_id)
+
+
 def _handle_delete_key(token: str, chat_id, from_user: dict, args: str):
     if not _is_owner(from_user):
         _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
@@ -4664,7 +4982,9 @@ def _handle_delete_key(token: str, chat_id, from_user: dict, args: str):
             if not to_del:
                 _tg_send(token, chat_id, "✅ No expired keys to delete.")
                 return
-            for k in to_del: del keys[k]
+            for k in to_del:
+                _delete_key_from_api(keys[k])
+                del keys[k]
             _save_keys(keys)
             _tg_send(token, chat_id,
                 f"🗑 <b>Deleted {len(to_del)} expired key(s).</b>\n"
@@ -4675,7 +4995,9 @@ def _handle_delete_key(token: str, chat_id, from_user: dict, args: str):
             if not to_del:
                 _tg_send(token, chat_id, "✅ No unused keys to delete.")
                 return
-            for k in to_del: del keys[k]
+            for k in to_del:
+                _delete_key_from_api(keys[k])
+                del keys[k]
             _save_keys(keys)
             _tg_send(token, chat_id,
                 f"🗑 <b>Deleted {len(to_del)} unused key(s).</b>\n"
@@ -4683,6 +5005,8 @@ def _handle_delete_key(token: str, chat_id, from_user: dict, args: str):
             return
         if args.lower() == "all":
             count = len(keys)
+            for entry in keys.values():
+                _delete_key_from_api(entry)
             keys.clear()
             _save_keys(keys)
             _deletekey_selection.pop(chat_id, None)
@@ -4694,6 +5018,7 @@ def _handle_delete_key(token: str, chat_id, from_user: dict, args: str):
             _tg_send(token, chat_id, f"❌ Key <code>{target}</code> not found.")
             return
         entry = keys.pop(target)
+        _delete_key_from_api(entry)
         _save_keys(keys)
         exp_dt = datetime.fromtimestamp(entry.get("expires", 0)).strftime("%Y-%m-%d %H:%M")
         used   = entry.get("used_by") or "never used"
@@ -4730,14 +5055,69 @@ def _handle_redeem(token: str, chat_id, from_user: dict, key_arg: str):
     keys    = _load_keys()
     now     = time.time()
     uid_str = str(chat_id)
+    api     = _get_keysystem_api()
 
+    # ── Check local store first ─────────────────────────────────
     if key not in keys:
-        _tg_send_buttons(token, chat_id,
-            "❌ <b>Invalid key.</b>\n\n"
-            "Please check the key and try again.",
-            [[{"text": "🔄 Try again", "callback_data": "redeem:prompt"}]]
-        )
-        return
+        # Try case-insensitive match (API keys may be mixed case)
+        key_lower = key_arg.strip().lower()
+        matched = None
+        for k in keys:
+            if k.lower() == key_lower:
+                matched = k
+                break
+        if matched:
+            key = matched
+        elif api.enabled:
+            # Key not found locally — try validating via KeyVault API
+            api_result = api.validate_key(key_arg.strip())
+            if not api_result:
+                # Also try the original case
+                api_result = api.validate_key(key)
+            if api_result and api_result.get("valid"):
+                # Key is valid in API — create local entry for user tracking
+                api_key_info = api_result.get("key", {})
+                expires_at = api_key_info.get("expiresAt")
+                if expires_at:
+                    expires = expires_at / 1000.0  # API uses milliseconds
+                else:
+                    expires = now + 86400 * 30  # default 30 days if no expiry
+                rate_limit = api_key_info.get("rateLimit", "1000")
+                combo_limit = int(rate_limit) if rate_limit.isdigit() else 0
+                max_redemptions = api_key_info.get("maxRedemptions")
+                max_users = max_redemptions if max_redemptions else 0
+                keys[key] = {
+                    "expires":     expires,
+                    "combo_limit": combo_limit,
+                    "max_users":   max_users,
+                    "used_by":     [],
+                    "created":     now,
+                    "api_id":      api_key_info.get("id", ""),
+                    "source":      "keyvault",
+                }
+                _save_keys(keys)
+            elif api_result and not api_result.get("valid"):
+                reason = api_result.get("reason", "Invalid key")
+                _tg_send_buttons(token, chat_id,
+                    f"❌ <b>{reason}</b>\n\n"
+                    "Please check the key and try again.",
+                    [[{"text": "🔄 Try again", "callback_data": "redeem:prompt"}]]
+                )
+                return
+            else:
+                _tg_send_buttons(token, chat_id,
+                    "❌ <b>Invalid key.</b>\n\n"
+                    "Please check the key and try again.",
+                    [[{"text": "🔄 Try again", "callback_data": "redeem:prompt"}]]
+                )
+                return
+        else:
+            _tg_send_buttons(token, chat_id,
+                "❌ <b>Invalid key.</b>\n\n"
+                "Please check the key and try again.",
+                [[{"text": "🔄 Try again", "callback_data": "redeem:prompt"}]]
+            )
+            return
 
     entry = keys[key]
 
@@ -5825,6 +6205,7 @@ def _handle_callback_query(token: str, cq: dict):
         deleted = []
         for k in list(sel):
             if k in keys:
+                _delete_key_from_api(keys[k])
                 deleted.append(k)
                 del keys[k]
         _save_keys(keys)
@@ -6335,6 +6716,13 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
             _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
             return
         _handle_delete_key(token, chat_id, from_user, cmd_args)
+        return
+
+    if cmd == "keysystem":
+        if not _is_owner(from_user):
+            _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+            return
+        _handle_keysystem_config(token, chat_id, from_user, cmd_args)
         return
 
     # ── Proxy file upload state ────────────────────────────────
