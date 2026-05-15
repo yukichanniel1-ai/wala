@@ -4152,32 +4152,34 @@ class KeySystemAPI:
         self.admin_secret = cfg.get("keysystem_admin_secret") or ""
         self.enabled = bool(self.base_url)
 
-    def generate_key(self, duration_seconds: int, max_users: int, combo_limit: int, count: int = 1) -> list:
+    def generate_key(self, duration_seconds: int, max_users: int, combo_limit: int,
+                     count: int = 1, tier: str = "vip", key_format: str = "alphanum",
+                     label: str = "") -> list:
         """
         Generate key(s) via the KeyVault API.
-        Returns a list of dicts with key info, or empty list on failure.
-        Maps wala fields to KeyVault fields:
-          - duration_seconds -> expiryDays (converted)
+        Parameters match the KeyVault dashboard fields exactly:
+          - tier: "free" | "vip"
+          - key_format: "uuid" | "hex" | "alphanum" | "prefix"
+          - duration_seconds -> expiryDays
+          - combo_limit -> rateLimit
           - max_users -> maxRedemptions
-          - combo_limit -> rateLimit (stored as string)
+          - label: optional key label
         """
         if not self.enabled:
             return []
 
-        expiry_days = max(1, duration_seconds // 86400) if duration_seconds >= 86400 else 1
-        # For sub-day durations, we use 1 day as minimum in the API
-        # and track the real expiry locally
+        expiry_days = max(1, duration_seconds // 86400) if duration_seconds >= 86400 else 0
 
         generated = []
         for _ in range(count):
             try:
                 payload = {
-                    "label": f"tg-bot-key",
-                    "tier": "vip",
-                    "format": "alphanum",
+                    "label": label or f"tg-bot-{tier}",
+                    "tier": tier,
+                    "format": key_format,
                     "expiryDays": expiry_days,
                     "rateLimit": str(combo_limit) if combo_limit > 0 else "unlimited",
-                    "threads": VIP_THREADS_PER_USER,
+                    "threads": VIP_THREADS_PER_USER if tier == "vip" else 2,
                     "maxRedemptions": max_users if max_users > 0 else None,
                 }
                 resp = requests.post(
@@ -4386,9 +4388,30 @@ def _handle_keysystem_config(token: str, chat_id, from_user: dict, args: str):
 def _gen_key() -> str:
     return uuid.uuid4().hex[:20].upper()
 
+
+def _gen_local_key(key_format: str, tier: str = "free") -> str:
+    """Generate a key value matching KeyVault format options."""
+    import random
+    if key_format == "uuid":
+        return str(uuid.uuid4())
+    elif key_format == "hex":
+        return "".join(random.choices("0123456789abcdef", k=32))
+    elif key_format == "alphanum":
+        chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+        return "".join(random.choices(chars, k=24))
+    elif key_format == "prefix":
+        chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+        pfx = "vip" if tier == "vip" else "free"
+        part1 = "".join(random.choices(chars, k=8))
+        part2 = "".join(random.choices(chars, k=8))
+        return f"{pfx}_{part1}_{part2}"
+    else:
+        return uuid.uuid4().hex[:20].upper()
+
 # ── /generate_key interactive state ────────────────────────────
 # Stores partial genkey wizard data per owner chat_id
-_genkey_wizard: dict = {}  # chat_id -> {"step": "AWAIT_DURATION"|"AWAIT_USERS"|"AWAIT_LIMIT"|"AWAIT_COUNT", "duration": int, "max_users": int, "combo_limit": int}
+# Steps: AWAIT_TIER -> AWAIT_FORMAT -> AWAIT_EXPIRY -> AWAIT_COMBO -> AWAIT_REDEEMS -> AWAIT_LABEL -> AWAIT_COUNT
+_genkey_wizard: dict = {}  # chat_id -> {"step": ..., "tier": str, "format": str, "expiry_days": int, "combo_limit": int, "max_redemptions": int, "label": str}
 
 
 def _parse_duration(arg: str) -> int:
@@ -4416,117 +4439,160 @@ def _dur_label(seconds: int) -> str:
     return " ".join(parts) if parts else "0m"
 
 
-# ── /generate_key [duration] ───────────────────────────────────
+# ── /generate_key — matches KeyVault dashboard fields ──────────
 def _handle_gen_key(token: str, chat_id, from_user: dict, args: str):
     if not _is_owner(from_user):
         _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
         return
 
-    args = args.strip()
-
-    if not args:
-        # ── Interactive wizard: ask duration first ─────────────
-        _genkey_wizard[chat_id] = {"step": "AWAIT_DURATION"}
-        _tg_send_buttons(token, chat_id,
-            "🔑 <b>Generate Key — Step 1 of 4</b>\n\n"
-            "⏳ How long should the key be valid?\n\n"
-            "<i>Tap a button or type a custom duration (e.g. <code>3d</code>, <code>12hrs</code>, <code>45min</code>)</i>",
-            [
-                [
-                    {"text": "1 Hour",  "callback_data": "gk_dur:3600"},
-                    {"text": "6 Hours", "callback_data": "gk_dur:21600"},
-                    {"text": "12 Hours","callback_data": "gk_dur:43200"},
-                ],
-                [
-                    {"text": "1 Day",   "callback_data": "gk_dur:86400"},
-                    {"text": "3 Days",  "callback_data": "gk_dur:259200"},
-                    {"text": "7 Days",  "callback_data": "gk_dur:604800"},
-                ],
-                [
-                    {"text": "30 Days", "callback_data": "gk_dur:2592000"},
-                    {"text": "❌ Cancel","callback_data": "gk_cancel"},
-                ],
-            ]
-        )
-        return
-
-    # ── One-shot: /generate_key 1d ─────────────────────────────
-    duration = _parse_duration(args)
-    if duration <= 0:
-        _tg_send(token, chat_id,
-            "❌ <b>Invalid duration.</b>\n\n"
-            "Usage: /generate_key 1d\n"
-            "Examples: 1hrs  30min  7d")
-        return
-
-    # Start from users step (duration already known)
-    _genkey_wizard[chat_id] = {"step": "AWAIT_USERS", "duration": duration}
-    _ask_genkey_users(token, chat_id, duration)
-
-
-def _ask_genkey_users(token: str, chat_id, duration: int):
-    """Ask owner how many users/devices can redeem this key (Step 2 of 4)."""
+    # Start interactive wizard — Step 1: Tier
+    _genkey_wizard[chat_id] = {"step": "AWAIT_TIER"}
     _tg_send_buttons(token, chat_id,
-        f"🔑 <b>Generate Key — Step 2 of 4</b>\n\n"
-        f"⏳ Duration: <b>{_dur_label(duration)}</b>\n\n"
-        f"👥 How many users/devices can use this key?\n\n"
-        f"<i>Tap a button or type a custom number (e.g. <code>50</code>)</i>",
+        "🔑 <b>Generate Key — Step 1 of 6</b>\n\n"
+        "🏷 <b>Select Tier:</b>\n\n"
+        "<i>Free = basic access  |  VIP = premium access + more threads</i>",
         [
             [
-                {"text": "1 user",    "callback_data": "gk_usr:1"},
-                {"text": "5 users",   "callback_data": "gk_usr:5"},
-                {"text": "10 users",  "callback_data": "gk_usr:10"},
+                {"text": "🆓 Free",  "callback_data": "gk_tier:free"},
+                {"text": "⭐ VIP",   "callback_data": "gk_tier:vip"},
             ],
             [
-                {"text": "25 users",  "callback_data": "gk_usr:25"},
-                {"text": "50 users",  "callback_data": "gk_usr:50"},
-                {"text": "100 users", "callback_data": "gk_usr:100"},
-            ],
-            [
-                {"text": "∞ Unlimited users", "callback_data": "gk_usr:0"},
-                {"text": "❌ Cancel",          "callback_data": "gk_cancel"},
+                {"text": "❌ Cancel", "callback_data": "gk_cancel"},
             ],
         ]
     )
 
 
-def _ask_genkey_limit(token: str, chat_id, duration: int, max_users: int):
-    """Ask owner to pick combo line limit for the new key(s) (Step 3 of 4)."""
-    users_disp = "∞ Unlimited" if max_users == 0 else f"{max_users}"
+def _ask_genkey_format(token: str, chat_id):
+    """Step 2: Key format."""
+    wiz = _genkey_wizard.get(chat_id, {})
+    tier_disp = "⭐ VIP" if wiz.get("tier") == "vip" else "🆓 Free"
     _tg_send_buttons(token, chat_id,
-        f"🔑 <b>Generate Key — Step 3 of 4</b>\n\n"
-        f"⏳ Duration: <b>{_dur_label(duration)}</b>\n"
-        f"👥 Users: <b>{users_disp}</b>\n\n"
-        f"📦 How many combo lines should each user be allowed?\n\n"
-        f"<i>Tap a button or type a custom number (e.g. <code>2000</code>)</i>",
+        f"🔑 <b>Generate Key — Step 2 of 6</b>\n\n"
+        f"🏷 Tier: <b>{tier_disp}</b>\n\n"
+        f"🔤 <b>Select Key Format:</b>\n\n"
+        f"<i>How should the key look?</i>",
         [
             [
-                {"text": "500 lines",  "callback_data": "gk_lim:500"},
-                {"text": "1000 lines", "callback_data": "gk_lim:1000"},
+                {"text": "UUID v4",      "callback_data": "gk_fmt:uuid"},
+                {"text": "HEX-32",       "callback_data": "gk_fmt:hex"},
             ],
             [
-                {"text": "2500 lines", "callback_data": "gk_lim:2500"},
-                {"text": "5000 lines", "callback_data": "gk_lim:5000"},
+                {"text": "ALPHANUM-24",  "callback_data": "gk_fmt:alphanum"},
+                {"text": "PREFIX-KEY",   "callback_data": "gk_fmt:prefix"},
             ],
             [
-                {"text": "∞ Unlimited","callback_data": "gk_lim:0"},
-                {"text": "❌ Cancel",  "callback_data": "gk_cancel"},
+                {"text": "❌ Cancel", "callback_data": "gk_cancel"},
             ],
         ]
     )
 
 
-def _ask_genkey_count(token: str, chat_id, duration: int, max_users: int, combo_limit: int):
-    """Ask owner how many keys to generate (Step 4 of 4)."""
-    limit_disp = "∞ Unlimited" if combo_limit == 0 else f"{combo_limit:,} lines"
-    users_disp = "∞ Unlimited" if max_users == 0 else f"{max_users}"
+def _ask_genkey_expiry(token: str, chat_id):
+    """Step 3: Expiry — same options as KeyVault dashboard."""
+    wiz = _genkey_wizard.get(chat_id, {})
+    tier_disp = "⭐ VIP" if wiz.get("tier") == "vip" else "🆓 Free"
+    fmt_disp = (wiz.get("format") or "uuid").upper()
     _tg_send_buttons(token, chat_id,
-        f"🔑 <b>Generate Key — Step 4 of 4</b>\n\n"
-        f"⏳ Duration: <b>{_dur_label(duration)}</b>\n"
-        f"👥 Users/key: <b>{users_disp}</b>\n"
-        f"📦 Limit/user: <b>{limit_disp}</b>\n\n"
-        f"🔢 How many keys do you want to generate?\n\n"
-        f"<i>Tap a button or type a custom number (e.g. <code>50</code>)</i>",
+        f"🔑 <b>Generate Key — Step 3 of 6</b>\n\n"
+        f"🏷 Tier: <b>{tier_disp}</b>\n"
+        f"🔤 Format: <b>{fmt_disp}</b>\n\n"
+        f"⏳ <b>Select Expiry:</b>\n\n"
+        f"<i>How long should the key be valid?</i>",
+        [
+            [
+                {"text": "7 Days",   "callback_data": "gk_exp:7"},
+                {"text": "30 Days",  "callback_data": "gk_exp:30"},
+                {"text": "90 Days",  "callback_data": "gk_exp:90"},
+            ],
+            [
+                {"text": "1 Year",   "callback_data": "gk_exp:365"},
+                {"text": "♾ Never",  "callback_data": "gk_exp:0"},
+            ],
+            [
+                {"text": "❌ Cancel", "callback_data": "gk_cancel"},
+            ],
+        ]
+    )
+
+
+def _ask_genkey_combo(token: str, chat_id):
+    """Step 4: Combo Limit — same as KeyVault dashboard."""
+    wiz = _genkey_wizard.get(chat_id, {})
+    tier_disp = "⭐ VIP" if wiz.get("tier") == "vip" else "🆓 Free"
+    fmt_disp = (wiz.get("format") or "uuid").upper()
+    exp_disp = "Never" if wiz.get("expiry_days") == 0 else f"{wiz.get('expiry_days')} days"
+    _tg_send_buttons(token, chat_id,
+        f"🔑 <b>Generate Key — Step 4 of 6</b>\n\n"
+        f"🏷 Tier: <b>{tier_disp}</b>\n"
+        f"🔤 Format: <b>{fmt_disp}</b>\n"
+        f"⏳ Expiry: <b>{exp_disp}</b>\n\n"
+        f"📦 <b>Select Combo Limit:</b>\n\n"
+        f"<i>How many combo lines per user?</i>",
+        [
+            [
+                {"text": "1,000 lines",  "callback_data": "gk_lim:1000"},
+                {"text": "5,000 lines",  "callback_data": "gk_lim:5000"},
+            ],
+            [
+                {"text": "∞ Unlimited",  "callback_data": "gk_lim:0"},
+            ],
+            [
+                {"text": "❌ Cancel", "callback_data": "gk_cancel"},
+            ],
+        ]
+    )
+
+
+def _ask_genkey_redeems(token: str, chat_id):
+    """Step 5: Max Redemptions — same as KeyVault dashboard."""
+    wiz = _genkey_wizard.get(chat_id, {})
+    tier_disp = "⭐ VIP" if wiz.get("tier") == "vip" else "🆓 Free"
+    fmt_disp = (wiz.get("format") or "uuid").upper()
+    exp_disp = "Never" if wiz.get("expiry_days") == 0 else f"{wiz.get('expiry_days')} days"
+    combo_disp = "∞ Unlimited" if wiz.get("combo_limit") == 0 else f"{wiz.get('combo_limit', 1000):,} lines"
+    _tg_send_buttons(token, chat_id,
+        f"🔑 <b>Generate Key — Step 5 of 6</b>\n\n"
+        f"🏷 Tier: <b>{tier_disp}</b>\n"
+        f"🔤 Format: <b>{fmt_disp}</b>\n"
+        f"⏳ Expiry: <b>{exp_disp}</b>\n"
+        f"📦 Combo: <b>{combo_disp}</b>\n\n"
+        f"👥 <b>Max Redemptions:</b>\n\n"
+        f"<i>How many users can redeem this key?</i>",
+        [
+            [
+                {"text": "1",    "callback_data": "gk_usr:1"},
+                {"text": "5",    "callback_data": "gk_usr:5"},
+                {"text": "10",   "callback_data": "gk_usr:10"},
+            ],
+            [
+                {"text": "50",   "callback_data": "gk_usr:50"},
+                {"text": "100",  "callback_data": "gk_usr:100"},
+                {"text": "∞",    "callback_data": "gk_usr:0"},
+            ],
+            [
+                {"text": "❌ Cancel", "callback_data": "gk_cancel"},
+            ],
+        ]
+    )
+
+
+def _ask_genkey_count(token: str, chat_id):
+    """Step 6: How many keys to generate."""
+    wiz = _genkey_wizard.get(chat_id, {})
+    tier_disp = "⭐ VIP" if wiz.get("tier") == "vip" else "🆓 Free"
+    fmt_disp = (wiz.get("format") or "uuid").upper()
+    exp_disp = "Never" if wiz.get("expiry_days") == 0 else f"{wiz.get('expiry_days')} days"
+    combo_disp = "∞ Unlimited" if wiz.get("combo_limit") == 0 else f"{wiz.get('combo_limit', 1000):,} lines"
+    redeems_disp = "∞ Unlimited" if wiz.get("max_redemptions") == 0 else f"{wiz.get('max_redemptions', 1)}"
+    _tg_send_buttons(token, chat_id,
+        f"🔑 <b>Generate Key — Step 6 of 6</b>\n\n"
+        f"🏷 Tier: <b>{tier_disp}</b>\n"
+        f"🔤 Format: <b>{fmt_disp}</b>\n"
+        f"⏳ Expiry: <b>{exp_disp}</b>\n"
+        f"📦 Combo: <b>{combo_disp}</b>\n"
+        f"👥 Redeems: <b>{redeems_disp}</b>\n\n"
+        f"🔢 <b>How many keys to generate?</b>",
         [
             [
                 {"text": "1 key",    "callback_data": "gk_cnt:1"},
@@ -4545,12 +4611,15 @@ def _ask_genkey_count(token: str, chat_id, duration: int, max_users: int, combo_
     )
 
 
-def _finalize_gen_key(token: str, chat_id, duration: int, combo_limit: int, count: int = 1, max_users: int = 1):
-    """Actually create `count` keys, each allowing up to `max_users` users.
+def _finalize_gen_key(token: str, chat_id, tier: str, key_format: str,
+                      expiry_days: int, combo_limit: int, max_redemptions: int,
+                      count: int = 1, label: str = ""):
+    """Create `count` keys matching KeyVault dashboard fields.
     Tries KeyVault API first; falls back to local JSON storage.
     """
     now     = time.time()
-    expires = now + duration
+    duration = expiry_days * 86400 if expiry_days > 0 else 0
+    expires = (now + duration) if duration > 0 else (now + 86400 * 36500)  # ~100 years for "Never"
     keys    = _load_keys()
 
     new_keys = []
@@ -4559,54 +4628,76 @@ def _finalize_gen_key(token: str, chat_id, duration: int, combo_limit: int, coun
     # Try KeyVault API first
     api_keys = []
     if api.enabled:
-        api_keys = api.generate_key(duration, max_users, combo_limit, count)
+        api_keys = api.generate_key(
+            duration_seconds=duration if duration > 0 else 86400 * 365,
+            max_users=max_redemptions,
+            combo_limit=combo_limit,
+            count=count,
+            tier=tier,
+            key_format=key_format,
+            label=label,
+        )
 
     if api_keys:
-        # Keys generated via API — also store locally for user tracking
         for api_key_data in api_keys:
             k = api_key_data.get("key", _gen_key())
             keys[k] = {
-                "expires":     expires,
-                "combo_limit": combo_limit,
-                "max_users":   max_users,
-                "used_by":     [],
-                "created":     now,
-                "api_id":      api_key_data.get("id", ""),
-                "source":      "keyvault",
+                "expires":         expires,
+                "combo_limit":     combo_limit,
+                "max_users":       max_redemptions,
+                "used_by":         [],
+                "created":         now,
+                "api_id":          api_key_data.get("id", ""),
+                "source":          "keyvault",
+                "tier":            tier,
+                "format":          key_format,
+                "label":           label or api_key_data.get("label", ""),
+                "redemption_count": 0,
             }
             new_keys.append(k)
     else:
-        # Fallback: generate locally
         for _ in range(count):
-            k = _gen_key()
+            k = _gen_local_key(key_format, tier)
             keys[k] = {
-                "expires":     expires,
-                "combo_limit": combo_limit,
-                "max_users":   max_users,
-                "used_by":     [],
-                "created":     now,
-                "source":      "local",
+                "expires":         expires,
+                "combo_limit":     combo_limit,
+                "max_users":       max_redemptions,
+                "used_by":         [],
+                "created":         now,
+                "source":          "local",
+                "tier":            tier,
+                "format":          key_format,
+                "label":           label,
+                "redemption_count": 0,
             }
             new_keys.append(k)
 
     _save_keys(keys)
     _genkey_wizard.pop(chat_id, None)
 
-    limit_disp = "∞ Unlimited" if combo_limit == 0 else f"{combo_limit:,} lines"
-    users_disp = "∞ Unlimited" if max_users  == 0 else f"{max_users}"
-    exp_dt     = datetime.fromtimestamp(expires).strftime("%Y-%m-%d %H:%M")
+    # Display fields matching KeyVault dashboard
+    tier_disp    = "⭐ VIP" if tier == "vip" else "🆓 Free"
+    fmt_disp     = key_format.upper()
+    combo_disp   = "∞ Unlimited" if combo_limit == 0 else f"{combo_limit:,} lines"
+    redeems_disp = "∞ Unlimited" if max_redemptions == 0 else f"{max_redemptions}"
+    exp_disp     = "Never" if expiry_days == 0 else f"{expiry_days} days"
+    exp_dt       = "Never" if expiry_days == 0 else datetime.fromtimestamp(expires).strftime("%Y-%m-%d %H:%M")
+    label_disp   = label if label else "(none)"
 
     if count == 1:
         _tg_send(token, chat_id,
             f"✅ <b>Key Generated Successfully!</b>\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔑 <b>Key:</b>\n<code>{new_keys[0]}</code>\n\n"
-            f"⏳ <b>Duration:</b> {_dur_label(duration)}\n"
+            f"🏷 <b>Tier:</b> {tier_disp}\n"
+            f"🔤 <b>Format:</b> {fmt_disp}\n"
+            f"📝 <b>Label:</b> {label_disp}\n"
+            f"⏳ <b>Expiry:</b> {exp_disp}\n"
             f"📅 <b>Expires:</b> {exp_dt}\n"
-            f"👥 <b>Users/devices:</b> {users_disp}\n"
-            f"📦 <b>Combo limit/user:</b> {limit_disp}\n"
+            f"📦 <b>Combo Limit:</b> {combo_disp}\n"
+            f"👥 <b>Max Redemptions:</b> {redeems_disp}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"<i>Share this key — up to {users_disp} users can redeem it.</i>"
+            f"<i>Share this key — up to {redeems_disp} users can redeem it.</i>"
         )
     else:
         import io
@@ -4618,10 +4709,12 @@ def _finalize_gen_key(token: str, chat_id, duration: int, combo_limit: int, coun
         _tg_send(token, chat_id,
             f"✅ <b>{count} Keys Generated!</b>\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏳ <b>Duration:</b> {_dur_label(duration)}\n"
+            f"🏷 <b>Tier:</b> {tier_disp}\n"
+            f"🔤 <b>Format:</b> {fmt_disp}\n"
+            f"⏳ <b>Expiry:</b> {exp_disp}\n"
             f"📅 <b>Expires:</b> {exp_dt}\n"
-            f"👥 <b>Users/devices per key:</b> {users_disp}\n"
-            f"📦 <b>Combo limit/user:</b> {limit_disp}\n"
+            f"📦 <b>Combo Limit:</b> {combo_disp}\n"
+            f"👥 <b>Max Redemptions:</b> {redeems_disp}\n"
             f"🔢 <b>Total keys:</b> {count}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"<i>Keys attached below as .txt file.</i>"
@@ -4632,7 +4725,7 @@ def _finalize_gen_key(token: str, chat_id, duration: int, combo_limit: int, coun
                 url,
                 data={
                     "chat_id":    chat_id,
-                    "caption":    f"🔑 <b>{count} keys</b> · {_dur_label(duration)} · {users_disp} users · {limit_disp}",
+                    "caption":    f"🔑 <b>{count} keys</b> · {tier_disp} · {exp_disp} · {combo_disp} · {redeems_disp} redeems",
                     "parse_mode": "HTML",
                 },
                 files={"document": (fname, io.BytesIO(txt_bytes), "text/plain")},
@@ -4798,17 +4891,21 @@ def _handle_status_key(token: str, chat_id, from_user: dict, args: str):
                 expires_at = ak.get("expiresAt")
                 expires = (expires_at / 1000.0) if expires_at else (now + 86400 * 365)
                 rate_limit = ak.get("rateLimit", "1000")
-                combo_limit = int(rate_limit) if rate_limit.isdigit() else 0
+                combo_limit = int(rate_limit) if str(rate_limit).isdigit() else 0
                 max_redemptions = ak.get("maxRedemptions")
                 keys[key_value] = {
-                    "expires":     expires,
-                    "combo_limit": combo_limit,
-                    "max_users":   max_redemptions if max_redemptions else 0,
-                    "used_by":     [],
-                    "created":     ak.get("createdAt", now * 1000) / 1000.0,
-                    "api_id":      ak.get("id", ""),
-                    "source":      "keyvault",
-                    "revoked":     ak.get("revoked", False),
+                    "expires":         expires,
+                    "combo_limit":     combo_limit,
+                    "max_users":       max_redemptions if max_redemptions else 0,
+                    "used_by":         [],
+                    "created":         ak.get("createdAt", now * 1000) / 1000.0,
+                    "api_id":          ak.get("id", ""),
+                    "source":          "keyvault",
+                    "revoked":         ak.get("revoked", False),
+                    "tier":            ak.get("tier", "free"),
+                    "format":          ak.get("format", "unknown"),
+                    "label":           ak.get("label", ""),
+                    "redemption_count": ak.get("redemptionCount", 0),
                 }
         _save_keys(keys)
 
@@ -4826,48 +4923,61 @@ def _handle_status_key(token: str, chat_id, from_user: dict, args: str):
             return
         e = keys[target]
         expired   = now > e.get("expires", 0)
+        revoked   = e.get("revoked", False)
         remaining = max(0, int(e.get("expires", 0) - now))
-        status    = "❌ Expired" if expired else f"✅ Active — {_dur_label(remaining)} left"
-        # Handle both legacy (string) and new (list) used_by
+        if revoked:
+            status = "🚫 Revoked"
+        elif expired:
+            status = "❌ Expired"
+        else:
+            status = f"✅ Active — {_dur_label(remaining)} left"
         used_by   = e.get("used_by", [])
         if isinstance(used_by, str):
             used_by = [used_by] if used_by else []
         max_users  = e.get("max_users", 1)
         slots_used = len(used_by)
         slots_max  = "∞" if max_users == 0 else str(max_users)
-        limit_disp = "∞ Unlimited" if e.get("combo_limit") == 0 else f"{e.get('combo_limit', 500):,}"
+        combo_disp = "∞ Unlimited" if e.get("combo_limit") == 0 else f"{e.get('combo_limit', 500):,} lines"
         created    = datetime.fromtimestamp(e.get("created", 0)).strftime("%Y-%m-%d %H:%M")
         exp_dt     = datetime.fromtimestamp(e.get("expires", 0)).strftime("%Y-%m-%d %H:%M")
+        tier_disp  = "⭐ VIP" if e.get("tier") == "vip" else "🆓 Free"
+        label_disp = e.get("label") or "(none)"
+        fmt_disp   = (e.get("format") or "unknown").upper()
+        source     = e.get("source", "local")
         users_list = "\n".join(f"    • <code>{u}</code>" for u in used_by) or "    <i>none yet</i>"
         _tg_send(token, chat_id,
             f"🔍 <b>Key Details</b>\n\n"
             f"🔑 <code>{target}</code>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 <b>Status:</b> {status}\n"
+            f"🏷 <b>Tier:</b> {tier_disp}\n"
+            f"🔤 <b>Format:</b> {fmt_disp}\n"
+            f"📝 <b>Label:</b> {label_disp}\n"
             f"📅 <b>Created:</b> {created}\n"
             f"📅 <b>Expires:</b> {exp_dt}\n"
-            f"👥 <b>Slots:</b> {slots_used}/{slots_max} used\n"
-            f"📦 <b>Limit/user:</b> {limit_disp} lines\n"
+            f"📦 <b>Combo Limit:</b> {combo_disp}\n"
+            f"👥 <b>Max Redemptions:</b> {slots_used}/{slots_max} used\n"
+            f"📡 <b>Source:</b> {source}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"👤 <b>Users redeemed:</b>\n{users_list}"
         )
         return
 
-    # Show summary of all keys
-    total   = len(keys)
-    active  = [k for k, v in keys.items() if now < v.get("expires", 0)]
-    expired = [k for k, v in keys.items() if now >= v.get("expires", 0)]
+    # Show summary of all keys — same layout as KeyVault dashboard stats
+    total    = len(keys)
+    active   = [k for k, v in keys.items() if now < v.get("expires", 0) and not v.get("revoked")]
+    expired  = [k for k, v in keys.items() if now >= v.get("expires", 0) and not v.get("revoked")]
+    revoked  = [k for k, v in keys.items() if v.get("revoked")]
 
     def _used_count(v):
         ub = v.get("used_by", [])
         if isinstance(ub, str): return 1 if ub else 0
         return len(ub)
 
-    unused  = [k for k, v in keys.items() if _used_count(v) == 0]
-
     lines = [
-        f"📋 <b>Key Status Overview</b>\n"
+        f"📋 <b>Key Status — Dashboard</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔢 <b>Total:</b> {total}  |  ✅ Active: {len(active)}  |  ❌ Expired: {len(expired)}\n"
-        f"🆓 <b>Unused:</b> {len(unused)}\n"
+        f"🔢 <b>Total:</b> {total}  |  ✅ Active: {len(active)}  |  ❌ Expired: {len(expired)}  |  🚫 Revoked: {len(revoked)}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     ]
 
@@ -4878,9 +4988,12 @@ def _handle_status_key(token: str, chat_id, from_user: dict, args: str):
             rem        = max(0, int(v.get("expires", 0) - now))
             used_cnt   = _used_count(v)
             max_u      = v.get("max_users", 1)
-            slots      = f"{used_cnt}/{'∞' if max_u == 0 else max_u}"
-            lim        = "∞" if v.get("combo_limit") == 0 else str(v.get("combo_limit", 500))
-            lines.append(f"  <code>{k}</code>\n  ⏳ {_dur_label(rem)} · 👥 {slots} · 📦 {lim}")
+            redeems    = f"{used_cnt}/{'∞' if max_u == 0 else max_u}"
+            combo      = "∞" if v.get("combo_limit") == 0 else str(v.get("combo_limit", 1000))
+            tier_badge = "⭐" if v.get("tier") == "vip" else "🆓"
+            label      = v.get("label", "")
+            label_str  = f" · {label}" if label else ""
+            lines.append(f"  {tier_badge} <code>{k[:20]}{'…' if len(k) > 20 else ''}</code>{label_str}\n  ⏳ {_dur_label(rem)} · 👥 {redeems} · 📦 {combo}")
         if len(active) > 10:
             lines.append(f"  <i>...and {len(active)-10} more</i>")
 
@@ -4890,12 +5003,22 @@ def _handle_status_key(token: str, chat_id, from_user: dict, args: str):
             v        = keys[k]
             used_cnt = _used_count(v)
             max_u    = v.get("max_users", 1)
-            slots    = f"{used_cnt}/{'∞' if max_u == 0 else max_u}"
-            lines.append(f"  <code>{k}</code> — 👥 {slots}")
+            redeems  = f"{used_cnt}/{'∞' if max_u == 0 else max_u}"
+            tier_badge = "⭐" if v.get("tier") == "vip" else "🆓"
+            lines.append(f"  {tier_badge} <code>{k[:20]}{'…' if len(k) > 20 else ''}</code> — 👥 {redeems}")
         if len(expired) > 5:
             lines.append(f"  <i>...and {len(expired)-5} more</i>")
 
-    lines.append(f"\n<i>Use /deletekey to remove keys</i>")
+    if revoked:
+        lines.append("\n🚫 <b>Revoked Keys:</b>")
+        for k in revoked[:5]:
+            v = keys[k]
+            tier_badge = "⭐" if v.get("tier") == "vip" else "🆓"
+            lines.append(f"  {tier_badge} <code>{k[:20]}{'…' if len(k) > 20 else ''}</code>")
+        if len(revoked) > 5:
+            lines.append(f"  <i>...and {len(revoked)-5} more</i>")
+
+    lines.append(f"\n<i>Use /statuskey KEY for details · /deletekey to remove</i>")
     _tg_send(token, chat_id, "\n".join(lines))
 
 
@@ -6084,25 +6207,18 @@ def _handle_callback_query(token: str, cq: dict):
     # ── Admin panel button routing ─────────────────────────────
     if data == "admin:genkey":
         if not _is_owner(from_user): return
-        _genkey_wizard[chat_id] = {"step": "AWAIT_DURATION"}
+        _genkey_wizard[chat_id] = {"step": "AWAIT_TIER"}
         _tg_send_buttons(token, chat_id,
-            "🔑 <b>Generate Key — Step 1 of 4</b>\n\n"
-            "⏳ How long should the key be valid?\n\n"
-            "<i>Tap a button or type a custom duration</i>",
+            "🔑 <b>Generate Key — Step 1 of 6</b>\n\n"
+            "🏷 <b>Select Tier:</b>\n\n"
+            "<i>Free = basic access  |  VIP = premium access + more threads</i>",
             [
                 [
-                    {"text": "1 Hour",   "callback_data": "gk_dur:3600"},
-                    {"text": "6 Hours",  "callback_data": "gk_dur:21600"},
-                    {"text": "12 Hours", "callback_data": "gk_dur:43200"},
+                    {"text": "🆓 Free",  "callback_data": "gk_tier:free"},
+                    {"text": "⭐ VIP",   "callback_data": "gk_tier:vip"},
                 ],
                 [
-                    {"text": "1 Day",    "callback_data": "gk_dur:86400"},
-                    {"text": "3 Days",   "callback_data": "gk_dur:259200"},
-                    {"text": "7 Days",   "callback_data": "gk_dur:604800"},
-                ],
-                [
-                    {"text": "30 Days",  "callback_data": "gk_dur:2592000"},
-                    {"text": "❌ Cancel","callback_data": "gk_cancel"},
+                    {"text": "❌ Cancel", "callback_data": "gk_cancel"},
                 ],
             ]
         )
@@ -6230,41 +6346,63 @@ def _handle_callback_query(token: str, cq: dict):
     if data == "dk_noop":
         return
 
-    # ── Genkey wizard — duration chosen → ask users ───────────
-    if data.startswith("gk_dur:"):
+    # ── Genkey wizard — Tier selected → ask Format ──────────────
+    if data.startswith("gk_tier:"):
         if not _is_owner(from_user): return
-        duration = int(data.split(":")[1])
-        _genkey_wizard[chat_id] = {"step": "AWAIT_USERS", "duration": duration}
-        _ask_genkey_users(token, chat_id, duration)
+        tier = data.split(":")[1]
+        _genkey_wizard[chat_id] = {"step": "AWAIT_FORMAT", "tier": tier}
+        _ask_genkey_format(token, chat_id)
         return
 
-    # ── Genkey wizard — users chosen → ask limit ──────────────
-    if data.startswith("gk_usr:"):
+    # ── Genkey wizard — Format selected → ask Expiry ──────────
+    if data.startswith("gk_fmt:"):
         if not _is_owner(from_user): return
         wiz = _genkey_wizard.get(chat_id, {})
-        if not wiz or wiz.get("step") != "AWAIT_USERS":
+        if not wiz or wiz.get("step") != "AWAIT_FORMAT":
             _tg_send(token, chat_id, "⚠️ Session expired. Use /generate_key again.")
             return
-        max_users        = int(data.split(":")[1])
-        wiz["step"]      = "AWAIT_LIMIT"
-        wiz["max_users"] = max_users
-        _ask_genkey_limit(token, chat_id, wiz["duration"], max_users)
+        wiz["format"] = data.split(":")[1]
+        wiz["step"] = "AWAIT_EXPIRY"
+        _ask_genkey_expiry(token, chat_id)
         return
 
-    # ── Genkey wizard — limit chosen → ask count ──────────────
+    # ── Genkey wizard — Expiry selected → ask Combo Limit ─────
+    if data.startswith("gk_exp:"):
+        if not _is_owner(from_user): return
+        wiz = _genkey_wizard.get(chat_id, {})
+        if not wiz or wiz.get("step") != "AWAIT_EXPIRY":
+            _tg_send(token, chat_id, "⚠️ Session expired. Use /generate_key again.")
+            return
+        wiz["expiry_days"] = int(data.split(":")[1])
+        wiz["step"] = "AWAIT_COMBO"
+        _ask_genkey_combo(token, chat_id)
+        return
+
+    # ── Genkey wizard — Combo selected → ask Max Redemptions ──
     if data.startswith("gk_lim:"):
         if not _is_owner(from_user): return
         wiz = _genkey_wizard.get(chat_id, {})
-        if not wiz or wiz.get("step") != "AWAIT_LIMIT":
+        if not wiz or wiz.get("step") != "AWAIT_COMBO":
             _tg_send(token, chat_id, "⚠️ Session expired. Use /generate_key again.")
             return
-        limit = int(data.split(":")[1])
-        wiz["step"]        = "AWAIT_COUNT"
-        wiz["combo_limit"] = limit
-        _ask_genkey_count(token, chat_id, wiz["duration"], wiz["max_users"], limit)
+        wiz["combo_limit"] = int(data.split(":")[1])
+        wiz["step"] = "AWAIT_REDEEMS"
+        _ask_genkey_redeems(token, chat_id)
         return
 
-    # ── Genkey wizard — count chosen → finalize ───────────────
+    # ── Genkey wizard — Redeems selected → ask Count ──────────
+    if data.startswith("gk_usr:"):
+        if not _is_owner(from_user): return
+        wiz = _genkey_wizard.get(chat_id, {})
+        if not wiz or wiz.get("step") != "AWAIT_REDEEMS":
+            _tg_send(token, chat_id, "⚠️ Session expired. Use /generate_key again.")
+            return
+        wiz["max_redemptions"] = int(data.split(":")[1])
+        wiz["step"] = "AWAIT_COUNT"
+        _ask_genkey_count(token, chat_id)
+        return
+
+    # ── Genkey wizard — Count chosen → finalize ───────────────
     if data.startswith("gk_cnt:"):
         if not _is_owner(from_user): return
         wiz = _genkey_wizard.get(chat_id, {})
@@ -6272,7 +6410,16 @@ def _handle_callback_query(token: str, cq: dict):
             _tg_send(token, chat_id, "⚠️ Session expired. Use /generate_key again.")
             return
         count = int(data.split(":")[1])
-        _finalize_gen_key(token, chat_id, wiz["duration"], wiz["combo_limit"], count, wiz["max_users"])
+        _finalize_gen_key(
+            token, chat_id,
+            tier=wiz.get("tier", "vip"),
+            key_format=wiz.get("format", "alphanum"),
+            expiry_days=wiz.get("expiry_days", 30),
+            combo_limit=wiz.get("combo_limit", 1000),
+            max_redemptions=wiz.get("max_redemptions", 1),
+            count=count,
+            label=wiz.get("label", ""),
+        )
         return
 
     # ── Cancel genkey wizard ───────────────────────────────────
@@ -6498,43 +6645,45 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
     # ── Intercept text replies for genkey wizard ───────────────
     if _is_owner(from_user) and chat_id in _genkey_wizard:
         wiz = _genkey_wizard[chat_id]
-        if wiz["step"] == "AWAIT_DURATION" and text and not text.startswith("/"):
-            dur = _parse_duration(text)
-            if dur > 0:
-                wiz["step"]     = "AWAIT_USERS"
-                wiz["duration"] = dur
-                _ask_genkey_users(token, chat_id, dur)
-            else:
-                _tg_send(token, chat_id,
-                    "❌ Invalid format. Try: <code>1d</code>  <code>12hrs</code>  <code>45min</code>")
-            return
-        if wiz["step"] == "AWAIT_USERS" and text and not text.startswith("/"):
-            try:
-                max_users = int(text.strip())
-                if max_users < 0: raise ValueError
-                wiz["step"]      = "AWAIT_LIMIT"
-                wiz["max_users"] = max_users
-                _ask_genkey_limit(token, chat_id, wiz["duration"], max_users)
-            except ValueError:
-                _tg_send(token, chat_id,
-                    "❌ Enter a number (e.g. <code>10</code>) or <code>0</code> for unlimited.")
-            return
-        if wiz["step"] == "AWAIT_LIMIT" and text and not text.startswith("/"):
+        # Custom combo limit input
+        if wiz["step"] == "AWAIT_COMBO" and text and not text.startswith("/"):
             try:
                 limit = int(text.strip())
                 if limit < 0: raise ValueError
-                wiz["step"]        = "AWAIT_COUNT"
                 wiz["combo_limit"] = limit
-                _ask_genkey_count(token, chat_id, wiz["duration"], wiz["max_users"], limit)
+                wiz["step"] = "AWAIT_REDEEMS"
+                _ask_genkey_redeems(token, chat_id)
             except ValueError:
                 _tg_send(token, chat_id,
-                    "❌ Please enter a valid number (e.g. <code>1000</code>) or <code>0</code> for unlimited.")
+                    "❌ Enter a number (e.g. <code>2500</code>) or <code>0</code> for unlimited.")
             return
+        # Custom max redemptions input
+        if wiz["step"] == "AWAIT_REDEEMS" and text and not text.startswith("/"):
+            try:
+                max_r = int(text.strip())
+                if max_r < 0: raise ValueError
+                wiz["max_redemptions"] = max_r
+                wiz["step"] = "AWAIT_COUNT"
+                _ask_genkey_count(token, chat_id)
+            except ValueError:
+                _tg_send(token, chat_id,
+                    "❌ Enter a number (e.g. <code>25</code>) or <code>0</code> for unlimited.")
+            return
+        # Custom count input
         if wiz["step"] == "AWAIT_COUNT" and text and not text.startswith("/"):
             try:
                 count = int(text.strip())
                 if count < 1 or count > 500: raise ValueError
-                _finalize_gen_key(token, chat_id, wiz["duration"], wiz["combo_limit"], count, wiz["max_users"])
+                _finalize_gen_key(
+                    token, chat_id,
+                    tier=wiz.get("tier", "vip"),
+                    key_format=wiz.get("format", "alphanum"),
+                    expiry_days=wiz.get("expiry_days", 30),
+                    combo_limit=wiz.get("combo_limit", 1000),
+                    max_redemptions=wiz.get("max_redemptions", 1),
+                    count=count,
+                    label=wiz.get("label", ""),
+                )
             except ValueError:
                 _tg_send(token, chat_id,
                     "❌ Enter a number between <code>1</code> and <code>500</code>.")
