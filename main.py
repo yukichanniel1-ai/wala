@@ -3183,23 +3183,43 @@ USERS_FILE = "bot_users.json"
 ACTIVE_SESSIONS_FILE = "active_sessions.json"
 
 
-def _load_saved_users():
-    """Load saved user profiles from disk."""
+def _load_saved_users(sync_api: bool = False):
+    """Load saved user profiles — local file first, optionally sync from API."""
     global _saved_users
+    # Try loading from local file first
     if os.path.exists(USERS_FILE):
         try:
             with open(USERS_FILE, "r", encoding="utf-8") as f:
                 _saved_users = json.load(f)
         except Exception:
             _saved_users = {}
+    # Sync from KeyVault API (has latest data surviving redeploys)
+    if sync_api:
+        try:
+            api = _get_keysystem_api()
+            if api.enabled:
+                remote = api.load_state("bot_users")
+                if remote and isinstance(remote, dict):
+                    for k, v in remote.items():
+                        if k not in _saved_users:
+                            _saved_users[k] = v
+                    logger.info(f"[BOT] Synced {len(remote)} user profiles from KeyVault API")
+        except Exception as e:
+            logger.warning(f"[BOT] Could not sync users from API: {e}")
 
 def _save_users_to_disk():
-    """Persist all saved user profiles to disk."""
+    """Persist all saved user profiles to disk AND sync to KeyVault API."""
     try:
         with open(USERS_FILE, "w", encoding="utf-8") as f:
             json.dump(_saved_users, f, indent=2)
     except Exception as e:
-        logger.warning(f"[BOT] Could not save users: {e}")
+        logger.warning(f"[BOT] Could not save users to disk: {e}")
+    # Also sync to KeyVault API for persistence across Railway redeploys
+    try:
+        if _keysystem_api and _keysystem_api.enabled:
+            _keysystem_api.save_state("bot_users", _saved_users)
+    except Exception:
+        pass
 
 # Load on startup
 _load_saved_users()
@@ -3247,23 +3267,40 @@ def _remove_active_session(chat_id):
 
 
 def _flush_active_sessions():
-    """Write active sessions to disk (called under lock)."""
+    """Write active sessions to disk AND sync to API (called under lock)."""
     try:
         with open(ACTIVE_SESSIONS_FILE, "w", encoding="utf-8") as f:
             json.dump(_active_sessions, f, indent=2)
     except Exception as e:
         logger.warning(f"[BOT] Could not save active sessions: {e}")
+    # Sync to KeyVault API for persistence across Railway redeploys
+    try:
+        if _keysystem_api and _keysystem_api.enabled:
+            _keysystem_api.save_state("active_sessions", _active_sessions)
+    except Exception:
+        pass
 
 
 def _load_active_sessions() -> dict:
-    """Load active sessions from disk on startup."""
+    """Load active sessions — try local first, merge from API."""
+    result = {}
     if os.path.exists(ACTIVE_SESSIONS_FILE):
         try:
             with open(ACTIVE_SESSIONS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                result = json.load(f)
         except Exception:
-            return {}
-    return {}
+            pass
+    # Also check API for sessions saved before redeploy
+    try:
+        if _keysystem_api and _keysystem_api.enabled:
+            remote = _keysystem_api.load_state("active_sessions")
+            if remote and isinstance(remote, dict):
+                for k, v in remote.items():
+                    if k not in result:
+                        result[k] = v
+    except Exception:
+        pass
+    return result
 
 
 def _udata(chat_id) -> dict:
@@ -4183,18 +4220,41 @@ def _is_vip_user(chat_id) -> bool:
 # ══════════════════════════════════════════════════════════════
 KEYS_FILE = "redeem_keys.json"
 
-def _load_keys() -> dict:
+def _load_keys(sync_api: bool = True) -> dict:
+    """Load redeem keys — local file first, optionally merge from KeyVault API."""
+    keys = {}
     if os.path.exists(KEYS_FILE):
         try:
             with open(KEYS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                keys = json.load(f)
         except Exception:
             pass
-    return {}
+    # Merge from API (persists across Railway redeploys)
+    if sync_api:
+        try:
+            api = _get_keysystem_api()
+            if api.enabled:
+                remote = api.load_state("redeem_keys")
+                if remote and isinstance(remote, dict):
+                    for k, v in remote.items():
+                        if k not in keys:
+                            keys[k] = v
+                    if remote:
+                        logger.info(f"[BOT] Synced {len(remote)} redeem keys from KeyVault API")
+        except Exception:
+            pass
+    return keys
 
 def _save_keys(keys: dict):
+    """Save redeem keys to disk AND sync to KeyVault API."""
     with open(KEYS_FILE, "w", encoding="utf-8") as f:
         json.dump(keys, f, indent=2)
+    # Sync to KeyVault API for persistence across Railway redeploys
+    try:
+        if _keysystem_api and _keysystem_api.enabled:
+            _keysystem_api.save_state("redeem_keys", keys)
+    except Exception:
+        pass
 
 
 # ── KeyVault API Integration ────────────────────────────────────
@@ -4342,6 +4402,57 @@ class KeySystemAPI:
             return resp.status_code == 200
         except Exception as e:
             logger.warning(f"[KEYSYSTEM] Revoke error: {e}")
+            return False
+
+    # ── Bot state persistence (via /api/bot/state) ─────────────
+    def save_state(self, key: str, data) -> bool:
+        """Save arbitrary JSON data to KeyVault KV for persistence across redeploys."""
+        if not self.enabled:
+            return False
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/bot/state",
+                headers=self._headers(),
+                json={"key": key, "data": data},
+                timeout=15,
+            )
+            return resp.status_code == 200
+        except Exception as e:
+            logger.warning(f"[KEYSYSTEM] Save state error: {e}")
+            return False
+
+    def load_state(self, key: str):
+        """Load previously saved data from KeyVault KV."""
+        if not self.enabled:
+            return None
+        try:
+            resp = requests.get(
+                f"{self.base_url}/api/bot/state",
+                headers=self._headers(),
+                params={"key": key},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                return resp.json().get("data")
+            return None
+        except Exception as e:
+            logger.warning(f"[KEYSYSTEM] Load state error: {e}")
+            return None
+
+    def delete_state(self, key: str) -> bool:
+        """Delete saved state from KeyVault KV."""
+        if not self.enabled:
+            return False
+        try:
+            resp = requests.delete(
+                f"{self.base_url}/api/bot/state",
+                headers=self._headers(),
+                params={"key": key},
+                timeout=15,
+            )
+            return resp.status_code == 200
+        except Exception as e:
+            logger.warning(f"[KEYSYSTEM] Delete state error: {e}")
             return False
 
 
@@ -7255,6 +7366,12 @@ def start_bot_polling(token: str, _unused=None):
     def _poll():
         nonlocal offset, poll_session, consecutive_errors
         logger.info("[BOT] 🤖 Polling started — waiting for users...")
+        # Sync user profiles and keys from KeyVault API (survives Railway redeploys)
+        try:
+            _load_saved_users(sync_api=True)
+            logger.info("[BOT] ✅ User profiles synced from API")
+        except Exception as e:
+            logger.warning(f"[BOT] API user sync skipped: {e}")
         # Auto-resume any interrupted sessions from previous crash
         try:
             _auto_resume_sessions(token)
