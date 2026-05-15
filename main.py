@@ -3180,6 +3180,7 @@ _saved_users : dict = {}   # username/chat_id -> saved profile (persisted across
 _saved_lock  = threading.Lock()
 
 USERS_FILE = "bot_users.json"
+ACTIVE_SESSIONS_FILE = "active_sessions.json"
 
 
 def _load_saved_users():
@@ -3202,6 +3203,67 @@ def _save_users_to_disk():
 
 # Load on startup
 _load_saved_users()
+
+
+# ── Active session persistence for auto-resume on crash ────────
+_active_sessions: dict = {}  # chat_id -> session info dict
+_active_sessions_lock = threading.Lock()
+
+
+def _save_active_session(chat_id, file_path: str, file_name: str, lines: list,
+                         user_data: dict, progress: int = 0):
+    """Persist an active checking session to disk for crash recovery."""
+    with _active_sessions_lock:
+        _active_sessions[str(chat_id)] = {
+            "chat_id": chat_id,
+            "file_path": file_path,
+            "file_name": file_name,
+            "total_lines": len(lines),
+            "progress": progress,
+            "level": user_data.get("level", [1]),
+            "clean_filter": user_data.get("clean_filter", "both"),
+            "hits_id": user_data.get("hits_id", chat_id),
+            "username": user_data.get("username", ""),
+            "combo_limit": user_data.get("combo_limit", COMBO_LINE_LIMIT),
+            "started_at": time.time(),
+        }
+        _flush_active_sessions()
+
+
+def _update_session_progress(chat_id, progress: int):
+    """Update the progress counter for an active session."""
+    with _active_sessions_lock:
+        key = str(chat_id)
+        if key in _active_sessions:
+            _active_sessions[key]["progress"] = progress
+            _flush_active_sessions()
+
+
+def _remove_active_session(chat_id):
+    """Remove a completed/stopped session from disk."""
+    with _active_sessions_lock:
+        _active_sessions.pop(str(chat_id), None)
+        _flush_active_sessions()
+
+
+def _flush_active_sessions():
+    """Write active sessions to disk (called under lock)."""
+    try:
+        with open(ACTIVE_SESSIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(_active_sessions, f, indent=2)
+    except Exception as e:
+        logger.warning(f"[BOT] Could not save active sessions: {e}")
+
+
+def _load_active_sessions() -> dict:
+    """Load active sessions from disk on startup."""
+    if os.path.exists(ACTIVE_SESSIONS_FILE):
+        try:
+            with open(ACTIVE_SESSIONS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
 
 def _udata(chat_id) -> dict:
@@ -3546,6 +3608,9 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
     with _state_lock:
         _bot_state[chat_id] = "RUNNING"
 
+    # ── Save active session for auto-resume on crash ───────────
+    _save_active_session(chat_id, clean_path, file_name, clean_lines, d)
+
     # ── Create a per-user stop event ───────────────────────────
     stop_evt = threading.Event()
     with _stop_events_lock:
@@ -3652,6 +3717,8 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
                 _bot_state[chat_id] = "AWAIT_FILE"
             with _stop_events_lock:
                 _stop_events.pop(chat_id, None)
+            # Remove from active sessions (no longer needs resume)
+            _remove_active_session(chat_id)
 
             if stopped:
                 _tg_send(token, chat_id,
@@ -3993,6 +4060,9 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
                     speed   = int(done_count[0] / elapsed)
                     _active_bars[bar_key]["done"]  = done_count[0]
                     _active_bars[bar_key]["speed"] = speed
+            # Persist progress every 50 accounts for crash recovery
+            if chat_id and done_count[0] % 50 == 0:
+                _update_session_progress(chat_id, done_count[0])
 
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as ex:
         for fut in as_completed(
@@ -6539,6 +6609,7 @@ def _handle_callback_query(token: str, cq: dict):
         thresholds, label = level_map[val]
         d = _udata(chat_id)
         d["level"] = thresholds
+        _save_profile(chat_id, d)  # auto-save level immediately
         _ask_filter(token, chat_id, label)
         return
 
@@ -7007,6 +7078,157 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
                 "Or send /start to reset settings.")
 
 
+# ── Auto-resume interrupted sessions on startup ───────────────
+def _auto_resume_sessions(token: str):
+    """Check for interrupted sessions from a crash and resume them."""
+    sessions = _load_active_sessions()
+    if not sessions:
+        return
+
+    logger.info(f"[BOT] 🔄 Found {len(sessions)} interrupted session(s) — attempting auto-resume...")
+
+    for key, sess in sessions.items():
+        chat_id    = sess.get("chat_id")
+        file_path  = sess.get("file_path", "")
+        file_name  = sess.get("file_name", "unknown.txt")
+        progress   = sess.get("progress", 0)
+        total      = sess.get("total_lines", 0)
+
+        if not chat_id or not file_path:
+            continue
+
+        # Check if the combo file still exists on disk
+        if not os.path.exists(file_path):
+            logger.warning(f"[BOT] Resume skip: file gone for chat {chat_id}: {file_path}")
+            _tg_send(token, chat_id,
+                f"⚠️ <b>Bot restarted!</b>\n\n"
+                f"Your previous check (<code>{file_name}</code>) could not resume — "
+                f"the file was lost during restart.\n\n"
+                f"📂 Please re-upload your combo file to continue.")
+            _remove_active_session(chat_id)
+            continue
+
+        # Read remaining lines from the file
+        remaining_lines = []
+        for enc in ["utf-8", "latin-1", "cp1252", "iso-8859-1"]:
+            try:
+                with open(file_path, "r", encoding=enc, errors="ignore") as fh:
+                    all_lines = [l.strip() for l in fh if l.strip() and ":" in l]
+                break
+            except Exception:
+                continue
+        else:
+            all_lines = []
+
+        if not all_lines:
+            _tg_send(token, chat_id,
+                f"⚠️ <b>Bot restarted!</b>\n\n"
+                f"Could not resume <code>{file_name}</code> — file is empty or unreadable.\n\n"
+                f"📂 Please re-upload your combo file.")
+            _remove_active_session(chat_id)
+            continue
+
+        # Skip already-processed lines
+        remaining_lines = all_lines[progress:]
+        if not remaining_lines:
+            _tg_send(token, chat_id,
+                f"✅ <b>Bot restarted!</b>\n\n"
+                f"Your previous check (<code>{file_name}</code>) was already complete ({progress}/{total}).\n\n"
+                f"📂 Send a new combo file to start again.")
+            _remove_active_session(chat_id)
+            continue
+
+        # Restore user data
+        d = _udata(chat_id)
+        d["hits_id"]      = sess.get("hits_id", chat_id)
+        d["username"]     = sess.get("username", "")
+        d["level"]        = sess.get("level", [1])
+        d["clean_filter"] = sess.get("clean_filter", "both")
+        d["combo_limit"]  = sess.get("combo_limit", COMBO_LINE_LIMIT)
+
+        # Write remaining lines to a temp file
+        save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "combo")
+        os.makedirs(save_dir, exist_ok=True)
+        resume_path = os.path.join(save_dir, f"resume_{chat_id}_{file_name}")
+        with open(resume_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(remaining_lines) + "\n")
+
+        # Notify user
+        _tg_send(token, chat_id,
+            f"🔄 <b>Auto-Resuming!</b>\n\n"
+            f"Bot restarted — resuming your check automatically.\n\n"
+            f"📄 <b>File:</b> <code>{file_name}</code>\n"
+            f"📊 <b>Progress:</b> {progress}/{total} done\n"
+            f"▶️ <b>Remaining:</b> {len(remaining_lines)} accounts\n\n"
+            f"<i>Resuming now... Send /stop to cancel.</i>")
+
+        # Start checker thread for remaining lines
+        hits_id = d["hits_id"]
+        user_telegram_config = (token, str(hits_id), d["level"], "", d["clean_filter"])
+
+        with _state_lock:
+            _bot_state[chat_id] = "RUNNING"
+
+        # Update session with new file path
+        _save_active_session(chat_id, resume_path, file_name, remaining_lines, d, 0)
+
+        stop_evt = threading.Event()
+        with _stop_events_lock:
+            _stop_events[chat_id] = stop_evt
+
+        def _resume_run(cid=chat_id, rpath=resume_path, tg_cfg=user_telegram_config,
+                        se=stop_evt, fn=file_name, rem=len(remaining_lines)):
+            try:
+                label = f"resume:{cid}"
+                stats, result_folder = _run_checker_for_file(
+                    rpath, tg_cfg, chat_id=cid, label=label, stop_event=se
+                )
+                stopped = se.is_set()
+            except Exception as e:
+                stats = {}
+                result_folder = ""
+                stopped = False
+                logger.error(f"[BOT] Resume checker error: {e}", exc_info=True)
+            finally:
+                with _state_lock:
+                    _bot_state[cid] = "AWAIT_FILE"
+                with _stop_events_lock:
+                    _stop_events.pop(cid, None)
+                _remove_active_session(cid)
+
+                if stopped:
+                    _tg_send(token, cid,
+                        f"🛑 <b>Resumed checker stopped.</b>\n"
+                        f"📊 Partial results for <code>{fn}</code>")
+                else:
+                    valid = stats.get("valid", 0)
+                    invalid = stats.get("invalid", 0)
+                    clean_c = stats.get("clean", 0)
+                    _tg_send(token, cid,
+                        f"✅ <b>Resumed Check Complete!</b>\n\n"
+                        f"📄 <code>{fn}</code>\n"
+                        f"✅ Valid: <code>{valid}</code>  ❌ Invalid: <code>{invalid}</code>  "
+                        f"🧹 Clean: <code>{clean_c}</code>")
+
+                if result_folder and os.path.isdir(result_folder):
+                    _send_results_zip(token, cid, result_folder, fn)
+
+                # Cleanup
+                try:
+                    if os.path.exists(rpath):
+                        os.remove(rpath)
+                except Exception:
+                    pass
+
+                gc.collect()
+                _tg_send(token, cid,
+                    f"📂 Send your next combo file to check again.\n"
+                    f"Or /start to reset your settings.")
+
+        threading.Thread(target=_resume_run, daemon=True).start()
+        logger.info(f"[BOT] 🔄 Resumed session for chat_id={chat_id}, {len(remaining_lines)} remaining")
+
+
 # ── long-poll loop (single daemon thread, handles all users) ───
 def start_bot_polling(token: str, _unused=None):
     offset = 0
@@ -7033,6 +7255,11 @@ def start_bot_polling(token: str, _unused=None):
     def _poll():
         nonlocal offset, poll_session, consecutive_errors
         logger.info("[BOT] 🤖 Polling started — waiting for users...")
+        # Auto-resume any interrupted sessions from previous crash
+        try:
+            _auto_resume_sessions(token)
+        except Exception as e:
+            logger.error(f"[BOT] Auto-resume failed: {e}", exc_info=True)
         while not shutdown_event.is_set():
             try:
                 r = poll_session.get(
