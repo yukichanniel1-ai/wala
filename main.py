@@ -4596,17 +4596,23 @@ _genkey_wizard: dict = {}  # chat_id -> {"step": ..., "tier": str, "format": str
 
 
 def _parse_duration(arg: str) -> int:
-    """Parse e.g. '1hrs' / '2h' / '30min' / '1d' → seconds. Returns 0 on failure."""
+    """Parse e.g. '1hrs' / '2h' / '30min' / '1d' / '2w' / '3mo' → seconds. Returns 0 on failure."""
     arg = arg.strip().lower()
     import re
-    m = re.match(r"(\d+)\s*(hr?s?|min?s?|d)", arg)
-    if not m:
-        return 0
-    val, unit = int(m.group(1)), m.group(2)
-    if unit.startswith("d"):   return val * 86400
-    if unit.startswith("h"):   return val * 3600
-    if unit.startswith("m"):   return val * 60
-    return 0
+    total = 0
+    for m in re.finditer(r"(\d+)\s*(mo(?:n(?:th)?s?)?|w(?:ee)?k?s?|d(?:ay)?s?|hr?s?|min?s?)", arg):
+        val, unit = int(m.group(1)), m.group(2)
+        if unit.startswith("mo"):  total += val * 86400 * 30
+        elif unit.startswith("w"): total += val * 86400 * 7
+        elif unit.startswith("d"): total += val * 86400
+        elif unit.startswith("h"): total += val * 3600
+        elif unit.startswith("m"): total += val * 60
+    if total == 0:
+        # Try plain number as days
+        m = re.match(r"^(\d+)$", arg)
+        if m:
+            total = int(m.group(1)) * 86400
+    return total
 
 
 def _dur_label(seconds: int) -> str:
@@ -4679,15 +4685,24 @@ def _ask_genkey_expiry(token: str, chat_id):
         f"🏷 Tier: <b>{tier_disp}</b>\n"
         f"🔤 Format: <b>{fmt_disp}</b>\n\n"
         f"⏳ <b>Select Expiry:</b>\n\n"
-        f"<i>How long should the key be valid?</i>",
+        f"<i>Pick a preset or type custom (e.g. 1d, 12h, 2w, 3mo):</i>",
         [
             [
-                {"text": "7 Days",   "callback_data": "gk_exp:7"},
-                {"text": "30 Days",  "callback_data": "gk_exp:30"},
-                {"text": "90 Days",  "callback_data": "gk_exp:90"},
+                {"text": "1 Hour",   "callback_data": "gk_exp_h:1"},
+                {"text": "6 Hours",  "callback_data": "gk_exp_h:6"},
+                {"text": "12 Hours", "callback_data": "gk_exp_h:12"},
             ],
             [
+                {"text": "1 Day",    "callback_data": "gk_exp:1"},
+                {"text": "3 Days",   "callback_data": "gk_exp:3"},
+                {"text": "7 Days",   "callback_data": "gk_exp:7"},
+            ],
+            [
+                {"text": "30 Days",  "callback_data": "gk_exp:30"},
+                {"text": "90 Days",  "callback_data": "gk_exp:90"},
                 {"text": "1 Year",   "callback_data": "gk_exp:365"},
+            ],
+            [
                 {"text": "♾ Never",  "callback_data": "gk_exp:0"},
             ],
             [
@@ -4697,25 +4712,39 @@ def _ask_genkey_expiry(token: str, chat_id):
     )
 
 
+def _wiz_expiry_disp(wiz: dict) -> str:
+    """Display expiry from wizard state."""
+    secs = wiz.get("expiry_seconds", 0)
+    if secs > 0:
+        return _dur_label(secs)
+    days = wiz.get("expiry_days", 0)
+    if days > 0:
+        return f"{days}d"
+    return "Never"
+
+
 def _ask_genkey_combo(token: str, chat_id):
     """Step 4: Combo Limit — same as KeyVault dashboard."""
     wiz = _genkey_wizard.get(chat_id, {})
     tier_disp = "⭐ VIP" if wiz.get("tier") == "vip" else "🆓 Free"
     fmt_disp = (wiz.get("format") or "uuid").upper()
-    exp_disp = "Never" if wiz.get("expiry_days") == 0 else f"{wiz.get('expiry_days')} days"
+    exp_disp = _wiz_expiry_disp(wiz)
     _tg_send_buttons(token, chat_id,
         f"🔑 <b>Generate Key — Step 4 of 6</b>\n\n"
         f"🏷 Tier: <b>{tier_disp}</b>\n"
         f"🔤 Format: <b>{fmt_disp}</b>\n"
         f"⏳ Expiry: <b>{exp_disp}</b>\n\n"
         f"📦 <b>Select Combo Limit:</b>\n\n"
-        f"<i>How many combo lines per user?</i>",
+        f"<i>Pick a preset or type a custom number:</i>",
         [
             [
+                {"text": "500 lines",    "callback_data": "gk_lim:500"},
                 {"text": "1,000 lines",  "callback_data": "gk_lim:1000"},
-                {"text": "5,000 lines",  "callback_data": "gk_lim:5000"},
+                {"text": "2,500 lines",  "callback_data": "gk_lim:2500"},
             ],
             [
+                {"text": "5,000 lines",  "callback_data": "gk_lim:5000"},
+                {"text": "10,000 lines", "callback_data": "gk_lim:10000"},
                 {"text": "∞ Unlimited",  "callback_data": "gk_lim:0"},
             ],
             [
@@ -4730,7 +4759,7 @@ def _ask_genkey_redeems(token: str, chat_id):
     wiz = _genkey_wizard.get(chat_id, {})
     tier_disp = "⭐ VIP" if wiz.get("tier") == "vip" else "🆓 Free"
     fmt_disp = (wiz.get("format") or "uuid").upper()
-    exp_disp = "Never" if wiz.get("expiry_days") == 0 else f"{wiz.get('expiry_days')} days"
+    exp_disp = _wiz_expiry_disp(wiz)
     combo_disp = "∞ Unlimited" if wiz.get("combo_limit") == 0 else f"{wiz.get('combo_limit', 1000):,} lines"
     _tg_send_buttons(token, chat_id,
         f"🔑 <b>Generate Key — Step 5 of 6</b>\n\n"
@@ -4739,7 +4768,7 @@ def _ask_genkey_redeems(token: str, chat_id):
         f"⏳ Expiry: <b>{exp_disp}</b>\n"
         f"📦 Combo: <b>{combo_disp}</b>\n\n"
         f"👥 <b>Max Redemptions:</b>\n\n"
-        f"<i>How many users can redeem this key?</i>",
+        f"<i>Pick a preset or type a custom number:</i>",
         [
             [
                 {"text": "1",    "callback_data": "gk_usr:1"},
@@ -4763,7 +4792,7 @@ def _ask_genkey_count(token: str, chat_id):
     wiz = _genkey_wizard.get(chat_id, {})
     tier_disp = "⭐ VIP" if wiz.get("tier") == "vip" else "🆓 Free"
     fmt_disp = (wiz.get("format") or "uuid").upper()
-    exp_disp = "Never" if wiz.get("expiry_days") == 0 else f"{wiz.get('expiry_days')} days"
+    exp_disp = _wiz_expiry_disp(wiz)
     combo_disp = "∞ Unlimited" if wiz.get("combo_limit") == 0 else f"{wiz.get('combo_limit', 1000):,} lines"
     redeems_disp = "∞ Unlimited" if wiz.get("max_redemptions") == 0 else f"{wiz.get('max_redemptions', 1)}"
     _tg_send_buttons(token, chat_id,
@@ -4794,12 +4823,13 @@ def _ask_genkey_count(token: str, chat_id):
 
 def _finalize_gen_key(token: str, chat_id, tier: str, key_format: str,
                       expiry_days: int, combo_limit: int, max_redemptions: int,
-                      count: int = 1, label: str = ""):
+                      count: int = 1, label: str = "", expiry_seconds: int = 0):
     """Create `count` keys matching KeyVault dashboard fields.
     Tries KeyVault API first; falls back to local JSON storage.
+    expiry_seconds takes priority over expiry_days for sub-day precision.
     """
     now     = time.time()
-    duration = expiry_days * 86400 if expiry_days > 0 else 0
+    duration = expiry_seconds if expiry_seconds > 0 else (expiry_days * 86400 if expiry_days > 0 else 0)
     expires = (now + duration) if duration > 0 else (now + 86400 * 36500)  # ~100 years for "Never"
     keys    = _load_keys()
 
@@ -4861,8 +4891,8 @@ def _finalize_gen_key(token: str, chat_id, tier: str, key_format: str,
     fmt_disp     = key_format.upper()
     combo_disp   = "∞ Unlimited" if combo_limit == 0 else f"{combo_limit:,} lines"
     redeems_disp = "∞ Unlimited" if max_redemptions == 0 else f"{max_redemptions}"
-    exp_disp     = "Never" if expiry_days == 0 else f"{expiry_days} days"
-    exp_dt       = "Never" if expiry_days == 0 else datetime.fromtimestamp(expires).strftime("%Y-%m-%d %H:%M")
+    exp_disp     = "Never" if duration == 0 else _dur_label(duration)
+    exp_dt       = "Never" if duration == 0 else datetime.fromtimestamp(expires).strftime("%Y-%m-%d %H:%M")
     label_disp   = label if label else "(none)"
 
     if count == 1:
@@ -6547,7 +6577,7 @@ def _handle_callback_query(token: str, cq: dict):
         _ask_genkey_expiry(token, chat_id)
         return
 
-    # ── Genkey wizard — Expiry selected → ask Combo Limit ─────
+    # ── Genkey wizard — Expiry (days) selected → ask Combo Limit
     if data.startswith("gk_exp:"):
         if not _is_owner(from_user): return
         wiz = _genkey_wizard.get(chat_id, {})
@@ -6555,6 +6585,21 @@ def _handle_callback_query(token: str, cq: dict):
             _tg_send(token, chat_id, "⚠️ Session expired. Use /generate_key again.")
             return
         wiz["expiry_days"] = int(data.split(":")[1])
+        wiz["expiry_seconds"] = wiz["expiry_days"] * 86400
+        wiz["step"] = "AWAIT_COMBO"
+        _ask_genkey_combo(token, chat_id)
+        return
+
+    # ── Genkey wizard — Expiry (hours) selected → ask Combo Limit
+    if data.startswith("gk_exp_h:"):
+        if not _is_owner(from_user): return
+        wiz = _genkey_wizard.get(chat_id, {})
+        if not wiz or wiz.get("step") != "AWAIT_EXPIRY":
+            _tg_send(token, chat_id, "⚠️ Session expired. Use /generate_key again.")
+            return
+        hours = int(data.split(":")[1])
+        wiz["expiry_seconds"] = hours * 3600
+        wiz["expiry_days"] = 0  # sub-day
         wiz["step"] = "AWAIT_COMBO"
         _ask_genkey_combo(token, chat_id)
         return
@@ -6600,6 +6645,7 @@ def _handle_callback_query(token: str, cq: dict):
             max_redemptions=wiz.get("max_redemptions", 1),
             count=count,
             label=wiz.get("label", ""),
+            expiry_seconds=wiz.get("expiry_seconds", 0),
         )
         return
 
@@ -6827,6 +6873,29 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
     # ── Intercept text replies for genkey wizard ───────────────
     if _is_owner(from_user) and chat_id in _genkey_wizard:
         wiz = _genkey_wizard[chat_id]
+        # Custom expiry input (e.g. "1d", "12h", "2w 3d", "1mo", "6h30m")
+        if wiz["step"] == "AWAIT_EXPIRY" and text and not text.startswith("/"):
+            secs = _parse_duration(text)
+            if secs > 0:
+                wiz["expiry_seconds"] = secs
+                wiz["expiry_days"] = secs // 86400 if secs >= 86400 else 0
+                wiz["step"] = "AWAIT_COMBO"
+                _ask_genkey_combo(token, chat_id)
+            elif text.strip() == "0" or text.strip().lower() == "never":
+                wiz["expiry_seconds"] = 0
+                wiz["expiry_days"] = 0
+                wiz["step"] = "AWAIT_COMBO"
+                _ask_genkey_combo(token, chat_id)
+            else:
+                _tg_send(token, chat_id,
+                    "❌ Invalid format. Examples:\n"
+                    "<code>1d</code> = 1 day\n"
+                    "<code>12h</code> = 12 hours\n"
+                    "<code>1d12h</code> = 1 day 12 hours\n"
+                    "<code>2w</code> = 2 weeks\n"
+                    "<code>3mo</code> = 3 months\n"
+                    "<code>0</code> or <code>never</code> = no expiry")
+            return
         # Custom combo limit input
         if wiz["step"] == "AWAIT_COMBO" and text and not text.startswith("/"):
             try:
@@ -6865,6 +6934,7 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
                     max_redemptions=wiz.get("max_redemptions", 1),
                     count=count,
                     label=wiz.get("label", ""),
+                    expiry_seconds=wiz.get("expiry_seconds", 0),
                 )
             except ValueError:
                 _tg_send(token, chat_id,
