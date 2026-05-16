@@ -554,6 +554,7 @@ except Exception as _geo_err:
         _global_idx = 0
         total = 0
         current_proxy = None
+        _lock = threading.Lock()
         def get_proxies(self): return {}
         def force_rotate(self): return None
         def smart_rotate(self): return None
@@ -561,6 +562,19 @@ except Exception as _geo_err:
         def _load_all_files(self): return False
         def _advance_thread(self): return None
         def _get_thread_idx(self): return 0
+        def _normalize_proxy(self, line):
+            """Basic normalizer for when GeoRotator is unavailable."""
+            line = line.strip()
+            if not line or line.startswith("#"):
+                return None
+            if line.lower().startswith("http://") or line.lower().startswith("https://"):
+                return line
+            parts = line.split(":")
+            if len(parts) == 2 and parts[1].isdigit():
+                return f"http://{line}"
+            if len(parts) == 4 and parts[1].isdigit():
+                return f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+            return None
     geo_rotator = _DummyRotator()
 
 # ══════════════════════════════════════════════════════════════
@@ -569,8 +583,9 @@ except Exception as _geo_err:
 #  deduplicates against the current pool, and saves new ones.
 # ══════════════════════════════════════════════════════════════
 RAW_PROXY_SOURCES = [
-    # ── HTTP/HTTPS proxies ──
+    # ── Primary source (custom worker) ──
     "https://worker-production-a615.up.railway.app/",
+    # ── HTTP/HTTPS proxies ──
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=yes&anonymity=all",
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=no&anonymity=elite",
     # ── SOCKS5 proxies (better for HTTPS tunneling) ──
@@ -662,97 +677,126 @@ def _fetch_raw_proxies():
     Background worker: fetches raw proxy lists from configured URLs every 30 seconds.
     Proxies are validated against Garena's endpoint before being added to the pool.
     Only new, unique, working proxies are saved.
+    Wrapped in try/except so the thread never dies silently.
     """
     log = logging.getLogger(__name__)
-    log.info(f"[RAW-PROXY] Auto-fetch started — {len(RAW_PROXY_SOURCES)} source(s), "
+    log.info(f"[RAW-PROXY] Auto-fetch started \u2014 {len(RAW_PROXY_SOURCES)} source(s), "
              f"interval {RAW_PROXY_FETCH_INTERVAL}s, validate={RAW_PROXY_VALIDATE_ON_FETCH}")
 
     os.makedirs(PROXY_FOLDER, exist_ok=True)
-    normalizer = geo_rotator._normalize_proxy
+    
+    # Get normalizer \u2014 with fallback if geo_rotator is a DummyRotator
+    try:
+        normalizer = geo_rotator._normalize_proxy
+    except AttributeError:
+        log.warning("[RAW-PROXY] geo_rotator has no _normalize_proxy \u2014 using built-in fallback")
+        def normalizer(line):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                return None
+            if line.lower().startswith("http://") or line.lower().startswith("https://"):
+                return line
+            parts = line.split(":")
+            if len(parts) == 2 and parts[1].isdigit():
+                return f"http://{line}"
+            if len(parts) == 4 and parts[1].isdigit():
+                return f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+            return None
 
     while not shutdown_event.is_set():
-        total_new = 0
-        total_fetched = 0
-        total_dupes = 0
-        total_validated = 0
-        total_dead = 0
+        try:
+            total_new = 0
+            total_fetched = 0
+            total_dupes = 0
+            total_validated = 0
+            total_dead = 0
 
-        all_new_proxies = []  # Collect all new proxies across sources before validation
+            all_new_proxies = []  # Collect all new proxies across sources before validation
 
-        for url in RAW_PROXY_SOURCES:
-            try:
-                resp = requests.get(url, timeout=30)
-                resp.raise_for_status()
-                lines = [l.strip() for l in resp.text.splitlines()
-                         if l.strip() and not l.strip().startswith("#")]
-            except Exception as e:
-                log.warning(f"[RAW-PROXY] Failed to fetch {url}: {e}")
-                continue
-
-            total_fetched += len(lines)
-
-            # Load existing proxies from the save file to avoid duplicates
-            existing = set()
-            if os.path.exists(RAW_PROXY_SAVE_FILE):
+            for url in RAW_PROXY_SOURCES:
                 try:
-                    with open(RAW_PROXY_SAVE_FILE, "r", encoding="utf-8", errors="ignore") as f:
-                        existing = {l.strip() for l in f if l.strip() and not l.strip().startswith("#")}
-                except OSError:
-                    pass
-
-            # Also check the entire geo_rotator pool for duplicates
-            with geo_rotator._lock:
-                pool_set = set(geo_rotator._proxies)
-
-            dupes = 0
-            for raw_line in lines:
-                normalized = normalizer(raw_line)
-                if not normalized:
+                    resp = requests.get(url, timeout=30)
+                    resp.raise_for_status()
+                    lines = [l.strip() for l in resp.text.splitlines()
+                             if l.strip() and not l.strip().startswith("#")]
+                except Exception as e:
+                    log.debug(f"[RAW-PROXY] Failed to fetch {url}: {e}")
                     continue
-                if normalized in existing or normalized in pool_set:
-                    dupes += 1
-                    continue
-                all_new_proxies.append(normalized)
-                existing.add(normalized)
-                pool_set.add(normalized)
 
-            total_dupes += dupes
+                total_fetched += len(lines)
 
-        # ── Validate all new proxies in one batch ──
-        if all_new_proxies:
-            total_validated = len(all_new_proxies)
-            if RAW_PROXY_VALIDATE_ON_FETCH:
-                log.info(f"[RAW-PROXY] Validating {total_validated} new proxies...")
-                working_proxies = _validate_proxies_batch(all_new_proxies)
-                total_dead = total_validated - len(working_proxies)
+                # Load existing proxies from the save file to avoid duplicates
+                existing = set()
+                if os.path.exists(RAW_PROXY_SAVE_FILE):
+                    try:
+                        with open(RAW_PROXY_SAVE_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                            existing = {l.strip() for l in f if l.strip() and not l.strip().startswith("#")}
+                    except OSError:
+                        pass
+
+                # Also check the entire geo_rotator pool for duplicates
+                try:
+                    with geo_rotator._lock:
+                        pool_set = set(geo_rotator._proxies)
+                except (AttributeError, TypeError):
+                    pool_set = set()
+
+                dupes = 0
+                for raw_line in lines:
+                    try:
+                        normalized = normalizer(raw_line)
+                    except Exception:
+                        continue
+                    if not normalized:
+                        continue
+                    if normalized in existing or normalized in pool_set:
+                        dupes += 1
+                        continue
+                    all_new_proxies.append(normalized)
+                    existing.add(normalized)
+                    pool_set.add(normalized)
+
+                total_dupes += dupes
+
+            # ── Validate all new proxies in one batch ──
+            if all_new_proxies:
+                total_validated = len(all_new_proxies)
+                if RAW_PROXY_VALIDATE_ON_FETCH:
+                    log.info(f"[RAW-PROXY] Validating {total_validated} new proxies...")
+                    working_proxies = _validate_proxies_batch(all_new_proxies)
+                    total_dead = total_validated - len(working_proxies)
+                else:
+                    working_proxies = all_new_proxies
+
+                if working_proxies:
+                    try:
+                        with open(RAW_PROXY_SAVE_FILE, "a", encoding="utf-8") as f:
+                            for p in working_proxies:
+                                f.write(p + "\n")
+                        total_new = len(working_proxies)
+                    except OSError as e:
+                        log.error(f"[RAW-PROXY] Failed to write {RAW_PROXY_SAVE_FILE}: {e}")
+
+            if total_new > 0:
+                try:
+                    geo_rotator._load_all_files()
+                except Exception as e:
+                    log.error(f"[RAW-PROXY] Failed to reload proxy pool: {e}")
+
+                log.info(f"[RAW-PROXY] +{total_new} new working proxies added "
+                         f"(fetched {total_fetched}, {total_dupes} dupes, "
+                         f"{total_dead} dead filtered) | pool now: {geo_rotator.total}")
             else:
-                working_proxies = all_new_proxies
+                log.debug(f"[RAW-PROXY] No new proxies this cycle "
+                          f"(fetched {total_fetched}, {total_dupes} dupes, "
+                          f"{total_dead} dead filtered)")
 
-            if working_proxies:
-                try:
-                    with open(RAW_PROXY_SAVE_FILE, "a", encoding="utf-8") as f:
-                        for p in working_proxies:
-                            f.write(p + "\n")
-                    total_new = len(working_proxies)
-                except OSError as e:
-                    log.error(f"[RAW-PROXY] Failed to write {RAW_PROXY_SAVE_FILE}: {e}")
-
-        if total_new > 0:
-            try:
-                geo_rotator._load_all_files()
-            except Exception as e:
-                log.error(f"[RAW-PROXY] Failed to reload proxy pool: {e}")
-
-            log.info(f"[RAW-PROXY] +{total_new} new working proxies added "
-                     f"(fetched {total_fetched}, {total_dupes} dupes, "
-                     f"{total_dead} dead filtered) | pool now: {geo_rotator.total}")
-        else:
-            log.debug(f"[RAW-PROXY] No new proxies this cycle "
-                      f"(fetched {total_fetched}, {total_dupes} dupes, "
-                      f"{total_dead} dead filtered)")
+        except Exception as e:
+            log.error(f"[RAW-PROXY] Error in fetch cycle: {e}", exc_info=True)
 
         # Wait for next cycle (interruptible by shutdown)
         shutdown_event.wait(RAW_PROXY_FETCH_INTERVAL)
+
 
 def signal_handler(signum, frame):
     """Handle SIGINT (Ctrl+C) and SIGTERM (process manager shutdown) gracefully."""
@@ -4410,12 +4454,30 @@ threading.Thread(target=_render_bars, daemon=True).start()
 
 
 class _BotLogFilter(logging.Filter):
-    """In BOT_MODE: drop ALL log output — progress bar is the only terminal output.
-    Nothing from processaccount, prelogin, login, proxy rotation etc. should print."""
+    """In BOT_MODE: drop most log output but allow important system messages through.
+    Proxy fetch, HEARTBEAT, and error-level messages are always shown."""
+    # Prefixes that should always be visible even in BOT_MODE
+    ALLOWED_PREFIXES = (
+        "[RAW-PROXY]",
+        "[PROXY-VAL]",
+        "[HEARTBEAT]",
+        "[MAIN]",
+        "[DATADOME]",
+    )
+
     def filter(self, record):
-        if BOT_MODE:
-            return False   # drop everything — progress bar handles display
-        return True
+        if not BOT_MODE:
+            return True
+        # Always allow ERROR and CRITICAL level messages
+        if record.levelno >= logging.ERROR:
+            return True
+        # Allow specific important prefixes
+        msg = record.getMessage()
+        for prefix in self.ALLOWED_PREFIXES:
+            if prefix in msg:
+                return True
+        # Drop everything else (per-account noise, proxy rotation, etc.)
+        return False
 
 
 # Attach the filter to every handler on the root logger
