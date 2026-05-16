@@ -706,35 +706,79 @@ except Exception as _geo_err:
     logging.getLogger(__name__).warning(f"[GEO] ⚠️  GeoRotator init failed: {_geo_err} — running without proxy rotation")
     # Create a dummy rotator that does nothing
     class _DummyRotator:
-        _proxies = []
-        _proxy_source = {}
-        _thread_idx = {}
-        _thread_proxy = {}
-        _global_idx = 0
-        total = 0
-        current_proxy = None
-        _lock = threading.Lock()
+        """Fallback rotator that actually loads proxy files when GeoRotator fails."""
+        def __init__(self):
+            self._proxies = []
+            self._proxy_source = {}
+            self._thread_idx = {}
+            self._thread_proxy = {}
+            self._global_idx = 0
+            self.current_proxy = None
+            self._lock = threading.Lock()
+            self._load_all_files()
+        @property
+        def total(self):
+            return len(self._proxies)
         def get_proxies(self): return {}
         def force_rotate(self): return None
         def smart_rotate(self): return None
         def remove_blocked_proxy(self, *a, **kw): pass
-        def _load_all_files(self): return False
         def _advance_thread(self): return None
         def _get_thread_idx(self): return 0
         def _normalize_proxy(self, line):
-            """Basic normalizer for when GeoRotator is unavailable."""
+            """Basic normalizer with socks5h support for when GeoRotator is unavailable."""
             line = line.strip()
             if not line or line.startswith("#"):
                 return None
             low = line.lower()
-            if low.startswith(("http://", "https://", "socks5://", "socks4://")):
+            if low.startswith("socks5h://"):
+                return line
+            if low.startswith("socks5://"):
+                return "socks5h://" + line[8:]
+            if low.startswith("socks4://"):
+                return "socks5h://" + line[8:]
+            if low.startswith(("http://", "https://")):
                 return line
             parts = line.split(":")
             if len(parts) == 2 and parts[1].isdigit():
-                return f"http://{line}"
+                return f"http://{parts[0]}:{parts[1]}"
             if len(parts) == 4 and parts[1].isdigit():
                 return f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
             return None
+        def _load_all_files(self):
+            """Actually load proxy files — not a no-op anymore."""
+            try:
+                proxy_files = _get_proxy_files()
+                if not proxy_files:
+                    return False
+                seen = set()
+                merged = []
+                source_map = {}
+                for filepath in proxy_files:
+                    try:
+                        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line or line.startswith("#"):
+                                    continue
+                                normalized = self._normalize_proxy(line)
+                                if normalized and normalized not in seen:
+                                    seen.add(normalized)
+                                    merged.append(normalized)
+                                    source_map[normalized] = filepath
+                    except Exception:
+                        continue
+                if merged:
+                    import random
+                    random.shuffle(merged)
+                    self._proxies = merged
+                    self._proxy_source = source_map
+                    self._thread_idx = {}
+                    self.current_proxy = merged[0] if merged else None
+                    return True
+            except Exception:
+                pass
+            return False
     geo_rotator = _DummyRotator()
 
 # ══════════════════════════════════════════════════════════════
@@ -746,11 +790,11 @@ RAW_PROXY_SOURCES = [
     # ── (url, default_scheme) ── scheme is used for bare ip:port lines from that source
     # ── Primary source (custom worker) ──
     ("https://worker-production-a615.up.railway.app/", "http"),
-    # ── HTTP/HTTPS proxies ──
+    # ── ProxyScrape API (reliable, high volume) ──
     ("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=yes&anonymity=all", "http"),
     ("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=no&anonymity=elite", "http"),
-    # ── SOCKS5 proxies (better for HTTPS tunneling) ──
     ("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=5000&country=all", "socks5"),
+    # ── SOCKS5 proxies (better for HTTPS tunneling) ──
     ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt", "socks5"),
     ("https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt", "socks5"),
     ("https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt", "socks5"),
@@ -758,6 +802,11 @@ RAW_PROXY_SOURCES = [
     ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", "http"),
     ("https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt", "http"),
     ("https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt", "http"),
+    # ── Additional reliable sources ──
+    ("https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt", "http"),
+    ("https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt", "socks5"),
+    ("https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt", "socks5"),
+    ("https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt", "http"),
 ]
 RAW_PROXY_FETCH_INTERVAL = 30  # 30 seconds
 RAW_PROXY_SAVE_FILE = os.path.join(PROXY_FOLDER, "raw_fetched_proxies.txt")
@@ -772,10 +821,19 @@ def _fetch_raw_proxies():
     Wrapped in try/except so the thread never dies silently.
     """
     log = logging.getLogger(__name__)
-    log.info(f"[RAW-PROXY] Auto-fetch started — {len(RAW_PROXY_SOURCES)} source(s), "
-             f"interval {RAW_PROXY_FETCH_INTERVAL}s")
+    log.info(f"[RAW-PROXY] Auto-fetch thread started — {len(RAW_PROXY_SOURCES)} source(s), "
+             f"interval {RAW_PROXY_FETCH_INTERVAL}s, save file: {RAW_PROXY_SAVE_FILE}")
 
-    os.makedirs(PROXY_FOLDER, exist_ok=True)
+    # Ensure proxy folder and save file exist before we start
+    try:
+        os.makedirs(PROXY_FOLDER, exist_ok=True)
+        # Touch the save file so _get_proxy_files() can find it
+        if not os.path.exists(RAW_PROXY_SAVE_FILE):
+            with open(RAW_PROXY_SAVE_FILE, "w", encoding="utf-8") as f:
+                f.write("# Auto-fetched proxies — do not edit manually\n")
+            log.info(f"[RAW-PROXY] Created {RAW_PROXY_SAVE_FILE}")
+    except Exception as e:
+        log.error(f"[RAW-PROXY] Failed to create proxy folder/file: {e}")
 
     def _normalize_with_scheme(line, default_scheme="http"):
         """Normalize a proxy line using the correct scheme for its source."""
@@ -873,10 +931,22 @@ def _fetch_raw_proxies():
 
             if total_new > 0:
                 try:
-                    geo_rotator._load_all_files()
+                    with geo_rotator._lock:
+                        geo_rotator._load_all_files()
                     _touch_liveness()  # proxy fetch is alive
+                    pool_now = geo_rotator.total
+                    if pool_now > 0:
+                        log.info(f"[RAW-PROXY] Pool reloaded successfully: {pool_now} proxies")
+                    else:
+                        log.warning(f"[RAW-PROXY] Pool still 0 after reload — checking save file...")
+                        if os.path.exists(RAW_PROXY_SAVE_FILE):
+                            with open(RAW_PROXY_SAVE_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                                file_lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+                            log.warning(f"[RAW-PROXY] Save file has {len(file_lines)} lines, pool={pool_now}")
+                        else:
+                            log.error(f"[RAW-PROXY] Save file {RAW_PROXY_SAVE_FILE} does not exist!")
                 except Exception as e:
-                    log.error(f"[RAW-PROXY] Failed to reload proxy pool: {e}")
+                    log.error(f"[RAW-PROXY] Failed to reload proxy pool: {e}", exc_info=True)
 
                 # ── Auto-resume proxy-paused users if proxies are now available ──
                 try:
@@ -9136,6 +9206,28 @@ def main():
 
     # ── Raw proxy auto-fetch (every 30 seconds from external sources) ──
     threading.Thread(target=_fetch_raw_proxies, daemon=True, name="RawProxyFetcher").start()
+
+    # ── Startup diagnostic: verify auto-fetch thread is alive ──
+    def _verify_proxy_fetch():
+        """Wait 35s then verify the proxy fetcher actually ran and loaded proxies."""
+        time.sleep(35)  # Wait for first fetch cycle (30s interval + buffer)
+        log = logging.getLogger(__name__)
+        pool_size = geo_rotator.total
+        if pool_size > 0:
+            log.info(f"[STARTUP] ✅ Proxy auto-fetch working — pool: {pool_size} proxies")
+        else:
+            log.error(f"[STARTUP] ❌ Proxy pool still 0 after 35s — auto-fetch may be broken!")
+            log.error(f"[STARTUP] Check if proxy/ folder exists and sources are reachable")
+            # Try to list proxy folder contents
+            try:
+                if os.path.exists(PROXY_FOLDER):
+                    files = os.listdir(PROXY_FOLDER)
+                    log.error(f"[STARTUP] proxy/ folder contents: {files}")
+                else:
+                    log.error(f"[STARTUP] proxy/ folder does NOT exist!")
+            except Exception as e:
+                log.error(f"[STARTUP] Cannot list proxy folder: {e}")
+    threading.Thread(target=_verify_proxy_fetch, daemon=True, name="ProxyFetchVerify").start()
 
     bot_console.print(
         "[bold green]🤖 Bot is running![/bold green]\n"
