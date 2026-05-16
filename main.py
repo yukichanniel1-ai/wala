@@ -487,7 +487,28 @@ class GeoRotator:
         return len(self._proxies)
 
 # Singleton — created once, shared everywhere
-geo_rotator = GeoRotator()
+# Wrapped in try/except so Railway deployment doesn't crash if proxy folder is empty
+try:
+    geo_rotator = GeoRotator()
+except Exception as _geo_err:
+    logging.getLogger(__name__).warning(f"[GEO] ⚠️  GeoRotator init failed: {_geo_err} — running without proxy rotation")
+    # Create a dummy rotator that does nothing
+    class _DummyRotator:
+        _proxies = []
+        _proxy_source = {}
+        _thread_idx = {}
+        _thread_proxy = {}
+        _global_idx = 0
+        total = 0
+        current_proxy = None
+        def get_proxies(self): return {}
+        def force_rotate(self): return None
+        def smart_rotate(self): return None
+        def remove_blocked_proxy(self, *a, **kw): pass
+        def _load_all_files(self): return False
+        def _advance_thread(self): return None
+        def _get_thread_idx(self): return 0
+    geo_rotator = _DummyRotator()
 
 # ══════════════════════════════════════════════════════════════
 #  RAW PROXY AUTO-FETCH
@@ -588,9 +609,11 @@ def signal_handler(signum, frame):
     sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
     shutdown_event.set()   # signal all polling loops and checkers to stop
     print(f"\n  ⚠️  {sig_name} received — shutting down gracefully...")
-    # Give threads up to 3 seconds to finish current work
+    # Don't call os._exit(0) — it bypasses Python cleanup and can look like a crash.
+    # Instead, let the main loop detect shutdown_event and exit cleanly.
+    # Give threads up to 3 seconds to finish current work, then raise SystemExit
     time.sleep(1)
-    os._exit(0)
+    raise SystemExit(0)
 
 # Register both SIGINT (Ctrl+C) and SIGTERM (Wispbyte/systemd kill)
 signal.signal(signal.SIGINT,  signal_handler)
@@ -2849,7 +2872,8 @@ def _get_or_create_config() -> dict:
     """
     Load config from disk / env vars / KeyVault.
     If missing AND running interactively, run the setup wizard.
-    If missing AND running on Railway (no stdin), log error and exit gracefully.
+    If missing AND running on Railway (no stdin), wait for env vars instead of crashing.
+    The bot will NEVER call sys.exit() — it stays alive and waits for configuration.
     """
     cfg = _load_config()
     needs_setup = (
@@ -2862,20 +2886,48 @@ def _get_or_create_config() -> dict:
     # Config is incomplete — check if we can run the setup wizard
     if _is_railway() or not sys.stdin.isatty():
         # ── Railway / no-TTY mode: cannot use input() ──
-        logger.error("=" * 60)
-        logger.error("❌ BOT CRASH: Missing required configuration!")
-        logger.error("   On Railway/cloud, set these environment variables:")
-        logger.error("     BOT_TOKEN    = your Telegram bot token")
-        logger.error("     OWNER_ID     = your Telegram numeric user ID")
-        logger.error("     OWNER_USERNAME = your Telegram username (optional)")
-        logger.error("     KEYSYSTEM_URL = KeyVault API URL (optional)")
-        logger.error("     KEYSYSTEM_ADMIN_SECRET = KeyVault admin secret (optional)")
-        logger.error("   Or configure via /keysystem command after first run.")
-        logger.error("=" * 60)
-        print("\n\033[91m❌ FATAL: BOT_TOKEN and OWNER_ID not configured!\033[0m")
+        # Instead of crashing, wait for environment variables to be set.
+        # Railway will keep the process alive; once the user sets BOT_TOKEN
+        # and OWNER_ID in the Railway dashboard, the next poll will pick them up.
+        logger.warning("=" * 60)
+        logger.warning("⚠️  BOT_TOKEN and/or OWNER_ID not configured!")
+        logger.warning("   On Railway/cloud, set these environment variables:")
+        logger.warning("     BOT_TOKEN    = your Telegram bot token")
+        logger.warning("     OWNER_ID     = your Telegram numeric user ID")
+        logger.warning("     OWNER_USERNAME = your Telegram username (optional)")
+        logger.warning("     KEYSYSTEM_URL = KeyVault API URL (optional)")
+        logger.warning("     KEYSYSTEM_ADMIN_SECRET = KeyVault admin secret (optional)")
+        logger.warning("   Bot will wait and retry every 30 seconds...")
+        logger.warning("=" * 60)
+        print("\n\033[93m⚠️  BOT_TOKEN and OWNER_ID not configured!\033[0m")
         print("\033[93m   On Railway: set BOT_TOKEN and OWNER_ID environment variables.\033[0m")
-        print("\033[93m   On local: delete config.json and restart to run setup wizard.\033[0m\n")
-        sys.exit(1)
+        print("\033[93m   Bot will wait and retry every 30 seconds...\033[0m\n")
+        # Wait loop — keep checking for env vars instead of exiting
+        while True:
+            time.sleep(30)
+            env_cfg = _env_config()
+            if env_cfg.get("bot_token") and env_cfg.get("owner_id"):
+                # Env vars are now set — merge and return
+                cfg.update(env_cfg)
+                logger.info("[CONFIG] ✅ Environment variables detected — starting bot!")
+                # Also save to config.json for next time
+                _save_config(cfg)
+                return cfg
+            # Also try KeyVault API each cycle
+            try:
+                api = _get_keysystem_api()
+                if api and api.enabled:
+                    remote_cfg = api.load_state("bot_config")
+                    if isinstance(remote_cfg, dict) and remote_cfg.get("bot_token") and remote_cfg.get("owner_id"):
+                        for k, v in remote_cfg.items():
+                            if k not in cfg or not cfg[k]:
+                                cfg[k] = v
+                        logger.info("[CONFIG] ✅ KeyVault config detected — starting bot!")
+                        _save_config(cfg)
+                        return cfg
+            except Exception:
+                pass
+            logger.debug("[CONFIG] Still waiting for BOT_TOKEN and OWNER_ID...")
     else:
         # ── Interactive mode: run setup wizard ──
         cfg = _setup_wizard()
@@ -2883,7 +2935,7 @@ def _get_or_create_config() -> dict:
 
 # Load (or create) config at startup
 _cfg        = _get_or_create_config()
-BOT_TOKEN   = _cfg["bot_token"]
+BOT_TOKEN   = _cfg.get("bot_token", "")
 
 COMBO_LINE_LIMIT = 1000   # max lines allowed per upload
 
@@ -3307,8 +3359,11 @@ def _save_users_to_disk():
     except Exception:
         pass
 
-# Load on startup
-_load_saved_users()
+# Load on startup (wrapped for Railway resilience)
+try:
+    _load_saved_users()
+except Exception as _users_err:
+    logging.getLogger(__name__).warning(f"[BOT] ⚠️  Could not load saved users: {_users_err}")
 
 
 # ── Active session persistence for auto-resume on crash ────────
@@ -7629,6 +7684,20 @@ def main():
     # ── Start Telegram bot ────────────────────────────────────
     BOT_MODE = True
     _cleanup_stale_files()
+    if not BOT_TOKEN:
+        logger.error("[MAIN] ❌ BOT_TOKEN is empty — cannot start Telegram polling!")
+        logger.error("[MAIN] Set BOT_TOKEN environment variable and the bot will auto-detect it.")
+        logger.error("[MAIN] Staying alive... waiting for config...")
+        # Don't crash — just wait. The _get_or_create_config() wait loop
+        # should have already handled this, but as an extra safety net:
+        while not shutdown_event.is_set():
+            time.sleep(30)
+            # Re-check env vars
+            new_token = os.environ.get("BOT_TOKEN", "").strip()
+            if new_token:
+                logger.info("[MAIN] ✅ BOT_TOKEN detected! Restarting...")
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+        return
     start_bot_polling(BOT_TOKEN, None)
     _tg_set_commands(BOT_TOKEN)
 
@@ -7756,6 +7825,10 @@ def main():
 
 
 if __name__ == "__main__":
+    # Top-level crash guard — ensure the process NEVER exits with non-zero code
+    # on Railway (which would cause a "CRASHED" status).
+    # Any startup error (missing config, import error, etc.) is caught here
+    # and the process stays alive, retrying every 30 seconds.
     while True:   # auto-restart on unexpected crash
         try:
             shutdown_event.clear()   # reset shutdown flag for restart
@@ -7770,5 +7843,13 @@ if __name__ == "__main__":
             bot_console.print(f"[red]✘ Memory error — forcing GC and restarting in 3s...[/red]")
             time.sleep(3)
         except Exception as e:
-            bot_console.print(f"[red]✘ Unexpected error: {e} — restarting in 5s...[/red]")
-            time.sleep(5)   # wait then restart automatically
+            logger = logging.getLogger(__name__)
+            logger.error(f"[MAIN] ✘ Unexpected error: {e}", exc_info=True)
+            bot_console.print(f"[red]✘ Unexpected error: {e} — restarting in 30s...[/red]")
+            if _is_railway():
+                # On Railway: don't exit — stay alive and retry
+                # Railway treats non-zero exit as "CRASHED"
+                logger.error("[MAIN] Running on Railway — staying alive and retrying in 30s...")
+                time.sleep(30)
+            else:
+                time.sleep(5)   # wait then restart automatically
