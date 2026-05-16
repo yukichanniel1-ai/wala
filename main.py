@@ -70,6 +70,7 @@ _stop_events_lock = threading.Lock()
 
 # Per-owner proxy accumulator — collects lines across multiple messages
 _proxy_accumulator: dict = {}   # chat_id -> [raw_line, ...]
+_broadcast_accumulator: dict = {}  # chat_id -> [text_line, ...]
 
 # Per-owner proxy message tracker — message IDs to delete on Done
 _proxy_msg_ids: dict = {}       # chat_id -> [msg_id, ...]
@@ -2943,7 +2944,6 @@ def create_thread_session(cookie_manager, datadome_manager):
     if valid_cookies:
         combined_cookie_str = "; ".join(valid_cookies)
         applyck(sess, combined_cookie_str)
-        # Try to extract datadome from the last cookie in the file
         final_cookie_value = valid_cookies[-1]
         datadome_value = (
             final_cookie_value.split('=', 1)[1].strip()
@@ -7860,6 +7860,81 @@ def _handle_callback_query(token: str, cq: dict):
         _tg_send(token, chat_id, "🗑 <b>Proxy upload cancelled.</b> Accumulator cleared.")
         return
 
+    # ── Broadcast callback buttons ──────────────────────────────────────────
+    if data == "broadcast:done":
+        if not _is_owner(from_user): return
+        _flush_broadcast_accumulator(token, chat_id, from_user)
+        return
+
+    if data == "broadcast:cancel":
+        if not _is_owner(from_user): return
+        _broadcast_accumulator.pop(chat_id, None)
+        _bot_state.pop(chat_id, None)
+        _tg_send(token, chat_id, "🗑 <b>Broadcast cancelled.</b> Message discarded.")
+        return
+
+
+def _send_broadcast(token: str, chat_id, from_user: dict, message_text: str):
+    """Send a broadcast message to all registered bot users."""
+    target_ids = set()
+    for k, v in _saved_users.items():
+        if isinstance(v, dict):
+            _cid = v.get("hits_id")
+            if _cid:
+                try:
+                    target_ids.add(int(_cid))
+                except (ValueError, TypeError):
+                    pass
+    # Also add chat_ids from _user_data (in case not yet saved)
+    for _cid in _user_data:
+        try:
+            target_ids.add(int(_cid))
+        except (ValueError, TypeError):
+            pass
+    # Remove owner from targets
+    try:
+        owner_id = int(OWNER_ID) if OWNER_ID else None
+        if owner_id: target_ids.discard(owner_id)
+    except (ValueError, TypeError):
+        pass
+    if not target_ids:
+        _tg_send(token, chat_id, "📢 <b>No users to broadcast to.</b>")
+        return
+    owner_name = from_user.get("first_name", "Owner")
+    broadcast_msg = (
+        f"📢 <b>Announcement from {owner_name}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{message_text}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>— Bot Admin</i>"
+    )
+    sent_ok, sent_fail = 0, 0
+    for tid in target_ids:
+        try:
+            _tg_send(token, tid, broadcast_msg)
+            sent_ok += 1
+            time.sleep(0.05)  # rate-limit: ~20 msg/sec
+        except Exception:
+            sent_fail += 1
+    _tg_send(token, chat_id,
+        f"📢 <b>Broadcast Complete!</b>\n\n"
+        f"✅ <b>Delivered:</b> {sent_ok}\n"
+        f"❌ <b>Failed:</b> {sent_fail}\n"
+        f"👥 <b>Total users:</b> {len(target_ids)}")
+
+
+def _flush_broadcast_accumulator(token: str, chat_id, from_user: dict):
+    """Send the accumulated broadcast message to all users and clean up."""
+    lines = _broadcast_accumulator.pop(chat_id, [])
+    _bot_state.pop(chat_id, None)
+    if not lines:
+        _tg_send(token, chat_id,
+            "⚠️ <b>No message to broadcast.</b>\n"
+            "Type your message first, then tap Done.")
+        return
+    message_text = "\n".join(lines)
+    _send_broadcast(token, chat_id, from_user, message_text)
+
 
 def handle_bot_update(token: str, update: dict, _unused_config):
     try:
@@ -8227,59 +8302,24 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
             _tg_send(token, chat_id, "ℹ️ No checkers are currently running.")
         return
 
-    # ── /broadcast — owner sends a message to all users ────────────────
+    # ── /broadcast ── owner sends a message to all users (with Done button) ──
     if cmd == "broadcast":
         if not _is_owner(from_user):
             _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
             return
-        if not cmd_args:
-            _tg_send(token, chat_id,
-                "📢 <b>Broadcast Message</b>\n\n"
-                "Usage: <code>/broadcast Your message here</code>\n\n"
-                "This will send your message to all registered bot users.")
-            return
-        # Collect unique chat_ids from _saved_users
-        target_ids = set()
-        for k, v in _saved_users.items():
-            if isinstance(v, dict):
-                _cid = v.get("hits_id")
-                if _cid:
-                    try:
-                        target_ids.add(int(_cid))
-                    except (ValueError, TypeError):
-                        pass
-        # Also add chat_ids from _user_data (in case not yet saved)
-        for _cid in _user_data:
-            try:
-                target_ids.add(int(_cid))
-            except (ValueError, TypeError):
-                pass
-        if not target_ids:
-            _tg_send(token, chat_id, "📢 <b>No users to broadcast to.</b>")
-            return
-        # Build the broadcast message
-        owner_name = from_user.get("first_name", "Owner")
-        broadcast_msg = (
-            f"📢 <b>Announcement from {owner_name}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"{cmd_args}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<i>— Bot Admin</i>"
-        )
-        sent_ok   = 0
-        sent_fail = 0
-        for tid in target_ids:
-            try:
-                _tg_send(token, tid, broadcast_msg)
-                sent_ok += 1
-                time.sleep(0.05)  # rate-limit: ~20 msg/sec
-            except Exception:
-                sent_fail += 1
-        _tg_send(token, chat_id,
-            f"📢 <b>Broadcast Complete!</b>\n\n"
-            f"✅ <b>Delivered:</b> {sent_ok}\n"
-            f"❌ <b>Failed:</b> {sent_fail}\n"
-            f"👥 <b>Total users:</b> {len(target_ids)}")
+        _broadcast_accumulator.pop(chat_id, None)   # clear any old session
+        _bot_state[chat_id] = "AWAIT_BROADCAST"
+        _tg_send_buttons(token, chat_id,
+            "📢 <b>Broadcast Mode</b>\n\n"
+            "Type your message below. You can send multiple messages.\n"
+            "When done, tap <b>✅ Done</b> to send to all users.\n\n"
+            "<i>Your next message will start the broadcast text.</i>",
+            [
+                [
+                    {"text": "✅ Done (send broadcast)", "callback_data": "broadcast:done"},
+                    {"text": "🗑 Cancel", "callback_data": "broadcast:cancel"},
+                ],
+            ])
         return
 
     if cmd == "statuskey":
@@ -8334,6 +8374,39 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
             if bot_reply and bot_reply.get("ok"):
                 _proxy_msg_ids.setdefault(chat_id, []).append(
                     bot_reply["result"]["message_id"])
+        return
+
+    # ── Broadcast message accumulation ──────────────────────────────────────
+    if _bot_state.get(chat_id) == "AWAIT_BROADCAST":
+        if not _is_owner(from_user):
+            _bot_state.pop(chat_id, None)
+            _broadcast_accumulator.pop(chat_id, None)
+            return
+        if cmd in ("done", "broadcast_done") or text.lower() == "done":
+            _flush_broadcast_accumulator(token, chat_id, from_user)
+        elif text and not text.startswith("/"):
+            if chat_id not in _broadcast_accumulator:
+                _broadcast_accumulator[chat_id] = []
+            _broadcast_accumulator[chat_id].append(text)
+            count_lines = len(_broadcast_accumulator[chat_id])
+            _tg_send_buttons(token, chat_id,
+                f"📝 <b>Message received!</b> Lines so far: <code>{count_lines}</code>\n"
+                f"<i>Keep typing more, or tap Done to send to all users.</i>",
+                [
+                    [
+                        {"text": "✅ Done (send broadcast)", "callback_data": "broadcast:done"},
+                        {"text": "🗑 Cancel", "callback_data": "broadcast:cancel"},
+                    ],
+                ])
+        else:
+            _tg_send_buttons(token, chat_id,
+                "📢 <b>Broadcast Mode</b>\n\nType your message, or tap Done/Cancel:",
+                [
+                    [
+                        {"text": "✅ Done (send broadcast)", "callback_data": "broadcast:done"},
+                        {"text": "🗑 Cancel", "callback_data": "broadcast:cancel"},
+                    ],
+                ])
         return
 
     # ── /start — always allowed, no key required ─────────────
