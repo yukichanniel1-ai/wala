@@ -317,6 +317,12 @@ class GeoRotator:
             self._proxies = []
             self._proxy_source = {}
             return False
+        # ── Notify owner about no proxies ─────────────────────
+        try:
+            if OWNER_ID and BOT_TOKEN:
+                _notify_no_proxy(BOT_TOKEN)
+        except Exception:
+            pass
 
         seen = set()
         merged = []
@@ -348,6 +354,12 @@ class GeoRotator:
             self._proxies = []
             self._proxy_source = {}
             return False
+        # ── Notify owner about empty proxy pool ──────────────
+        try:
+            if OWNER_ID and BOT_TOKEN:
+                _notify_no_proxy(BOT_TOKEN)
+        except Exception:
+            pass
 
         random.shuffle(merged)
         self._proxies = merged
@@ -355,6 +367,11 @@ class GeoRotator:
         self._thread_idx = {}
 
         log.info(f"[GEO] ✅ Proxy pool ready: {len(merged)} unique proxies across {len(PROXY_FILES)} file(s)")
+        # ── Clear no-proxy warning since pool is loaded ────────
+        try:
+            _clear_no_proxy_warning()
+        except Exception:
+            pass
         return True
 
     def _load_next_file(self):
@@ -4944,6 +4961,38 @@ def _is_vip_user(chat_id) -> bool:
     return False
 
 
+def _has_proxies() -> bool:
+    """Check if proxy pool has available proxies."""
+    return hasattr(geo_rotator, 'total') and geo_rotator.total > 0 and bool(geo_rotator._proxies)
+
+
+# Track if we already sent the "no proxy" warning to owner
+_no_proxy_warned = False
+
+def _notify_no_proxy(token, chat_id=None, from_user=None):
+    """Notify owner that no proxies are available. Only sends once per empty-pool event."""
+    global _no_proxy_warned
+    if _no_proxy_warned:
+        return  # already notified
+    _no_proxy_warned = True
+    try:
+        _now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _tg_send(token, OWNER_ID,
+            f"\u26a0\ufe0f <b>No Proxies Available!</b>\n\n"
+            f"\ud83d\udd50 <b>Time:</b> {_now}\n"
+            f"\ud83d\udce1 <b>Proxy Pool:</b> 0 proxies\n"
+            f"\ud83d\udd27 <b>Action:</b> Upload proxy files to the proxy/ folder\n\n"
+            f"<i>Bot is in maintenance mode for non-owner users.</i>"
+        )
+    except Exception:
+        pass
+
+def _clear_no_proxy_warning():
+    """Reset the no-proxy warning flag so owner gets notified again if pool empties later."""
+    global _no_proxy_warned
+    _no_proxy_warned = False
+
+
 # ══════════════════════════════════════════════════════════════
 #  REDEEM KEY SYSTEM  (with KeyVault API integration)
 # ══════════════════════════════════════════════════════════════
@@ -6448,6 +6497,17 @@ def _check_access(token: str, chat_id, from_user: dict) -> bool:
     """Returns True if user is allowed to use the checker."""
     if _is_owner(from_user):
         return True
+
+    # ── Maintenance mode: no proxies available ──────────────────
+    if not _has_proxies():
+        _notify_no_proxy(token, chat_id, from_user)
+        _tg_send(token, chat_id,
+            "🔧 <b>Bot Under Maintenance</b>\n\n"
+            "The bot is currently not available.\n"
+            "Please try again later.\n\n"
+            "<i>Thank you for your patience.</i>"
+        )
+        return False
 
     uid_str = str(chat_id)
     d = _udata(chat_id)
