@@ -1,25 +1,8 @@
 # Railway configuration — auto-restart & healthcheck
-# Docs: https://docs.railway.com/deployments/restart-policy
-# Docs: https://docs.railway.com/deployments/healthchecks
+# Docs: https://docs.railway.com/config-as-code/reference
 
 [deploy]
-# Restart policy: "Always" = restart on any exit (crash, OOM, error, or clean exit)
-# This ensures the bot comes back online no matter what.
-restartPolicyType = "Always"
-# 0 = unlimited restarts (we handle backoff in application code)
+restartPolicyType = "ALWAYS"
 restartPolicyMaxRetries = 0
-
-# Healthcheck — Railway pings this endpoint and auto-restarts if it fails
-# The bot starts a lightweight HTTP server on the PORT env var for this.
-[deploy.healthcheck]
-# Railway sets the PORT env var automatically
-# Health check path on our internal HTTP server
-path = "/health"
-# Wait 30s after deploy before starting health checks (give bot time to initialize)
-initialDelaySeconds = 30
-# Check every 30 seconds
-intervalSeconds = 30
-# Must respond within 10 seconds
-timeoutSeconds = 10
-# After 3 consecutive failures, Railway considers the deployment unhealthy and restarts it
-failureThreshold = 3
+healthcheckPath = "/health"
+healthcheckTimeout = 30
