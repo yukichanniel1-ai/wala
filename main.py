@@ -386,7 +386,13 @@ class GeoRotator:
 
         # ── Step 1: Detect and strip explicit scheme ──────────────────────────
         scheme = "http"
-        if line.lower().startswith("https://"):
+        if line.lower().startswith("socks5://"):
+            scheme = "socks5"
+            line = line[9:]
+        elif line.lower().startswith("socks4://"):
+            scheme = "socks4"
+            line = line[9:]
+        elif line.lower().startswith("https://"):
             scheme = "https"
             line = line[8:]
         elif line.lower().startswith("http://"):
@@ -720,7 +726,8 @@ except Exception as _geo_err:
             line = line.strip()
             if not line or line.startswith("#"):
                 return None
-            if line.lower().startswith("http://") or line.lower().startswith("https://"):
+            low = line.lower()
+            if low.startswith(("http://", "https://", "socks5://", "socks4://")):
                 return line
             parts = line.split(":")
             if len(parts) == 2 and parts[1].isdigit():
@@ -736,20 +743,21 @@ except Exception as _geo_err:
 #  deduplicates against the current pool, and saves new ones.
 # ══════════════════════════════════════════════════════════════
 RAW_PROXY_SOURCES = [
+    # ── (url, default_scheme) ── scheme is used for bare ip:port lines from that source
     # ── Primary source (custom worker) ──
-    "https://worker-production-a615.up.railway.app/",
+    ("https://worker-production-a615.up.railway.app/", "http"),
     # ── HTTP/HTTPS proxies ──
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=yes&anonymity=all",
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=no&anonymity=elite",
+    ("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=yes&anonymity=all", "http"),
+    ("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=no&anonymity=elite", "http"),
     # ── SOCKS5 proxies (better for HTTPS tunneling) ──
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=5000&country=all",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
-    "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+    ("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=5000&country=all", "socks5"),
+    ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt", "socks5"),
+    ("https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt", "socks5"),
+    ("https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt", "socks5"),
     # ── HTTP proxies (backup) ──
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+    ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", "http"),
+    ("https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt", "http"),
+    ("https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt", "http"),
 ]
 RAW_PROXY_FETCH_INTERVAL = 30  # 30 seconds
 RAW_PROXY_SAVE_FILE = os.path.join(PROXY_FOLDER, "raw_fetched_proxies.txt")
@@ -759,6 +767,8 @@ def _fetch_raw_proxies():
     Background worker: fetches raw proxy lists from configured URLs every 30 seconds.
     Deduplicates against the current pool and save file.
     Only new, unique proxies are appended to raw_fetched_proxies.txt.
+    Uses the correct scheme (http/socks5) per source so SOCKS5 proxies
+    are stored as socks5://ip:port instead of http://ip:port.
     Wrapped in try/except so the thread never dies silently.
     """
     log = logging.getLogger(__name__)
@@ -766,24 +776,23 @@ def _fetch_raw_proxies():
              f"interval {RAW_PROXY_FETCH_INTERVAL}s")
 
     os.makedirs(PROXY_FOLDER, exist_ok=True)
-    
-    # Get normalizer — with fallback if geo_rotator is a DummyRotator
-    try:
-        normalizer = geo_rotator._normalize_proxy
-    except AttributeError:
-        log.warning("[RAW-PROXY] geo_rotator has no _normalize_proxy — using built-in fallback")
-        def normalizer(line):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                return None
-            if line.lower().startswith("http://") or line.lower().startswith("https://"):
-                return line
-            parts = line.split(":")
-            if len(parts) == 2 and parts[1].isdigit():
-                return f"http://{line}"
-            if len(parts) == 4 and parts[1].isdigit():
-                return f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+
+    def _normalize_with_scheme(line, default_scheme="http"):
+        """Normalize a proxy line using the correct scheme for its source."""
+        line = line.strip()
+        if not line or line.startswith("#"):
             return None
+        # Already has a scheme? Use it as-is
+        low = line.lower()
+        if low.startswith(("http://", "https://", "socks5://", "socks4://")):
+            return line
+        # Bare ip:port or ip:port:user:pass → apply the source's default scheme
+        parts = line.split(":")
+        if len(parts) == 2 and parts[1].isdigit():
+            return f"{default_scheme}://{parts[0]}:{parts[1]}"
+        if len(parts) == 4 and parts[1].isdigit():
+            return f"{default_scheme}://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+        return None
 
     while not shutdown_event.is_set():
         try:
@@ -791,7 +800,13 @@ def _fetch_raw_proxies():
             total_fetched = 0
             total_dupes = 0
 
-            for url in RAW_PROXY_SOURCES:
+            for source_entry in RAW_PROXY_SOURCES:
+                # Support both (url, scheme) tuples and plain url strings
+                if isinstance(source_entry, tuple):
+                    url, scheme = source_entry[0], source_entry[1]
+                else:
+                    url, scheme = source_entry, "http"
+
                 try:
                     resp = requests.get(url, timeout=30)
                     resp.raise_for_status()
@@ -823,7 +838,7 @@ def _fetch_raw_proxies():
                 dupes = 0
                 for raw_line in lines:
                     try:
-                        normalized = normalizer(raw_line)
+                        normalized = _normalize_with_scheme(raw_line, scheme)
                     except Exception:
                         continue
                     if not normalized:
@@ -878,6 +893,9 @@ def _fetch_raw_proxies():
 
         # Wait for next cycle (interruptible by shutdown)
         shutdown_event.wait(RAW_PROXY_FETCH_INTERVAL)
+
+
+
 
 
 
@@ -7097,21 +7115,37 @@ def _handle_proxy_upload(token: str, chat_id, from_user: dict, message: dict):
 
 
 def _handle_proxy_status(token: str, chat_id, from_user: dict):
-    """Show current proxy files and counts."""
+    """Show current proxy pool status with HTTP/SOCKS5 breakdown and auto-fetch info."""
     if not _is_owner(from_user):
         _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
         return
 
-    files = _get_proxy_files()
-    if not files:
-        _tg_send(token, chat_id,
-            "📡 <b>Proxy Files</b>\n\n"
-            "<i>No proxy files found in proxy/ folder.</i>\n\n"
-            "Use <code>/upload_proxy</code> to upload one.")
-        return
+    # ── Pool breakdown by scheme ──
+    http_count = 0
+    https_count = 0
+    socks5_count = 0
+    socks4_count = 0
+    try:
+        with geo_rotator._lock:
+            for p in geo_rotator._proxies:
+                low = p.lower()
+                if low.startswith("socks5://"):
+                    socks5_count += 1
+                elif low.startswith("socks4://"):
+                    socks4_count += 1
+                elif low.startswith("https://"):
+                    https_count += 1
+                else:
+                    http_count += 1
+    except Exception:
+        pass
 
-    lines_out = []
-    total = 0
+    pool_total = geo_rotator.total if hasattr(geo_rotator, 'total') else 0
+
+    # ── File listing ──
+    files = _get_proxy_files()
+    file_lines = []
+    file_total = 0
     for fpath in files:
         fname = os.path.basename(fpath)
         try:
@@ -7120,18 +7154,42 @@ def _handle_proxy_status(token: str, chat_id, from_user: dict):
                 count = sum(1 for l in f if l.strip() and not l.startswith("#") and ":" in l)
         except Exception:
             count, size_kb = 0, 0
-        total += count
-        lines_out.append(f"  📄 {fname}\n  📊 {count:,} proxies · {size_kb:.1f}KB")
+        file_total += count
+        file_lines.append(f"  📄 {fname}\n  📊 {count:,} proxies · {size_kb:.1f}KB")
 
-    body = "\n\n".join(lines_out)
-    _tg_send(token, chat_id,
-        f"📡 <b>Proxy Files</b>\n\n"
-        f"{body}\n\n"
-        f"🔢 <b>Total: {total:,} in {len(files)} file(s)</b>"
-    )
+    # ── Build message ──
+    if pool_total == 0 and not files:
+        _tg_send(token, chat_id,
+            "📡 <b>Proxy Status</b>\n\n"
+            "❌ <b>No proxies available.</b>\n\n"
+            "Use <code>/upload_proxy</code> to upload one.\n"
+            f"🔄 Free proxies are auto-fetched every {RAW_PROXY_FETCH_INTERVAL}s.\n\n"
+            "🏊 <b>Pool:</b> 0 proxies\n"
+            "  🌐 HTTP: 0 · 🔒 SOCKS5: 0")
+        return
+
+    # Header with pool size
+    msg = "📡 <b>Proxy Status</b>\n"
+    msg += "━" * 20 + "\n"
+    msg += f"🏊 <b>Pool:</b> {pool_total:,} proxies\n"
+    msg += f"  🌐 HTTP: {http_count:,} · 🔒 SOCKS5: {socks5_count:,}"
+    if https_count:
+        msg += f" · 🔒 HTTPS: {https_count:,}"
+    if socks4_count:
+        msg += f" · 🔒 SOCKS4: {socks4_count:,}"
+    msg += "\n"
+    msg += f"🔄 Auto-fetch: every {RAW_PROXY_FETCH_INTERVAL}s from {len(RAW_PROXY_SOURCES)} source(s)\n"
+
+    # File details
+    if file_lines:
+        msg += "\n" + "\n\n".join(file_lines)
+        msg += f"\n\n📝 <b>Total on disk:</b> {file_total:,} in {len(files)} file(s)"
+    else:
+        msg += "\n\n<i>No proxy files on disk (pool loaded from memory).</i>"
+
+    _tg_send(token, chat_id, msg)
 
 
-# ── /check — show level & country breakdown for active checker ──
 def _handle_check(token: str, chat_id, from_user: dict, sub_cmd: str = ""):
     """
     /check         — full overview (level + country + server)
