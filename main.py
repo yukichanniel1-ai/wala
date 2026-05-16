@@ -5912,21 +5912,44 @@ def _handle_status_key(token: str, chat_id, from_user: dict, args: str):
         label_disp = e.get("label") or "(none)"
         fmt_disp   = (e.get("format") or "unknown").upper()
         source     = e.get("source", "local")
-        # Build rich user list with Name, @username, and ID
+        # Build rich user list with Name, @username, ID, and active status
         users_lines = []
         for u in used_by:
             if isinstance(u, dict):
                 u_name = u.get("name", "")
                 u_user = u.get("username", "")
                 u_id   = u.get("id", u.get("tg_id", ""))
-                display = f"    • {u_name}"
+                # Check if this user is currently active
+                u_chat_id = None
+                try: u_chat_id = int(u_id)
+                except (ValueError, TypeError): pass
+                is_active = False
+                if u_chat_id and u_chat_id in _bot_state:
+                    is_active = _bot_state[u_chat_id] in ("RUNNING", "AWAIT_FILE", "AWAIT_LEVEL", "AWAIT_FILTER")
+                active_badge = "🟢 1/1" if is_active else "⚫ 0/1"
+                # key-username format
+                username_part = f"@{u_user}" if u_user else u_name or str(u_id)
+                display = f"    • <code>{target[:8]}-{username_part}</code>"
+                display += f" ─ {u_name}"
                 if u_user:
                     display += f" @{u_user}"
-                display += f" ─ <code>{u_id}</code>"
+                display += f" ─ <code>{u_id}</code> {active_badge}"
                 users_lines.append(display)
             else:
                 # Legacy: plain chat_id string
-                users_lines.append(f"    • <code>{u}</code>")
+                u_chat_id = None
+                try: u_chat_id = int(u)
+                except (ValueError, TypeError): pass
+                is_active = False
+                if u_chat_id and u_chat_id in _bot_state:
+                    is_active = _bot_state[u_chat_id] in ("RUNNING", "AWAIT_FILE", "AWAIT_LEVEL", "AWAIT_FILTER")
+                active_badge = "🟢 1/1" if is_active else "⚫ 0/1"
+                profile = _get_saved_profile(u)
+                p_name = profile.get("username", "") if profile else ""
+                username_part = f"@{p_name}" if p_name else str(u)
+                display = f"    • <code>{target[:8]}-{username_part}</code>"
+                display += f" ─ <code>{u}</code> {active_badge}"
+                users_lines.append(display)
         users_list = "\n".join(users_lines) or "    <i>none yet</i>"
         _tg_send(token, chat_id,
             f"🔍 <b>Key Details</b>\n\n"
@@ -5978,8 +6001,37 @@ def _handle_status_key(token: str, chat_id, from_user: dict, args: str):
             tier_badge = "⭐" if v.get("tier") == "vip" else "🆓"
             label      = v.get("label", "")
             label_str  = f" · {label}" if label else ""
-            lines.append(f"  {tier_badge} <code>{k[:20]}{'…' if len(k) > 20 else ''}</code>{label_str}\n  ⏳ {_dur_label(rem)} · 👥 {redeems} · 📦 {combo}")
+            # Build usernames list for this key
+            ub = v.get("used_by", [])
+            if isinstance(ub, str): ub = [ub] if ub else []
+            if isinstance(ub, dict): ub = [ub]
+            key_users = []
+            for u in ub:
+                if isinstance(u, dict):
+                    un = u.get("username", "")
+                    nm = u.get("name", "")
+                    uid = u.get("id", u.get("tg_id", ""))
+                    # Check active status
+                    u_cid = None
+                    try: u_cid = int(uid)
+                    except (ValueError, TypeError): pass
+                    is_on = u_cid and u_cid in _bot_state and _bot_state[u_cid] in ("RUNNING", "AWAIT_FILE", "AWAIT_LEVEL", "AWAIT_FILTER")
+                    badge = "🟢" if is_on else "⚫"
+                    key_users.append(f"{badge} {f'@'+un if un else nm or uid}")
+                else:
+                    profile = _get_saved_profile(u)
+                    pn = profile.get("username", "") if profile else ""
+                    u_cid = None
+                    try: u_cid = int(u)
+                    except (ValueError, TypeError): pass
+                    is_on = u_cid and u_cid in _bot_state and _bot_state[u_cid] in ("RUNNING", "AWAIT_FILE", "AWAIT_LEVEL", "AWAIT_FILTER")
+                    badge = "🟢" if is_on else "⚫"
+                    key_users.append(f"{badge} {f'@'+pn if pn else u}")
+            users_str = " · ".join(key_users) if key_users else ""
+            users_line = f"\n  👤 {users_str}" if users_str else ""
+            lines.append(f"  {tier_badge} <code>{k[:20]}{'…' if len(k) > 20 else ''}</code>{label_str}\n  ⏳ {_dur_label(rem)} · 👥 {redeems} · 📦 {combo}{users_line}")
         if len(active) > 10:
+            lines.append(f"  <i>...and {len(active)-10} more</i>")
             lines.append(f"  <i>...and {len(active)-10} more</i>")
 
     if expired:
@@ -6002,6 +6054,41 @@ def _handle_status_key(token: str, chat_id, from_user: dict, args: str):
             lines.append(f"  {tier_badge} <code>{k[:20]}{'…' if len(k) > 20 else ''}</code>")
         if len(revoked) > 5:
             lines.append(f"  <i>...and {len(revoked)-5} more</i>")
+
+    # ── Active Users Overview ────────────────────────────────────
+    all_key_users = []  # (name, username, id, is_active)
+    for k, v in keys.items():
+        ub = v.get("used_by", [])
+        if isinstance(ub, str): ub = [ub] if ub else []
+        if isinstance(ub, dict): ub = [ub]
+        for u in ub:
+            if isinstance(u, dict):
+                uid = u.get("id", u.get("tg_id", ""))
+                u_cid = None
+                try: u_cid = int(uid)
+                except (ValueError, TypeError): pass
+                is_on = u_cid and u_cid in _bot_state and _bot_state[u_cid] in ("RUNNING", "AWAIT_FILE", "AWAIT_LEVEL", "AWAIT_FILTER")
+                all_key_users.append((u.get("name", ""), u.get("username", ""), uid, is_on))
+            else:
+                profile = _get_saved_profile(u)
+                pn = profile.get("username", "") if profile else ""
+                nm = profile.get("username", "") if profile else ""
+                u_cid = None
+                try: u_cid = int(u)
+                except (ValueError, TypeError): pass
+                is_on = u_cid and u_cid in _bot_state and _bot_state[u_cid] in ("RUNNING", "AWAIT_FILE", "AWAIT_LEVEL", "AWAIT_FILTER")
+                all_key_users.append((nm, pn, u, is_on))
+    if all_key_users:
+        online_count = sum(1 for _, _, _, on in all_key_users if on)
+        total_count = len(all_key_users)
+        lines.append(f"\n👥 <b>Key Users:</b> {online_count}/{total_count} online")
+        for nm, un, uid, on in all_key_users[:15]:
+            badge = "🟢" if on else "⚫"
+            status = "1/1" if on else "0/1"
+            name_part = f"@{un}" if un else nm or str(uid)
+            lines.append(f"  {badge} {name_part} ─ <code>{uid}</code> [{status}]")
+        if len(all_key_users) > 15:
+            lines.append(f"  <i>...and {len(all_key_users)-15} more</i>")
 
     lines.append(f"\n<i>Use /statuskey KEY for details · /deletekey to remove</i>")
     _tg_send(token, chat_id, "\n".join(lines))
@@ -8112,12 +8199,25 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
     if cmd == "reset":
         key_id = str(from_user.get("id", chat_id))
         uname  = from_user.get("username", "")
+        # ── Preserve key & expiry before clearing ────────────────────
+        old_d       = _user_data.get(chat_id, {})
+        saved_key   = old_d.get("key") or (_saved_users.get(key_id) or {}).get("key")
+        saved_exp   = old_d.get("key_expires") or (_saved_users.get(key_id) or {}).get("key_expires", 0)
+        # Clear settings but keep key access
         _saved_users.pop(key_id, None)
         if uname:
             _saved_users.pop(uname.lstrip("@").lower(), None)
         _save_users_to_disk()
         _user_data.pop(chat_id, None)
         _bot_state.pop(chat_id, None)
+        # Restore key so user doesn't need to re-redeem
+        if saved_key and saved_exp and time.time() < saved_exp:
+            d = _udata(chat_id)
+            d["key"]         = saved_key
+            d["key_expires"] = saved_exp
+            # Note: intentionally NOT calling _save_profile here,
+            # so /start will go through level/filter picker again.
+            # _check_access will find the key in _udata.
         _tg_send(token, chat_id,
             "🗑 <b>Settings cleared!</b>\n\n"
             "Send /start to choose your level and hit type again.")
@@ -8489,6 +8589,31 @@ def main():
         return
     start_bot_polling(BOT_TOKEN, None)
     _tg_set_commands(BOT_TOKEN)
+
+    # ── Notify owner that bot has started/restarted ───────────────────
+    try:
+        _restart_count = _keysystem_api.load_state("restart_count") if _keysystem_api.enabled else {}
+        if not isinstance(_restart_count, dict):
+            _restart_count = {}
+        count = _restart_count.get("count", 0) + 1
+        _restart_count["count"] = count
+        _restart_count["last_restart"] = time.time()
+        if _keysystem_api.enabled:
+            _keysystem_api.save_state("restart_count", _restart_count)
+        _now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _total_users = len({v.get("hits_id") for v in _saved_users.values() if isinstance(v, dict) and "hits_id" in v})
+        _proxy_info = f"{geo_rotator.total} proxies" if hasattr(geo_rotator, "total") else "N/A"
+        _tg_send(BOT_TOKEN, OWNER_ID,
+            f"🤖 <b>Bot Restarted!</b>\n\n"
+            f"🕐 <b>Time:</b> {_now}\n"
+            f"🔄 <b>Restart #:</b> {count}\n"
+            f"👥 <b>Total Users:</b> {_total_users}\n"
+            f"🌐 <b>Proxies:</b> {_proxy_info}\n"
+            f"🚀 <b>Status:</b> Online & Ready\n\n"
+            f"👥 <b>Active Users:</b> Send /statuskey to see details"
+        )
+    except Exception as e:
+        logger.warning(f"[MAIN] Failed to send restart notification: {e}")
 
     # ── Memory watchdog — 3-tier adaptive throttle ───────────────
     # Tier 1 (>80%): reduce to 3 threads (warn)
