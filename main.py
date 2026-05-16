@@ -903,6 +903,12 @@ def _fetch_raw_proxies():
             total_fetched = 0
             total_dupes = 0
 
+            # ── Collect ALL proxies from ALL sources first, then write once ──
+            # This replaces the old append-only approach that kept stale proxies forever.
+            # Each cycle does a full rewrite so dead proxies are removed automatically.
+            all_normalized = []   # ordered list of unique normalized proxies
+            seen = set()
+
             for source_entry in RAW_PROXY_SOURCES:
                 # Support both (url, scheme) tuples and plain url strings
                 if isinstance(source_entry, tuple):
@@ -921,23 +927,7 @@ def _fetch_raw_proxies():
 
                 total_fetched += len(lines)
 
-                # Load existing proxies from the save file to avoid duplicates
-                existing = set()
-                if os.path.exists(RAW_PROXY_SAVE_FILE):
-                    try:
-                        with open(RAW_PROXY_SAVE_FILE, "r", encoding="utf-8", errors="ignore") as f:
-                            existing = {l.strip() for l in f if l.strip() and not l.strip().startswith("#")}
-                    except OSError:
-                        pass
-
-                # Also check the entire geo_rotator pool for duplicates
-                try:
-                    with geo_rotator._lock:
-                        pool_set = set(geo_rotator._proxies)
-                except (AttributeError, TypeError):
-                    pool_set = set()
-
-                new_proxies = []
+                source_new = 0
                 dupes = 0
                 for raw_line in lines:
                     try:
@@ -946,24 +936,28 @@ def _fetch_raw_proxies():
                         continue
                     if not normalized:
                         continue
-                    if normalized in existing or normalized in pool_set:
+                    if normalized in seen:
                         dupes += 1
                         continue
-                    new_proxies.append(normalized)
-                    existing.add(normalized)
-                    pool_set.add(normalized)
+                    seen.add(normalized)
+                    all_normalized.append(normalized)
+                    source_new += 1
 
                 total_dupes += dupes
+                total_new += source_new
 
-                # Write new proxies to file immediately per source
-                if new_proxies:
-                    try:
-                        with open(RAW_PROXY_SAVE_FILE, "a", encoding="utf-8") as f:
-                            for p in new_proxies:
-                                f.write(p + "\n")
-                        total_new += len(new_proxies)
-                    except OSError as e:
-                        log.error(f"[RAW-PROXY] Failed to write {RAW_PROXY_SAVE_FILE}: {e}")
+            # ── Full rewrite: replace the entire file with fresh proxies ──
+            # This ensures dead/stale proxies from previous cycles are removed.
+            if all_normalized:
+                try:
+                    os.makedirs(PROXY_FOLDER, exist_ok=True)
+                    with open(RAW_PROXY_SAVE_FILE, "w", encoding="utf-8") as f:
+                        f.write("# Auto-fetched proxies — do not edit manually\n")
+                        for p in all_normalized:
+                            f.write(p + "\n")
+                    log.info(f"[RAW-PROXY] Full rewrite: {len(all_normalized)} proxies written to {RAW_PROXY_SAVE_FILE}")
+                except OSError as e:
+                    log.error(f"[RAW-PROXY] Failed to write {RAW_PROXY_SAVE_FILE}: {e}")
 
             if total_new > 0:
                 try:
@@ -3672,6 +3666,8 @@ def _tg_set_commands(token: str):
         {"command": "proxy_done",     "description": "✅ Finish proxy upload & save"},
         {"command": "proxystatus",    "description": "📊 View proxy pool status"},
         {"command": "testproxy",      "description": "🧪 Test proxy connectivity"},
+        {"command": "deleteproxy",    "description": "🗑️ Delete all proxy files"},
+        {"command": "renewproxy",    "description": "🔄 Renew proxies from worker"},
         {"command": "serverstatus",   "description": "🖥 Server load & limits"},
         {"command": "setthreads",    "description": "🔧 Set checker threads (e.g. /setthreads 10)"},
         {"command": "setmaxusers",    "description": "👥 Set max concurrent users (e.g. /setmaxusers 20)"},
@@ -7774,6 +7770,210 @@ def _handle_proxy_status(token: str, chat_id, from_user: dict):
     )
 
 
+def _handle_delete_proxy(token: str, chat_id, from_user: dict):
+    """Delete the raw_fetched_proxies.txt file and clear the proxy pool.
+    Owner-only command — removes all auto-fetched proxies so they can be refreshed cleanly."""
+    if not _is_owner(from_user):
+        _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+        return
+
+    log = logging.getLogger(__name__)
+    deleted_files = []
+    deleted_count = 0
+
+    # Delete raw_fetched_proxies.txt
+    if os.path.exists(RAW_PROXY_SAVE_FILE):
+        try:
+            with open(RAW_PROXY_SAVE_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                lines = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+            deleted_count = len(lines)
+            os.remove(RAW_PROXY_SAVE_FILE)
+            deleted_files.append(f"raw_fetched_proxies.txt ({deleted_count} proxies)")
+            log.info(f"[DELETE-PROXY] Deleted {RAW_PROXY_SAVE_FILE} ({deleted_count} proxies)")
+        except Exception as e:
+            log.error(f"[DELETE-PROXY] Failed to delete {RAW_PROXY_SAVE_FILE}: {e}")
+            _tg_send(token, chat_id, f"❌ <b>Failed to delete proxy file:</b> <code>{e}</code>")
+            return
+    else:
+        deleted_files.append("raw_fetched_proxies.txt (not found — already deleted)")
+
+    # Also delete pasted_proxies.txt if it exists
+    pasted_path = os.path.join(PROXY_FOLDER, "pasted_proxies.txt")
+    if os.path.exists(pasted_path):
+        try:
+            with open(pasted_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+            pasted_count = len(lines)
+            os.remove(pasted_path)
+            deleted_files.append(f"pasted_proxies.txt ({pasted_count} proxies)")
+            deleted_count += pasted_count
+            log.info(f"[DELETE-PROXY] Deleted {pasted_path} ({pasted_count} proxies)")
+        except Exception as e:
+            log.error(f"[DELETE-PROXY] Failed to delete {pasted_path}: {e}")
+
+    # Clear the in-memory proxy pool and reload (will be empty now)
+    try:
+        with geo_rotator._lock:
+            geo_rotator._proxies = []
+            geo_rotator._proxy_source = {}
+            geo_rotator._thread_idx = {}
+            geo_rotator._thread_proxy = {}
+            geo_rotator._global_idx = 0
+        geo_rotator._load_all_files()
+    except Exception as e:
+        log.error(f"[DELETE-PROXY] Failed to clear pool: {e}")
+
+    # Also clean saved_proxies/ mirror
+    try:
+        for fname in ["raw_fetched_proxies.txt", "pasted_proxies.txt"]:
+            sp = os.path.join(SAVED_PROXIES_DIR, fname)
+            if os.path.exists(sp):
+                os.remove(sp)
+    except Exception:
+        pass
+
+    pool_now = geo_rotator.total
+    files_str = "\n".join(f"  🗑️ {f}" for f in deleted_files)
+
+    _tg_send(token, chat_id,
+        f"🗑️ <b>Proxy Files Deleted!</b>\n\n"
+        f"{files_str}\n\n"
+        f"🧹 <b>Total proxies removed:</b> <code>{deleted_count}</code>\n"
+        f"📡 <b>Proxy pool now:</b> <code>{pool_now}</code>\n\n"
+        f"💡 Use <code>/renewproxy</code> to fetch fresh proxies from the worker."
+    )
+
+
+def _handle_renew_proxy(token: str, chat_id, from_user: dict):
+    """Fetch fresh proxies from https://worker-production-a615.up.railway.app/ only.
+    DELETES the old raw_fetched_proxies.txt first (clean wipe), then fetches new
+    proxies from the primary worker source and reloads the pool."""
+    if not _is_owner(from_user):
+        _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+        return
+
+    log = logging.getLogger(__name__)
+
+    _tg_send(token, chat_id, "🔄 <b>Renewing proxies from worker…</b>\n\n"
+        "⏳ Fetching fresh proxies from:\n"
+        "<code>https://worker-production-a615.up.railway.app/</code>")
+
+    # Step 1: DELETE old raw_fetched_proxies.txt completely
+    old_count = 0
+    if os.path.exists(RAW_PROXY_SAVE_FILE):
+        try:
+            with open(RAW_PROXY_SAVE_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                old_count = sum(1 for l in f if l.strip() and not l.strip().startswith("#"))
+            os.remove(RAW_PROXY_SAVE_FILE)
+            log.info(f"[RENEW-PROXY] Deleted old {RAW_PROXY_SAVE_FILE} ({old_count} proxies)")
+        except Exception as e:
+            log.error(f"[RENEW-PROXY] Failed to delete old file: {e}")
+
+    # Step 2: Also delete pasted_proxies.txt
+    pasted_path = os.path.join(PROXY_FOLDER, "pasted_proxies.txt")
+    if os.path.exists(pasted_path):
+        try:
+            os.remove(pasted_path)
+            log.info(f"[RENEW-PROXY] Deleted old {pasted_path}")
+        except Exception as e:
+            log.error(f"[RENEW-PROXY] Failed to delete {pasted_path}: {e}")
+
+    # Step 3: Clear in-memory pool so old proxies don't persist
+    try:
+        with geo_rotator._lock:
+            geo_rotator._proxies = []
+            geo_rotator._proxy_source = {}
+            geo_rotator._thread_idx = {}
+            geo_rotator._thread_proxy = {}
+            geo_rotator._global_idx = 0
+    except Exception as e:
+        log.error(f"[RENEW-PROXY] Failed to clear in-memory pool: {e}")
+
+    # Also clean saved_proxies/ mirror
+    try:
+        for fname in ["raw_fetched_proxies.txt", "pasted_proxies.txt"]:
+            sp = os.path.join(SAVED_PROXIES_DIR, fname)
+            if os.path.exists(sp):
+                os.remove(sp)
+    except Exception:
+        pass
+
+    # Step 4: Fetch fresh proxies from the primary worker source ONLY
+    worker_url = "https://worker-production-a615.up.railway.app/"
+    new_proxies = []
+    fetch_errors = []
+
+    try:
+        resp = requests.get(worker_url, timeout=30)
+        resp.raise_for_status()
+        raw_lines = [l.strip() for l in resp.text.splitlines()
+                     if l.strip() and not l.strip().startswith("#")]
+        log.info(f"[RENEW-PROXY] Fetched {len(raw_lines)} raw lines from worker")
+    except Exception as e:
+        raw_lines = []
+        fetch_errors.append(f"Worker fetch failed: {e}")
+        log.error(f"[RENEW-PROXY] Failed to fetch from worker: {e}")
+
+    # Step 5: Normalize, deduplicate, write to fresh file
+    if raw_lines:
+        os.makedirs(PROXY_FOLDER, exist_ok=True)
+
+        # Create FRESH raw_fetched_proxies.txt (not append!)
+        with open(RAW_PROXY_SAVE_FILE, "w", encoding="utf-8") as f:
+            f.write("# Auto-fetched proxies — renewed from worker\n")
+
+        seen = set()
+        for line in raw_lines:
+            try:
+                # Use GeoRotator's normalizer for consistent formatting
+                normalized = geo_rotator._normalize_proxy(line)
+                if not normalized:
+                    continue
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                new_proxies.append(normalized)
+            except Exception:
+                continue
+
+        # Write all new proxies
+        if new_proxies:
+            with open(RAW_PROXY_SAVE_FILE, "a", encoding="utf-8") as f:
+                for p in new_proxies:
+                    f.write(p + "\n")
+
+    # Step 6: Reload the pool from disk (only the new file exists now)
+    try:
+        geo_rotator._load_all_files()
+    except Exception as e:
+        log.error(f"[RENEW-PROXY] Failed to reload pool: {e}")
+
+    # Step 7: Persist
+    try:
+        _persist_proxies()
+    except Exception:
+        pass
+
+    pool_now = geo_rotator.total
+
+    # Build result message
+    if fetch_errors:
+        err_str = "\n".join(f"  ❌ {e}" for e in fetch_errors)
+        _tg_send(token, chat_id,
+            f"⚠️ <b>Proxy Renewal — Partial Failure</b>\n\n"
+            f"🗑️ Old proxies deleted: <code>{old_count}</code>\n"
+            f"✅ New proxies fetched: <code>{len(new_proxies)}</code>\n"
+            f"📡 Proxy pool now: <code>{pool_now}</code>\n\n"
+            f"<b>Errors:</b>\n{err_str}")
+    else:
+        _tg_send(token, chat_id,
+            f"✅ <b>Proxy Renewal Complete!</b>\n\n"
+            f"🗑️ Old proxies deleted: <code>{old_count}</code>\n"
+            f"🔄 Fetched from: <code>{worker_url}</code>\n"
+            f"✅ New proxies added: <code>{len(new_proxies)}</code>\n"
+            f"📡 Proxy pool now: <code>{pool_now}</code>")
+
+
 def _handle_check(token: str, chat_id, from_user: dict, sub_cmd: str = ""):
     """
     /check         — full overview (level + country + server)
@@ -7935,6 +8135,10 @@ def _handle_help(token: str, chat_id, from_user: dict):
                 [
                     {"text": "📤 Upload Proxy",    "callback_data": "admin:upload_proxy"},
                     {"text": "🔄 Refresh Panel",   "callback_data": "admin:refresh"},
+                ],
+                [
+                    {"text": "🗑️ Delete Proxies",  "callback_data": "admin:deleteproxy"},
+                    {"text": "🔄 Renew Proxies",   "callback_data": "admin:renewproxy"},
                 ],
                 [
                     {"text": "📊 Server Status",   "callback_data": "admin:serverstatus"},
@@ -8172,6 +8376,18 @@ def _handle_callback_query(token: str, cq: dict):
         _proxy_msg_ids.pop(chat_id, None)
         _bot_state[chat_id] = "AWAIT_PROXY"
         _handle_proxy_upload(token, chat_id, from_user, {})
+        return
+
+    if data == "admin:deleteproxy":
+        if not _is_owner(from_user): return
+        _handle_delete_proxy(token, chat_id, from_user)
+        return
+
+    if data == "admin:renewproxy":
+        if not _is_owner(from_user): return
+        def _run_renew_cb():
+            _handle_renew_proxy(token, chat_id, from_user)
+        threading.Thread(target=_run_renew_cb, daemon=True).start()
         return
 
     if data == "admin:refresh":
@@ -8843,6 +9059,23 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
         
         threading.Thread(target=_run_proxy_test, daemon=True).start()
         _tg_send(token, chat_id, "🧪 <b>Running proxy test...</b> (results in ~10s)")
+        return
+
+    if cmd == "deleteproxy":
+        if not _is_owner(from_user):
+            _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+            return
+        _handle_delete_proxy(token, chat_id, from_user)
+        return
+
+    if cmd == "renewproxy":
+        if not _is_owner(from_user):
+            _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+            return
+        # Run in background thread since it makes HTTP requests
+        def _run_renew_proxy():
+            _handle_renew_proxy(token, chat_id, from_user)
+        threading.Thread(target=_run_renew_proxy, daemon=True).start()
         return
 
     if cmd == "add_coowner":
