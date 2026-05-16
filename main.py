@@ -767,8 +767,8 @@ def _fetch_raw_proxies():
     Background worker: fetches raw proxy lists from configured URLs every 30 seconds.
     Deduplicates against the current pool and save file.
     Only new, unique proxies are appended to raw_fetched_proxies.txt.
-    Uses the correct scheme (http/socks5) per source so SOCKS5 proxies
-    are stored as socks5://ip:port instead of http://ip:port.
+    Uses the correct scheme (http/socks5h) per source so SOCKS5 proxies
+    are stored as socks5h://ip:port (remote DNS resolution) instead of http://ip:port.
     Wrapped in try/except so the thread never dies silently.
     """
     log = logging.getLogger(__name__)
@@ -782,16 +782,26 @@ def _fetch_raw_proxies():
         line = line.strip()
         if not line or line.startswith("#"):
             return None
-        # Already has a scheme? Use it as-is
+        # Already has a scheme? Upgrade socks5:// → socks5h:// for remote DNS resolution
         low = line.lower()
-        if low.startswith(("http://", "https://", "socks5://", "socks4://")):
+        if low.startswith("socks5h://"):
+            return line
+        if low.startswith("socks5://"):
+            return "socks5h://" + line[8:]  # upgrade to socks5h for remote DNS
+        if low.startswith("socks4://"):
+            return "socks5h://" + line[8:]  # upgrade socks4 to socks5h
+        if low.startswith(("http://", "https://")):
             return line
         # Bare ip:port or ip:port:user:pass → apply the source's default scheme
         parts = line.split(":")
+        if default_scheme == "socks5":
+            scheme_str = "socks5h"  # always use socks5h for SOCKS5 sources (remote DNS)
+        else:
+            scheme_str = default_scheme
         if len(parts) == 2 and parts[1].isdigit():
-            return f"{default_scheme}://{parts[0]}:{parts[1]}"
+            return f"{scheme_str}://{parts[0]}:{parts[1]}"
         if len(parts) == 4 and parts[1].isdigit():
-            return f"{default_scheme}://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+            return f"{scheme_str}://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
         return None
 
     while not shutdown_event.is_set():
