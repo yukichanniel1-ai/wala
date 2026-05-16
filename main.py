@@ -55,6 +55,22 @@ CY  = Fore.CYAN
 # Global shutdown event for Ctrl+C handling
 shutdown_event = Event()
 
+
+# ── Liveness tracking — updated by key operations, checked by watchdog ──
+_liveness_ts = time.time()           # last time the bot did something useful
+_liveness_lock = threading.Lock()
+
+def _touch_liveness():
+    """Call this from key operations to prove the bot is alive."""
+    global _liveness_ts
+    with _liveness_lock:
+        _liveness_ts = time.time()
+
+def _get_liveness_age():
+    """Return seconds since last liveness touch."""
+    with _liveness_lock:
+        return time.time() - _liveness_ts
+
 # ── Thread exception hook — prevents silent thread crashes ──────
 def _thread_exception_hook(args):
     logger = logging.getLogger(__name__)
@@ -662,6 +678,7 @@ def _fetch_raw_proxies():
             if total_new > 0:
                 try:
                     geo_rotator._load_all_files()
+                    _touch_liveness()  # proxy fetch is alive
                 except Exception as e:
                     log.error(f"[RAW-PROXY] Failed to reload proxy pool: {e}")
 
@@ -8454,6 +8471,7 @@ def start_bot_polling(token: str, _unused=None):
     def _poll():
         nonlocal offset, poll_session, consecutive_errors
         logger.info("[BOT] 🤖 Polling started — waiting for users...")
+        _touch_liveness()  # polling started
         # Sync user profiles and keys from KeyVault API (survives Railway redeploys)
         try:
             _load_saved_users(sync_api=True)
@@ -8473,6 +8491,7 @@ def start_bot_polling(token: str, _unused=None):
                     timeout=35
                 )
                 consecutive_errors = 0  # reset on success
+                _touch_liveness()  # polling is alive
 
                 if r.status_code == 429:
                     retry_after = int(r.headers.get("Retry-After", 10))
@@ -8523,6 +8542,128 @@ def start_bot_polling(token: str, _unused=None):
     threading.Thread(target=_poll, daemon=True).start()
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  RAILWAY HEALTHCHECK SERVER — lightweight HTTP server for liveness
+#  Railway pings /health every 30s; if it fails 3 times → auto-restart
+# ═══════════════════════════════════════════════════════════════════
+_healthcheck_server = None  # reference to HTTPServer for cleanup
+
+def _start_healthcheck_server():
+    """Start a lightweight HTTP server for Railway healthchecks.
+    Responds 200 if bot is alive, 503 if the main loop appears stuck."""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import traceback
+
+    port = int(os.environ.get("PORT", 0))  # Railway sets PORT automatically
+
+    if not port:
+        logger.debug("[HEALTH] No PORT env var — healthcheck server disabled")
+        return
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/health":
+                age = _get_liveness_age()
+                # If no liveness touch in 5 minutes → 503 (unhealthy)
+                if age > 300:
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "status": "unhealthy",
+                        "reason": f"no activity for {int(age)}s",
+                    }).encode())
+                    logger.warning(f"[HEALTH] ❌ Healthcheck FAILED — no activity for {int(age)}s")
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    active = sum(1 for s in _bot_state.values() if s == "RUNNING")
+                    self.wfile.write(json.dumps({
+                        "status": "healthy",
+                        "active_checkers": active,
+                        "liveness_age_s": int(age),
+                        "proxies": geo_rotator.total if hasattr(geo_rotator, "total") else 0,
+                    }).encode())
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, format, *args):
+            # Suppress default request logging to keep terminal clean
+            pass
+
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthHandler)
+        global _healthcheck_server
+        _healthcheck_server = server
+        threading.Thread(target=server.serve_forever, daemon=True, name="HealthcheckServer").start()
+        logger.info(f"[HEALTH] ✅ Healthcheck server listening on :{port}/health")
+    except Exception as e:
+        logger.warning(f"[HEALTH] Could not start healthcheck server: {e}")
+
+
+def _railway_redeploy():
+    """Trigger a Railway redeploy via the API using RAILWAY_TOKEN.
+    Falls back to os.execv (full process restart) if API is unavailable."""
+    token = os.environ.get("RAILWAY_TOKEN", "").strip()
+    service_id = os.environ.get("RAILWAY_SERVICE_ID", "").strip()
+    environment_id = os.environ.get("RAILWAY_ENVIRONMENT_ID", "").strip()
+
+    if token and service_id:
+        try:
+            logger.info("[RAILWAY] 🔄 Triggering redeploy via Railway API...")
+            # Notify owner before redeploying
+            try:
+                _tg_send(BOT_TOKEN, OWNER_ID,
+                    "🔄 <b>Auto-Redeploy Triggered</b>\n\n"
+                    "Bot detected a critical failure and is redeploying itself.\n"
+                    "<i>You don't need to do anything — it will be back online shortly.</i>"
+                )
+            except Exception:
+                pass
+
+            # Use Railway's GraphQL API to trigger a redeploy
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+            # First get the latest deployment ID
+            query = """
+            mutation { deployTrigger(serviceId: "%s", environmentId: "%s") { id } }
+            """ % (service_id, environment_id)
+            resp = requests.post(
+                "https://backboard.railway.app/graphql/v2",
+                json={"query": query},
+                headers=headers,
+                timeout=10,
+            )
+            if resp.ok:
+                logger.info("[RAILWAY] ✅ Redeploy triggered successfully via API")
+                # Give the message time to send, then exit so Railway can redeploy
+                time.sleep(3)
+                os._exit(1)  # non-zero exit so Railway knows this instance is done
+            else:
+                logger.warning(f"[RAILWAY] API redeploy failed ({resp.status_code}), falling back to execv")
+        except Exception as e:
+            logger.warning(f"[RAILWAY] API redeploy error: {e}, falling back to execv")
+
+    # Fallback: full process restart via os.execv
+    # This is the nuclear option — re-exec the Python process from scratch
+    logger.info("[RAILWAY] 🔄 Restarting process via os.execv...")
+    try:
+        _tg_send(BOT_TOKEN, OWNER_ID,
+            "🔄 <b>Auto-Restart Triggered</b>\n\n"
+            "Bot is restarting itself after detecting a critical failure.\n"
+            "<i>It will be back online in a moment.</i>"
+        )
+        time.sleep(3)  # give Telegram message time to send
+    except Exception:
+        pass
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+
 def main():
     global BOT_MODE
     print_banner()
@@ -8537,6 +8678,10 @@ def main():
                 evt.set()
     signal.signal(signal.SIGTERM, _graceful_shutdown)
     signal.signal(signal.SIGINT,  _graceful_shutdown)
+
+    # ── Start Railway healthcheck server (responds to /health) ──
+    _start_healthcheck_server()
+    _touch_liveness()  # initial liveness touch
 
     proxy_file_names = [os.path.basename(p) for p in PROXY_FILES]
     logger.info(
@@ -8682,16 +8827,54 @@ def main():
     threading.Thread(target=_memory_watchdog, daemon=True, name="MemWatchdog").start()
 
     # ── Railway keep-alive heartbeat ─────────────────────────
-    def _railway_heartbeat():
-        """Periodic heartbeat log to prevent Railway from thinking the process is idle."""
+    def _liveness_watchdog():
+        """Enhanced heartbeat + liveness watchdog.
+        Every 60s: log heartbeat and check liveness.
+        If no activity for 5 minutes: warn.
+        If no activity for 10 minutes: trigger self-healing restart."""
+        stuck_warned = False
         while not shutdown_event.is_set():
-            time.sleep(300)  # every 5 minutes
+            time.sleep(60)  # check every minute
             try:
+                age = _get_liveness_age()
                 active = sum(1 for s in _bot_state.values() if s == "RUNNING")
-                logger.info(f"[HEARTBEAT] 💓 Bot alive | {active} active checker(s) | threads: {MAX_GLOBAL_THREADS}")
+
+                if age > 600:  # 10 minutes — no activity at all
+                    logger.error(f"[WATCHDOG] 🚨 Bot appears DEAD — no activity for {int(age)}s! Triggering self-healing restart...")
+                    try:
+                        _tg_send(BOT_TOKEN, OWNER_ID,
+                            f"🚨 <b>Bot Self-Heal Triggered</b>\n\n"
+                            f"No activity detected for <b>{int(age/60)} minutes</b>.\n"
+                            f"Bot is restarting itself automatically.\n\n"
+                            f"<i>You don't need to do anything.</i>"
+                        )
+                        time.sleep(3)  # give message time to send
+                    except Exception:
+                        pass
+                    # Self-heal: full process restart
+                    if _is_railway():
+                        _railway_redeploy()
+                    else:
+                        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+                elif age > 300:  # 5 minutes — concerning
+                    if not stuck_warned:
+                        logger.warning(f"[WATCHDOG] ⚠️ Bot may be stuck — no activity for {int(age)}s")
+                        stuck_warned = True
+                        try:
+                            _tg_send(BOT_TOKEN, OWNER_ID,
+                                f"⚠️ <b>Bot May Be Stuck</b>\n\n"
+                                f"No activity for <b>{int(age/60)} minutes</b>.\n"
+                                f"Will auto-restart in 5 min if no recovery."
+                            )
+                        except Exception:
+                            pass
+                else:
+                    stuck_warned = False  # recovered
+                    logger.info(f"[HEARTBEAT] 💓 Bot alive | {active} active | liveness: {int(age)}s ago | threads: {MAX_GLOBAL_THREADS}")
             except Exception:
                 pass
-    threading.Thread(target=_railway_heartbeat, daemon=True, name="RailwayHeartbeat").start()
+    threading.Thread(target=_liveness_watchdog, daemon=True, name="LivenessWatchdog").start()
 
     # ── Raw proxy auto-fetch (every 30 seconds from external sources) ──
     threading.Thread(target=_fetch_raw_proxies, daemon=True, name="RawProxyFetcher").start()
@@ -8703,9 +8886,15 @@ def main():
     bot_console.print("[dim]Press Ctrl+C to stop.[/dim]\n")
 
     # Keep the main thread alive — catch ALL exceptions to prevent crash-exit
+    # Also touches liveness every 30s so the watchdog knows we're alive.
+    _main_loop_tick = 0
     while not shutdown_event.is_set():
         try:
             time.sleep(1)
+            _main_loop_tick += 1
+            if _main_loop_tick >= 30:  # touch liveness every 30s
+                _touch_liveness()
+                _main_loop_tick = 0
         except KeyboardInterrupt:
             break
         except Exception as e:
@@ -8714,9 +8903,9 @@ def main():
 
 
 if __name__ == "__main__":
-    # Top-level crash guard with retry limit and exponential backoff.
-    # On Railway, prevents infinite restart loops that spam logs.
-    MAX_CRASH_RETRIES = 5         # give up after 5 consecutive crashes
+    # Top-level crash guard with exponential backoff + self-healing on Railway.
+    # Instead of "giving up", triggers Railway redeploy or process restart.
+    MAX_CRASH_RETRIES = 5         # internal retry limit
     crash_count = 0
     while crash_count < MAX_CRASH_RETRIES:
         try:
@@ -8741,18 +8930,31 @@ if __name__ == "__main__":
             backoff = min(30 * (2 ** (crash_count - 1)), 480)
             bot_console.print(f"[red]✘ Restarting in {backoff}s... (attempt {crash_count}/{MAX_CRASH_RETRIES})[/red]")
             if _is_railway():
-                # On Railway: don't exit — stay alive and retry with backoff
                 logger.error(f"[MAIN] Running on Railway — retry {crash_count}/{MAX_CRASH_RETRIES} in {backoff}s...")
                 time.sleep(backoff)
             else:
                 time.sleep(backoff)
     else:
-        # Exhausted all retries
+        # ── All internal retries exhausted — SELF-HEAL instead of giving up ──
         logger = logging.getLogger(__name__)
-        logger.error(f"[MAIN] ✘ Bot crashed {MAX_CRASH_RETRIES} times in a row — giving up. Check logs for the root cause.")
-        bot_console.print(f"[bold red]✘ Bot crashed {MAX_CRASH_RETRIES} times — giving up to avoid restart loop. Check logs.[/bold red]")
+        logger.error(f"[MAIN] ✘ Bot crashed {MAX_CRASH_RETRIES} times — triggering self-healing restart!")
+        bot_console.print(f"[bold red]✘ Crashed {MAX_CRASH_RETRIES} times — self-healing restart![/bold red]")
+
         if _is_railway():
-            # Stay alive on Railway but don't keep restarting
-            logger.error("[MAIN] Staying alive on Railway but NOT restarting. Manual intervention needed.")
-            while not shutdown_event.is_set():
-                time.sleep(60)
+            # On Railway: trigger redeploy via API (or fall back to execv)
+            # This ensures Railway knows about the restart and tracks it properly.
+            try:
+                _tg_send(BOT_TOKEN, OWNER_ID,
+                    f"🚨 <b>Self-Healing Redeploy</b>\n\n"
+                    f"Bot crashed {MAX_CRASH_RETRIES} times internally.\n"
+                    f"Triggering Railway redeploy now.\n\n"
+                    f"<i>Bot will be back online automatically.</i>"
+                )
+                time.sleep(3)
+            except Exception:
+                pass
+            _railway_redeploy()
+        else:
+            # Not on Railway: just restart the process
+            logger.info("[MAIN] Restarting process via os.execv...")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
