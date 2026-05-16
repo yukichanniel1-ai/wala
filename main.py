@@ -536,12 +536,12 @@ except Exception as _geo_err:
 RAW_PROXY_SOURCES = [
     "https://worker-production-a615.up.railway.app/",
 ]
-RAW_PROXY_FETCH_INTERVAL = 300  # 5 minutes
+RAW_PROXY_FETCH_INTERVAL = 30  # 30 seconds
 RAW_PROXY_SAVE_FILE = os.path.join(PROXY_FOLDER, "raw_fetched_proxies.txt")
 
 def _fetch_raw_proxies():
     """
-    Background worker: fetches raw proxy lists from configured URLs every 5 minutes.
+    Background worker: fetches raw proxy lists from configured URLs every 30 seconds.
     Only new, unique proxies are appended to raw_fetched_proxies.txt.
     """
     log = logging.getLogger(__name__)
@@ -8235,7 +8235,7 @@ def main():
                 pass
     threading.Thread(target=_railway_heartbeat, daemon=True, name="RailwayHeartbeat").start()
 
-    # ── Raw proxy auto-fetch (every 5 minutes from external sources) ──
+    # ── Raw proxy auto-fetch (every 30 seconds from external sources) ──
     threading.Thread(target=_fetch_raw_proxies, daemon=True, name="RawProxyFetcher").start()
 
     bot_console.print(
