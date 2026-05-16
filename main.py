@@ -790,90 +790,20 @@ RAW_PROXY_SOURCES = [
 ]
 RAW_PROXY_FETCH_INTERVAL = 30  # 30 seconds — faster refresh for better proxy availability
 RAW_PROXY_SAVE_FILE = os.path.join(PROXY_FOLDER, "raw_fetched_proxies.txt")
-RAW_PROXY_VALIDATE_ON_FETCH = True  # Validate proxies against Garena SSO before adding
-RAW_PROXY_VALIDATE_TIMEOUT = 6     # Seconds to wait for validation
-RAW_PROXY_VALIDATE_WORKERS = 10    # Parallel validation threads
 
-def _validate_proxy(proxy_url):
-    """Test a single proxy against Garena SSO prelogin endpoint.
-    Returns True if the proxy can reach Garena (any HTTP response, even 403 = IP works).
-    Returns False if the proxy is dead or can't connect."""
-    try:
-        sess = requests.Session()
-        sess.proxies = {"http": proxy_url, "https": proxy_url}
-        sess.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
-        })
-        # Test against Garena's DataDome endpoint — lightweight check
-        resp = sess.get("https://dd.garena.com/js/", timeout=RAW_PROXY_VALIDATE_TIMEOUT, 
-                        allow_redirects=False)
-        # Any response (200, 403, etc.) means the proxy can reach Garena's servers
-        return resp.status_code is not None and resp.status_code != 0
-    except Exception:
-        return False
-    finally:
-        try:
-            sess.close()
-        except Exception:
-            pass
-
-
-def _validate_proxies_batch(proxy_list, max_workers=None):
-    """Validate a batch of proxies in parallel.
-    Returns a list of working proxy URLs."""
-    if not proxy_list:
-        return []
-    
-    if not RAW_PROXY_VALIDATE_ON_FETCH:
-        return proxy_list  # Skip validation
-    
-    max_workers = max_workers or RAW_PROXY_VALIDATE_WORKERS
-    log = logging.getLogger(__name__)
-    working = []
-    total = len(proxy_list)
-    
-    if total <= 5:
-        # Small batch — validate sequentially to avoid overhead
-        for p in proxy_list:
-            if _validate_proxy(p):
-                working.append(p)
-        log.info(f"[PROXY-VAL] {len(working)}/{total} proxies working (sequential)")
-        return working
-    
-    # Large batch — validate in parallel with ThreadPoolExecutor
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    
-    validated = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_proxy = {executor.submit(_validate_proxy, p): p for p in proxy_list}
-        for future in as_completed(future_to_proxy):
-            validated += 1
-            proxy = future_to_proxy[future]
-            try:
-                if future.result(timeout=RAW_PROXY_VALIDATE_TIMEOUT + 2):
-                    working.append(proxy)
-            except Exception:
-                pass
-            # Log progress every 50 proxies
-            if validated % 50 == 0:
-                log.info(f"[PROXY-VAL] Progress: {validated}/{total} tested, {len(working)} working")
-    
-    log.info(f"[PROXY-VAL] ✅ {len(working)}/{total} proxies validated as working")
-    return working
 
 
 def _fetch_raw_proxies():
     """
     Background worker: fetches raw proxy lists from configured URLs every 30 seconds.
-    Proxies are validated against Garena's endpoint before being added to the pool.
-    Only new, unique, working proxies are saved.
+    All fetched proxies are saved directly — the checker naturally removes dead ones.
     Uses the correct scheme (http/socks5h) per source so SOCKS5 proxies
     are stored with the right protocol instead of all as http://.
     Wrapped in try/except so the thread never dies silently.
     """
     log = logging.getLogger(__name__)
-    log.info(f"[RAW-PROXY] Auto-fetch started \u2014 {len(RAW_PROXY_SOURCES)} source(s), "
-             f"interval {RAW_PROXY_FETCH_INTERVAL}s, validate={RAW_PROXY_VALIDATE_ON_FETCH}")
+    log.info(f"[RAW-PROXY] Auto-fetch started — {len(RAW_PROXY_SOURCES)} source(s), "
+             f"interval {RAW_PROXY_FETCH_INTERVAL}s")
 
     os.makedirs(PROXY_FOLDER, exist_ok=True)
 
@@ -882,16 +812,26 @@ def _fetch_raw_proxies():
         line = line.strip()
         if not line or line.startswith("#"):
             return None
-        # Already has a scheme? Use it as-is
+        # Already has a scheme? Use it as-is (upgrade socks5:// → socks5h:// for remote DNS)
         low = line.lower()
-        if low.startswith(("http://", "https://", "socks5://", "socks4://")):
+        if low.startswith("socks5h://"):
+            return line
+        if low.startswith("socks5://"):
+            return "socks5h://" + line[8:]  # upgrade to socks5h for remote DNS resolution
+        if low.startswith("socks4://"):
+            return "socks5h://" + line[8:]  # upgrade socks4 to socks5h
+        if low.startswith(("http://", "https://")):
             return line
         # Bare ip:port or ip:port:user:pass → apply the source's default scheme
         parts = line.split(":")
+        if default_scheme == "socks5":
+            scheme_str = "socks5h"  # always use socks5h for SOCKS5 sources (remote DNS)
+        else:
+            scheme_str = default_scheme
         if len(parts) == 2 and parts[1].isdigit():
-            return f"{default_scheme}://{parts[0]}:{parts[1]}"
+            return f"{scheme_str}://{parts[0]}:{parts[1]}"
         if len(parts) == 4 and parts[1].isdigit():
-            return f"{default_scheme}://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+            return f"{scheme_str}://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
         return None
 
     while not shutdown_event.is_set():
@@ -899,10 +839,6 @@ def _fetch_raw_proxies():
             total_new = 0
             total_fetched = 0
             total_dupes = 0
-            total_validated = 0
-            total_dead = 0
-
-            all_new_proxies = []  # Collect all new proxies across sources before validation
 
             for source_entry in RAW_PROXY_SOURCES:
                 # Support both (url, scheme) tuples and plain url strings
@@ -938,6 +874,7 @@ def _fetch_raw_proxies():
                 except (AttributeError, TypeError):
                     pool_set = set()
 
+                new_proxies = []
                 dupes = 0
                 for raw_line in lines:
                     try:
@@ -949,28 +886,19 @@ def _fetch_raw_proxies():
                     if normalized in existing or normalized in pool_set:
                         dupes += 1
                         continue
-                    all_new_proxies.append(normalized)
+                    new_proxies.append(normalized)
                     existing.add(normalized)
                     pool_set.add(normalized)
 
                 total_dupes += dupes
 
-            # ── Validate all new proxies in one batch ──
-            if all_new_proxies:
-                total_validated = len(all_new_proxies)
-                if RAW_PROXY_VALIDATE_ON_FETCH:
-                    log.info(f"[RAW-PROXY] Validating {total_validated} new proxies...")
-                    working_proxies = _validate_proxies_batch(all_new_proxies)
-                    total_dead = total_validated - len(working_proxies)
-                else:
-                    working_proxies = all_new_proxies
-
-                if working_proxies:
+                # Write new proxies to file immediately per source
+                if new_proxies:
                     try:
                         with open(RAW_PROXY_SAVE_FILE, "a", encoding="utf-8") as f:
-                            for p in working_proxies:
+                            for p in new_proxies:
                                 f.write(p + "\n")
-                        total_new = len(working_proxies)
+                        total_new += len(new_proxies)
                     except OSError as e:
                         log.error(f"[RAW-PROXY] Failed to write {RAW_PROXY_SAVE_FILE}: {e}")
 
@@ -981,37 +909,30 @@ def _fetch_raw_proxies():
                 except Exception as e:
                     log.error(f"[RAW-PROXY] Failed to reload proxy pool: {e}")
 
-                # ── Auto-resume proxy-paused users if proxies are now available ──
+                # Auto-resume proxy-paused users if proxies are now available
                 try:
                     if _proxy_paused_users:
                         _resume_proxy_paused_users(BOT_TOKEN)
                 except Exception:
                     pass
 
-                # ── Persist fetched proxies to saved_proxies/ + KeyVault API ──
+                # Persist fetched proxies to saved_proxies/ + KeyVault API
                 try:
                     _persist_proxies()
                 except Exception:
                     pass
 
-                log.info(f"[RAW-PROXY] +{total_new} new working proxies added "
-                         f"(fetched {total_fetched}, {total_dupes} dupes, "
-                         f"{total_dead} dead filtered) | pool now: {geo_rotator.total}")
+                log.info(f"[RAW-PROXY] +{total_new} new proxies added "
+                         f"(fetched {total_fetched}, {total_dupes} dupes) | pool now: {geo_rotator.total}")
             else:
                 log.debug(f"[RAW-PROXY] No new proxies this cycle "
-                          f"(fetched {total_fetched}, {total_dupes} dupes, "
-                          f"{total_dead} dead filtered)")
+                          f"(fetched {total_fetched}, {total_dupes} dupes)")
 
         except Exception as e:
             log.error(f"[RAW-PROXY] Error in fetch cycle: {e}", exc_info=True)
 
         # Wait for next cycle (interruptible by shutdown)
         shutdown_event.wait(RAW_PROXY_FETCH_INTERVAL)
-
-
-
-
-
 
 def signal_handler(signum, frame):
     """Handle SIGINT (Ctrl+C) and SIGTERM (process manager shutdown) gracefully."""
