@@ -3714,6 +3714,18 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
         return
 
     file_name: str = document.get("file_name", "combo.txt")
+    file_size: int = document.get("file_size", 0)  # Telegram provides size in bytes
+    MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB limit
+
+    # ── File size check ──────────────────────────────────────
+    if file_size > MAX_FILE_SIZE:
+        size_mb = file_size / (1024 * 1024)
+        _tg_send(token, chat_id,
+            f"❌ <b>File too large!</b>\n\n"
+            f"Your file <code>{file_name}</code> is <b>{size_mb:.1f} MB</b>.\n"
+            f"Maximum allowed: <b>5 MB</b>\n\n"
+            f"<i>Please split your file into smaller parts and try again.</i>")
+        return
 
     # ── Smart filename detection ───────────────────────────────
     # Accept any .txt file whose name contains "garena" or "codm"
@@ -4080,10 +4092,16 @@ def _render_bars():
     Single background thread — redraws all active progress bars in-place.
     Style matches Image 2:  id:XXXXXXXXX [████░░░░░░░] 32.3%  97/300  1/s
     One line per user. Nothing else prints to terminal in BOT_MODE.
+
+    On non-TTY (Railway logs), only prints a summary line every 5 seconds
+    to avoid log spam. On a real terminal, uses ANSI in-place refresh.
     """
     import sys
 
     BAR_LEN = 30          # bar width in chars
+    IS_TTY  = sys.stdout.isatty()  # Railway logs are NOT a TTY
+    REFRESH = 0.5 if IS_TTY else 5.0  # 0.5s on TTY, 5s on logs
+    _last_log_time = 0
 
     # ANSI colours
     CYAN   = "\033[1;96m"
@@ -4094,7 +4112,7 @@ def _render_bars():
     RESET  = "\033[0m"
 
     while True:
-        time.sleep(0.1)
+        time.sleep(REFRESH)
         with _bars_lock:
             bars = list(_active_bars.items())
 
@@ -4120,22 +4138,34 @@ def _render_bars():
             )
             lines.append(line)
 
-        prev = _prev_bar_count[0]
-        out  = ""
-
-        if prev > 0:
-            out += f"\033[{prev}A"   # move cursor up to overwrite previous bars
-
-        for line in lines:
-            out += f"\033[2K{line}\n"
-
-        # Clear any leftover lines from a previous larger count
-        for _ in range(max(0, prev - len(lines))):
-            out += "\033[2K\n"
-
-        sys.stdout.write(out)
-        sys.stdout.flush()
-        _prev_bar_count[0] = len(lines)
+        if IS_TTY:
+            # Real terminal: use ANSI cursor movement to overwrite in-place
+            prev = _prev_bar_count[0]
+            out  = ""
+            if prev > 0:
+                out += f"\033[{prev}A"   # move cursor up to overwrite previous bars
+            for line in lines:
+                out += f"\033[2K{line}\n"
+            # Clear any leftover lines from a previous larger count
+            for _ in range(max(0, prev - len(lines))):
+                out += "\033[2K\n"
+            sys.stdout.write(out)
+            sys.stdout.flush()
+            _prev_bar_count[0] = len(lines)
+        else:
+            # Non-TTY (Railway logs): just print a compact single-line summary
+            # to avoid spamming the log with hundreds of lines
+            now = time.time()
+            if now - _last_log_time >= 5.0:
+                summary_parts = []
+                for cid, b in bars:
+                    done  = b["done"]
+                    total = b["total"]
+                    speed = b["speed"]
+                    pct   = done / total * 100 if total else 0
+                    summary_parts.append(f"id:{cid} {pct:.0f}% {done}/{total} {speed}/s")
+                logger.info(f"[PROGRESS] {' | '.join(summary_parts)}")
+                _last_log_time = now
 
 
 # Start the renderer once (daemon — dies with the main process)
@@ -8314,31 +8344,45 @@ def main():
 
 
 if __name__ == "__main__":
-    # Top-level crash guard — ensure the process NEVER exits with non-zero code
-    # on Railway (which would cause a "CRASHED" status).
-    # Any startup error (missing config, import error, etc.) is caught here
-    # and the process stays alive, retrying every 30 seconds.
-    while True:   # auto-restart on unexpected crash
+    # Top-level crash guard with retry limit and exponential backoff.
+    # On Railway, prevents infinite restart loops that spam logs.
+    MAX_CRASH_RETRIES = 5         # give up after 5 consecutive crashes
+    crash_count = 0
+    while crash_count < MAX_CRASH_RETRIES:
         try:
             shutdown_event.clear()   # reset shutdown flag for restart
             gc.collect()  # clean up before each run
             main()
-            break   # clean exit (shutdown_event set) — don't restart
+            crash_count = 0  # reset on clean exit (shutdown_event set)
+            break
         except KeyboardInterrupt:
             bot_console.print(f"\n[yellow]⚠️  Bot stopped by user[/yellow]")
             break
         except MemoryError:
             gc.collect()
-            bot_console.print(f"[red]✘ Memory error — forcing GC and restarting in 3s...[/red]")
-            time.sleep(3)
+            crash_count += 1
+            bot_console.print(f"[red]✘ Memory error (crash {crash_count}/{MAX_CRASH_RETRIES}) — forcing GC and restarting in 10s...[/red]")
+            time.sleep(10)
         except Exception as e:
+            crash_count += 1
             logger = logging.getLogger(__name__)
-            logger.error(f"[MAIN] ✘ Unexpected error: {e}", exc_info=True)
-            bot_console.print(f"[red]✘ Unexpected error: {e} — restarting in 30s...[/red]")
+            logger.error(f"[MAIN] ✘ Unexpected error (crash {crash_count}/{MAX_CRASH_RETRIES}): {e}", exc_info=True)
+            # Exponential backoff: 30s, 60s, 120s, 240s, 480s
+            backoff = min(30 * (2 ** (crash_count - 1)), 480)
+            bot_console.print(f"[red]✘ Restarting in {backoff}s... (attempt {crash_count}/{MAX_CRASH_RETRIES})[/red]")
             if _is_railway():
-                # On Railway: don't exit — stay alive and retry
-                # Railway treats non-zero exit as "CRASHED"
-                logger.error("[MAIN] Running on Railway — staying alive and retrying in 30s...")
-                time.sleep(30)
+                # On Railway: don't exit — stay alive and retry with backoff
+                logger.error(f"[MAIN] Running on Railway — retry {crash_count}/{MAX_CRASH_RETRIES} in {backoff}s...")
+                time.sleep(backoff)
             else:
-                time.sleep(5)   # wait then restart automatically
+                time.sleep(backoff)
+    else:
+        # Exhausted all retries
+        logger = logging.getLogger(__name__)
+        logger.error(f"[MAIN] ✘ Bot crashed {MAX_CRASH_RETRIES} times in a row — giving up. Check logs for the root cause.")
+        bot_console.print(f"[bold red]✘ Bot crashed {MAX_CRASH_RETRIES} times — giving up to avoid restart loop. Check logs.[/bold red]")
+        if _is_railway():
+            # Stay alive on Railway but don't keep restarting
+            logger.error("[MAIN] Staying alive on Railway but NOT restarting. Manual intervention needed.")
+            while not shutdown_event.is_set():
+                time.sleep(60)
