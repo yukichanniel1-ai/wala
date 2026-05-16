@@ -126,6 +126,7 @@ _global_thread_sem = threading.Semaphore(MAX_GLOBAL_THREADS)
 # ══════════════════════════════════════════════════════════════
 PROXY_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy")
 SAVED_COMBOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_combos")
+SAVED_PROXIES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_proxies")
 
 def _init_proxy_folder():
     """Create proxy/ folder + a sample proxies.txt if folder didn't exist."""
@@ -149,6 +150,171 @@ def _init_proxy_folder():
         print(f"\033[92m📁 proxy/ folder created — add your proxy .txt files inside it\033[0m")
 
 _init_proxy_folder()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  PERSISTENT PROXY STORAGE — survives Railway redeploys
+#  proxy/        → ephemeral (used by GeoRotator, may be cleaned)
+#  saved_proxies/→ persistent (never cleaned, backed up to KeyVault API)
+# ═══════════════════════════════════════════════════════════════════
+
+def _sync_proxies_to_saved():
+    """Copy all proxy/*.txt files to saved_proxies/ for persistence across restarts.
+    Called after any proxy change (upload, paste, fetch) to keep the backup current."""
+    import shutil
+    try:
+        os.makedirs(SAVED_PROXIES_DIR, exist_ok=True)
+        if not os.path.exists(PROXY_FOLDER):
+            return
+        for fname in os.listdir(PROXY_FOLDER):
+            if not fname.endswith(".txt"):
+                continue
+            src = os.path.join(PROXY_FOLDER, fname)
+            dst = os.path.join(SAVED_PROXIES_DIR, fname)
+            if not os.path.isfile(src):
+                continue
+            try:
+                shutil.copy2(src, dst)
+            except Exception as e:
+                logger.debug(f"[PROXY-PERSIST] Failed to sync {fname}: {e}")
+        logger.debug(f"[PROXY-PERSIST] Synced proxy files to saved_proxies/")
+    except Exception as e:
+        logger.debug(f"[PROXY-PERSIST] Sync failed: {e}")
+
+
+def _restore_proxies_from_saved():
+    """Restore proxy files from saved_proxies/ to proxy/ on startup.
+    Called before GeoRotator init so the proxy pool is populated from persistent storage.
+    Skips files that already exist in proxy/ (doesn't overwrite newer uploads)."""
+    import shutil
+    try:
+        if not os.path.exists(SAVED_PROXIES_DIR):
+            return 0
+        os.makedirs(PROXY_FOLDER, exist_ok=True)
+        restored = 0
+        for fname in os.listdir(SAVED_PROXIES_DIR):
+            if not fname.endswith(".txt"):
+                continue
+            src = os.path.join(SAVED_PROXIES_DIR, fname)
+            dst = os.path.join(PROXY_FOLDER, fname)
+            if not os.path.isfile(src):
+                continue
+            if os.path.exists(dst):
+                # Only overwrite if saved version is newer or proxy/ version is empty
+                try:
+                    src_size = os.path.getsize(src)
+                    dst_size = os.path.getsize(dst)
+                    if dst_size > 0 and dst_size >= src_size:
+                        continue  # keep existing (likely same or newer)
+                except Exception:
+                    continue
+            try:
+                shutil.copy2(src, dst)
+                restored += 1
+                logger.info(f"[PROXY-PERSIST] Restored {fname} from saved_proxies/")
+            except Exception as e:
+                logger.debug(f"[PROXY-PERSIST] Failed to restore {fname}: {e}")
+        if restored > 0:
+            logger.info(f"[PROXY-PERSIST] Restored {restored} proxy file(s) from saved_proxies/")
+        return restored
+    except Exception as e:
+        logger.debug(f"[PROXY-PERSIST] Restore failed: {e}")
+        return 0
+
+
+def _sync_proxies_to_keyvault():
+    """Save all proxy file contents to KeyVault API for persistence across Railway redeploys.
+    Each file is stored as a separate key: proxy_file_<filename>."""
+    try:
+        api = _get_keysystem_api()
+        if not api.enabled:
+            return
+        # Save a manifest of all proxy filenames
+        files = _get_proxy_files()
+        manifest = []
+        for fpath in files:
+            fname = os.path.basename(fpath)
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    file_content = f.read()
+                key = f"proxy_file_{fname}"
+                api.save_state(key, {"content": file_content, "filename": fname})
+                manifest.append(fname)
+            except Exception as e:
+                logger.debug(f"[PROXY-PERSIST] KeyVault sync failed for {fname}: {e}")
+        # Save manifest
+        api.save_state("proxy_manifest", {"files": manifest})
+        logger.debug(f"[PROXY-PERSIST] Synced {len(manifest)} proxy file(s) to KeyVault API")
+    except Exception as e:
+        logger.debug(f"[PROXY-PERSIST] KeyVault sync failed: {e}")
+
+
+def _restore_proxies_from_keyvault():
+    """Load proxy file contents from KeyVault API and write to proxy/ folder.
+    Called on startup after _restore_proxies_from_saved() as a fallback."""
+    try:
+        api = _get_keysystem_api()
+        if not api.enabled:
+            return 0
+        # Load manifest
+        manifest_data = api.load_state("proxy_manifest")
+        if not manifest_data or not isinstance(manifest_data, dict):
+            return 0
+        manifest = manifest_data.get("files", [])
+        if not manifest:
+            return 0
+        os.makedirs(PROXY_FOLDER, exist_ok=True)
+        restored = 0
+        for fname in manifest:
+            key = f"proxy_file_{fname}"
+            try:
+                data = api.load_state(key)
+                if not data or not isinstance(data, dict):
+                    continue
+                content = data.get("content", "")
+                if not content or not content.strip():
+                    continue
+                dst = os.path.join(PROXY_FOLDER, fname)
+                # Don't overwrite if file already exists with content
+                if os.path.exists(dst):
+                    try:
+                        with open(dst, "r", encoding="utf-8", errors="ignore") as f:
+                            existing = f.read()
+                        if existing.strip():
+                            continue  # keep local version
+                    except Exception:
+                        pass
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write(content)
+                restored += 1
+                logger.info(f"[PROXY-PERSIST] Restored {fname} from KeyVault API")
+            except Exception as e:
+                logger.debug(f"[PROXY-PERSIST] KeyVault restore failed for {fname}: {e}")
+        if restored > 0:
+            logger.info(f"[PROXY-PERSIST] Restored {restored} proxy file(s) from KeyVault API")
+        return restored
+    except Exception as e:
+        logger.debug(f"[PROXY-PERSIST] KeyVault restore failed: {e}")
+        return 0
+
+
+def _persist_proxies():
+    """Sync proxy files to both saved_proxies/ and KeyVault API.
+    Call this after any proxy change (upload, paste, fetch)."""
+    _sync_proxies_to_saved()
+    _sync_proxies_to_keyvault()
+
+
+def _restore_all_proxies():
+    """Restore proxy files from all persistent sources (saved_proxies/ + KeyVault API).
+    Called once at startup before GeoRotator init."""
+    restored_local = _restore_proxies_from_saved()
+    restored_api = _restore_proxies_from_keyvault()
+    total = restored_local + restored_api
+    if total > 0:
+        logger.info(f"[PROXY-PERSIST] ✅ Total {total} proxy file(s) restored from persistent storage")
+    return total
+
 
 def _get_proxy_files():
     """
@@ -558,6 +724,11 @@ class GeoRotator:
 
 # Singleton — created once, shared everywhere
 # Wrapped in try/except so Railway deployment doesn't crash if proxy folder is empty
+# ── Restore proxy files from persistent storage before initializing GeoRotator ──
+try:
+    _restore_all_proxies()
+except Exception as _restore_err:
+    logging.getLogger(__name__).warning(f"[PROXY-PERSIST] Restore failed: {_restore_err}")
 try:
     geo_rotator = GeoRotator()
 except Exception as _geo_err:
@@ -805,6 +976,12 @@ def _fetch_raw_proxies():
                 try:
                     if _proxy_paused_users:
                         _resume_proxy_paused_users(BOT_TOKEN)
+                except Exception:
+                    pass
+
+                # ── Persist fetched proxies to saved_proxies/ + KeyVault API ──
+                try:
+                    _persist_proxies()
                 except Exception:
                     pass
 
@@ -3050,7 +3227,7 @@ def _cleanup_stale_files():
     """
     Delete leftover combo/ and *_results/ folders from previous crashes.
     Called once at bot startup to recover disk space.
-    NOTE: Does NOT touch saved_combos/ — those are persistent across restarts.
+    NOTE: Does NOT touch saved_combos/ or saved_proxies/ — those are persistent across restarts.
     """
     import shutil, glob
     base = os.path.dirname(os.path.abspath(__file__))
@@ -3077,7 +3254,8 @@ def _cleanup_stale_files():
                 pass
 
     # saved_combos/ is NEVER cleaned — these persist across restarts for auto-resume
-    # Individual files are removed by _remove_active_session() when checks complete
+    # saved_proxies/ is NEVER cleaned — these persist across restarts for proxy auto-restore
+    # Individual combo files are removed by _remove_active_session() when checks complete
 
 
 # ══════════════════════════════════════════════════════════════
@@ -7269,6 +7447,12 @@ def _save_proxies_from_lines(raw_lines: list) -> tuple:
     except Exception:
         pass
 
+    # ── Persist to saved_proxies/ + KeyVault API ──
+    try:
+        _persist_proxies()
+    except Exception:
+        pass
+
     return len(new_proxies), skipped, save_path
 
 
@@ -7474,6 +7658,12 @@ def _handle_proxy_upload(token: str, chat_id, from_user: dict, message: dict):
         total_now = geo_rotator.total
     except Exception:
         total_now = valid_count
+
+    # ── Persist to saved_proxies/ + KeyVault API ──
+    try:
+        _persist_proxies()
+    except Exception:
+        pass
 
     rename_note = (
         f"\n📝 <b>Renamed:</b> <code>{file_name}</code> → <code>{saved_name}</code>"
