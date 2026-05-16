@@ -3414,6 +3414,7 @@ def _tg_set_commands(token: str):
         {"command": "testproxy",      "description": "🧪 Test proxy connectivity"},
         {"command": "serverstatus",   "description": "🖥 Server load & limits"},
         {"command": "setthreads",    "description": "🔧 Set checker threads (e.g. /setthreads 10)"},
+        {"command": "setmaxusers",    "description": "👥 Set max concurrent users (e.g. /setmaxusers 20)"},
         {"command": "add_coowner",    "description": "👥 Add a co-owner by Telegram ID"},
         {"command": "remove_coowner", "description": "👥 Remove a co-owner"},
         {"command": "stopall",        "description": "☢️ Stop ALL running checkers"},
@@ -5807,7 +5808,8 @@ def _handle_server_status(token: str, chat_id, from_user: dict):
         f"  Threads per user: <b>{MAX_THREADS_PER_USER}</b>\n"
         f"  VIP threads per user: <b>{VIP_THREADS_PER_USER}</b>\n"
         f"  Total thread cap: <b>{MAX_GLOBAL_THREADS}</b>\n\n"
-        f"💡 Use /setthreads to change thread counts"
+        f"💡 Use /setthreads to change thread counts\n"
+        f"Use /setmaxusers to change max concurrent users"
     )
 
 
@@ -5906,6 +5908,50 @@ def _handle_set_threads(token: str, chat_id, from_user: dict, args: str):
 
     except ValueError:
         _tg_send(token, chat_id, "❌ Invalid number. Use: <code>/setthreads 10</code>")
+
+
+# ── /setmaxusers — owner command to change max concurrent users ──────────────────────
+def _handle_set_max_users(token: str, chat_id, from_user: dict, args: str):
+    """
+    /setmaxusers           — show current max concurrent users
+    /setmaxusers <N>       — set max concurrent users to N
+    """
+    global MAX_CONCURRENT_USERS
+
+    if not _is_owner(from_user):
+        _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+        return
+
+    parts = args.strip().split() if args.strip() else []
+
+    running_now = sum(1 for s in _bot_state.values() if s == "RUNNING")
+
+    # No args — show current setting
+    if not parts:
+        _tg_send(token, chat_id,
+            f"👥 <b>Max Concurrent Users</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"  Current limit: <b>{MAX_CONCURRENT_USERS}</b>\n"
+            f"  Running now: <b>{running_now}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>Usage:</b>\n"
+            f"  <code>/setmaxusers 20</code> — set max to 20")
+        return
+
+    # Parse: /setmaxusers <N>
+    try:
+        new_val = int(parts[0])
+        if new_val < 1 or new_val > 100:
+            _tg_send(token, chat_id, "❌ Max concurrent users must be between <code>1</code> and <code>100</code>.")
+            return
+        old_val = MAX_CONCURRENT_USERS
+        MAX_CONCURRENT_USERS = new_val
+        _tg_send(token, chat_id,
+            f"✅ <b>Max concurrent users:</b> {old_val} → <b>{new_val}</b>\n\n"
+            f"<i>Currently running: {running_now} user(s). "
+            f"New limit takes effect immediately for new checkers.</i>")
+    except ValueError:
+        _tg_send(token, chat_id, "❌ Invalid number. Use: <code>/setmaxusers 20</code>")
 
 
 # ── /statuskey ─────────────────────────────────────────────────
@@ -7292,6 +7338,9 @@ def _handle_help(token: str, chat_id, from_user: dict):
                     {"text": "📊 Server Status",   "callback_data": "admin:serverstatus"},
                     {"text": "🧵 Set Threads",     "callback_data": "admin:setthreads"},
                 ],
+                [
+                    {"text": "👥 Set Max Users",    "callback_data": "admin:setmaxusers"},
+                ],
             ]
         )
 
@@ -7503,6 +7552,11 @@ def _handle_callback_query(token: str, cq: dict):
     if data == "admin:setthreads":
         if not _is_owner(from_user): return
         _handle_set_threads(token, chat_id, from_user, "")
+        return
+
+    if data == "admin:setmaxusers":
+        if not _is_owner(from_user): return
+        _handle_set_max_users(token, chat_id, from_user, "")
         return
 
     if data == "admin:proxystatus":
@@ -8265,6 +8319,10 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
 
     if cmd == "setthreads":
         _handle_set_threads(token, chat_id, from_user, cmd_args)
+        return
+
+    if cmd == "setmaxusers":
+        _handle_set_max_users(token, chat_id, from_user, cmd_args)
         return
 
     if cmd == "resetconfig":
