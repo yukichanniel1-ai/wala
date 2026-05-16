@@ -109,6 +109,7 @@ _global_thread_sem = threading.Semaphore(MAX_GLOBAL_THREADS)
 #  GEO PROXY CONFIG  (auto-reads all .txt files from proxy/ folder, loops)
 # ══════════════════════════════════════════════════════════════
 PROXY_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy")
+SAVED_COMBOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_combos")
 
 def _init_proxy_folder():
     """Create proxy/ folder + a sample proxies.txt if folder didn't exist."""
@@ -782,6 +783,13 @@ def _fetch_raw_proxies():
                     geo_rotator._load_all_files()
                 except Exception as e:
                     log.error(f"[RAW-PROXY] Failed to reload proxy pool: {e}")
+
+                # ── Auto-resume proxy-paused users if proxies are now available ──
+                try:
+                    if _proxy_paused_users:
+                        _resume_proxy_paused_users(BOT_TOKEN)
+                except Exception:
+                    pass
 
                 log.info(f"[RAW-PROXY] +{total_new} new working proxies added "
                          f"(fetched {total_fetched}, {total_dupes} dupes, "
@@ -3025,11 +3033,12 @@ def _cleanup_stale_files():
     """
     Delete leftover combo/ and *_results/ folders from previous crashes.
     Called once at bot startup to recover disk space.
+    NOTE: Does NOT touch saved_combos/ — those are persistent across restarts.
     """
     import shutil, glob
     base = os.path.dirname(os.path.abspath(__file__))
 
-    # combo/ folder — temp uploaded files
+    # combo/ folder — temp uploaded files (safe to delete, saved_combos/ has persistent copies)
     combo_dir = os.path.join(base, "combo")
     if os.path.isdir(combo_dir):
         for f in os.listdir(combo_dir):
@@ -3049,6 +3058,9 @@ def _cleanup_stale_files():
                 logger.warning(f"[CLEANUP] Removed stale results folder: {os.path.basename(d)}")
             except Exception:
                 pass
+
+    # saved_combos/ is NEVER cleaned — these persist across restarts for auto-resume
+    # Individual files are removed by _remove_active_session() when checks complete
 
 
 # ══════════════════════════════════════════════════════════════
@@ -3709,11 +3721,23 @@ _active_sessions_lock = threading.Lock()
 
 def _save_active_session(chat_id, file_path: str, file_name: str, lines: list,
                          user_data: dict, progress: int = 0):
-    """Persist an active checking session to disk for crash recovery."""
+    """Persist an active checking session to disk for crash recovery.
+    Also saves a copy of the combo file to saved_combos/ so it survives restarts."""
+    # ── Save combo file to persistent directory ──
+    os.makedirs(SAVED_COMBOS_DIR, exist_ok=True)
+    persistent_path = os.path.join(SAVED_COMBOS_DIR, f"{chat_id}_{file_name}")
+    try:
+        with open(persistent_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except Exception as e:
+        logger.warning(f"[BOT] Could not save persistent combo for {chat_id}: {e}")
+        persistent_path = file_path  # fallback to original path
+
     with _active_sessions_lock:
         _active_sessions[str(chat_id)] = {
             "chat_id": chat_id,
             "file_path": file_path,
+            "persistent_path": persistent_path,
             "file_name": file_name,
             "total_lines": len(lines),
             "progress": progress,
@@ -3736,11 +3760,31 @@ def _update_session_progress(chat_id, progress: int):
             _flush_active_sessions()
 
 
-def _remove_active_session(chat_id):
-    """Remove a completed/stopped session from disk."""
+def _remove_active_session(chat_id, delete_combo=True):
+    """Remove a completed/stopped session from disk.
+    Also removes the persistent combo file unless delete_combo=False."""
+    key = str(chat_id)
     with _active_sessions_lock:
-        _active_sessions.pop(str(chat_id), None)
+        sess = _active_sessions.pop(key, None)
         _flush_active_sessions()
+    # Clean up persistent combo file
+    if delete_combo and sess:
+        ppath = sess.get("persistent_path", "")
+        if ppath and os.path.exists(ppath):
+            try:
+                os.remove(ppath)
+                logger.debug(f"[BOT] Removed persistent combo: {ppath}")
+            except Exception:
+                pass
+        # Also try the default naming pattern
+        fname = sess.get("file_name", "")
+        if fname:
+            default_path = os.path.join(SAVED_COMBOS_DIR, f"{chat_id}_{fname}")
+            if os.path.exists(default_path) and default_path != ppath:
+                try:
+                    os.remove(default_path)
+                except Exception:
+                    pass
 
 
 def _flush_active_sessions():
@@ -3850,6 +3894,8 @@ def _handle_start(token: str, chat_id, from_user: dict):
         vip_badge = " ⭐ VIP" if is_vip else ""
 
         _bot_state[chat_id] = "AWAIT_FILE"
+        # Clear any proxy-paused state from previous session
+        _unregister_proxy_paused(chat_id)
 
         _tg_send(token, chat_id,
             f"👋 <b>Welcome back, {name}!</b>{vip_badge}\n\n"
@@ -3986,6 +4032,9 @@ def _handle_filter(token: str, chat_id, text: str):
 
 # ── Step 4: file upload ────────────────────────────────────────
 def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
+    # Clear any previous proxy-paused state for this user (they're re-uploading)
+    _unregister_proxy_paused(chat_id)
+
     document = message.get("document")
     if not document:
         _tg_send(token, chat_id,
@@ -4132,6 +4181,28 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
     lvl_label = "ALL" if d["level"] == [1] else f"{d['level'][0]}+"
     cf_map    = {"clean": "✅ CLEAN", "notclean": "❌ NOT CLEAN", "both": "🔄 BOTH"}
     user_telegram_config = (BOT_TOKEN, str(hits_id), d["level"], "", d["clean_filter"])
+
+    # ── If no proxies: save combo and register as proxy-paused ──
+    _is_owner_user = _is_owner(from_user) if from_user else False
+    if not _has_proxies() and not _is_owner_user:
+        _register_proxy_paused(chat_id, clean_path, file_name, clean_lines, d)
+        with _state_lock:
+            _bot_state[chat_id] = "AWAIT_FILE"
+        _tg_send(token, chat_id,
+            f"📄 <b>File received & saved!</b>\n\n"
+            f"<code>{file_name}</code> — {len(clean_lines)} accounts\n\n"
+            f"⏳ <b>No proxies available right now.</b>\n"
+            f"Your check will <b>auto-resume</b> as soon as proxies are back!\n\n"
+            f"<i>You don\'t need to re-upload. Just wait — I\'ll notify you.</i>"
+        )
+        # Clean up the temp combo/ files (persistent copy is in saved_combos/)
+        for p in (save_path, clean_path):
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        return
 
     with _state_lock:
         _bot_state[chat_id] = "RUNNING"
@@ -5117,6 +5188,209 @@ def _clear_no_proxy_warning():
     """Reset the no-proxy warning flag so owner gets notified again if pool empties later."""
     global _no_proxy_warned
     _no_proxy_warned = False
+
+
+# ── Proxy-paused users: auto-resume when proxies become available ──
+_proxy_paused_users: dict = {}   # chat_id -> {combo_path, file_name, lines, user_data}
+_proxy_paused_lock = threading.Lock()
+
+
+def _register_proxy_paused(chat_id, combo_path: str, file_name: str, lines: list, user_data: dict):
+    """Register a user whose check is paused because no proxies are available.
+    Their combo file and progress will be saved so it can auto-resume later."""
+    os.makedirs(SAVED_COMBOS_DIR, exist_ok=True)
+    persistent_path = os.path.join(SAVED_COMBOS_DIR, f"paused_{chat_id}_{file_name}")
+    try:
+        with open(persistent_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except Exception as e:
+        logger.warning(f"[BOT] Could not save paused combo for {chat_id}: {e}")
+        persistent_path = combo_path
+
+    with _proxy_paused_lock:
+        _proxy_paused_users[str(chat_id)] = {
+            "chat_id": chat_id,
+            "combo_path": combo_path,
+            "persistent_path": persistent_path,
+            "file_name": file_name,
+            "total_lines": len(lines),
+            "progress": 0,
+            "level": user_data.get("level", [1]),
+            "clean_filter": user_data.get("clean_filter", "both"),
+            "hits_id": user_data.get("hits_id", chat_id),
+            "username": user_data.get("username", ""),
+            "combo_limit": user_data.get("combo_limit", COMBO_LINE_LIMIT),
+            "paused_at": time.time(),
+        }
+    logger.info(f"[BOT] Registered proxy-paused user: chat_id={chat_id}, file={file_name}")
+
+
+def _unregister_proxy_paused(chat_id):
+    """Remove a user from the proxy-paused list (e.g. if they /stop or re-upload)."""
+    with _proxy_paused_lock:
+        sess = _proxy_paused_users.pop(str(chat_id), None)
+    # Clean up persistent combo file
+    if sess:
+        ppath = sess.get("persistent_path", "")
+        if ppath and os.path.exists(ppath):
+            try:
+                os.remove(ppath)
+            except Exception:
+                pass
+
+
+def _resume_proxy_paused_users(token: str):
+    """Called when proxies become available after being empty.
+    Auto-resumes all users who were paused due to no proxy."""
+    with _proxy_paused_lock:
+        paused = dict(_proxy_paused_users)  # copy
+        _proxy_paused_users.clear()
+
+    if not paused:
+        return
+
+    logger.info(f"[BOT] ✅ Proxies available! Resuming {len(paused)} paused user(s)...")
+
+    for key, sess in paused.items():
+        chat_id    = sess.get("chat_id")
+        file_name  = sess.get("file_name", "unknown.txt")
+        persistent_path = sess.get("persistent_path", "")
+
+        # Find the combo file
+        combo_path = None
+        for candidate in [persistent_path, sess.get("combo_path", ""),
+                          os.path.join(SAVED_COMBOS_DIR, f"paused_{chat_id}_{file_name}")]:
+            if candidate and os.path.exists(candidate):
+                combo_path = candidate
+                break
+
+        if not combo_path:
+            _tg_send(token, chat_id,
+                "⚠️ <b>Proxies are back!</b>\n\n"
+                "But your combo file was lost. Please re-upload it.")
+            continue
+
+        # Read lines from the combo file
+        all_lines = []
+        for enc in ["utf-8", "latin-1", "cp1252", "iso-8859-1"]:
+            try:
+                with open(combo_path, "r", encoding=enc, errors="ignore") as fh:
+                    all_lines = [l.strip() for l in fh if l.strip() and ":" in l]
+                break
+            except Exception:
+                continue
+
+        if not all_lines:
+            _tg_send(token, chat_id,
+                "⚠️ <b>Proxies are back!</b>\n\n"
+                "But your combo file is empty. Please re-upload it.")
+            continue
+
+        progress = sess.get("progress", 0)
+        total = sess.get("total_lines", len(all_lines))
+        remaining_lines = all_lines[progress:]
+
+        if not remaining_lines:
+            _tg_send(token, chat_id,
+                "✅ <b>Proxies are back!</b>\n\n"
+                f"Your check (<code>{file_name}</code>) was already complete.\n"
+                "📂 Send a new combo file to start again.")
+            # Clean up persistent file
+            try:
+                if os.path.exists(combo_path):
+                    os.remove(combo_path)
+            except Exception:
+                pass
+            continue
+
+        # Restore user data
+        d = _udata(chat_id)
+        d["hits_id"]      = sess.get("hits_id", chat_id)
+        d["username"]     = sess.get("username", "")
+        d["level"]        = sess.get("level", [1])
+        d["clean_filter"] = sess.get("clean_filter", "both")
+        d["combo_limit"]  = sess.get("combo_limit", COMBO_LINE_LIMIT)
+
+        # Write remaining lines to a temp file for the checker
+        save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "combo")
+        os.makedirs(save_dir, exist_ok=True)
+        resume_path = os.path.join(save_dir, f"resume_{chat_id}_{file_name}")
+        with open(resume_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(remaining_lines) + "\n")
+
+        # Notify user
+        _tg_send(token, chat_id,
+            f"✅ <b>Proxies are back — Auto-Resuming!</b>\n\n"
+            f"📄 <b>File:</b> <code>{file_name}</code>\n"
+            f"📊 <b>Progress:</b> {progress}/{total} done\n"
+            f"▶️ <b>Remaining:</b> {len(remaining_lines)} accounts\n\n"
+            f"<i>Resuming now... Send /stop to cancel.</i>")
+
+        # Start checker thread
+        hits_id = d["hits_id"]
+        user_telegram_config = (token, str(hits_id), d["level"], "", d["clean_filter"])
+
+        with _state_lock:
+            _bot_state[chat_id] = "RUNNING"
+
+        # Save session for crash recovery
+        _save_active_session(chat_id, resume_path, file_name, remaining_lines, d, 0)
+
+        stop_evt = threading.Event()
+        with _stop_events_lock:
+            _stop_events[chat_id] = stop_evt
+
+        def _paused_resume_run(cid=chat_id, rpath=resume_path, tg_cfg=user_telegram_config,
+                        se=stop_evt, fn=file_name, rem=len(remaining_lines), cp=combo_path):
+            try:
+                label = f"proxy-resume:{cid}"
+                stats, result_folder = _run_checker_for_file(
+                    rpath, tg_cfg, chat_id=cid, label=label, stop_event=se
+                )
+                stopped = se.is_set()
+            except Exception as e:
+                stats = {}
+                result_folder = ""
+                stopped = False
+                logger.error(f"[BOT] Proxy-resume checker error: {e}", exc_info=True)
+            finally:
+                with _state_lock:
+                    _bot_state[cid] = "AWAIT_FILE"
+                with _stop_events_lock:
+                    _stop_events.pop(cid, None)
+                _remove_active_session(cid)
+
+                if stopped:
+                    _tg_send(token, cid,
+                        f"🛑 <b>Resumed checker stopped.</b>\n"
+                        f"📊 Partial results for <code>{fn}</code>")
+                else:
+                    valid = stats.get("valid", 0)
+                    invalid = stats.get("invalid", 0)
+                    clean_c = stats.get("clean", 0)
+                    _tg_send(token, cid,
+                        f"✅ <b>Resumed Check Complete!</b>\n\n"
+                        f"📄 <code>{fn}</code>\n"
+                        f"✅ Valid: <code>{valid}</code>  ❌ Invalid: <code>{invalid}</code>  "
+                        f"🧹 Clean: <code>{clean_c}</code>")
+
+                if result_folder and os.path.isdir(result_folder):
+                    _send_results_zip(token, cid, result_folder, fn)
+
+                # Cleanup temp file
+                try:
+                    if os.path.exists(rpath):
+                        os.remove(rpath)
+                except Exception:
+                    pass
+
+                gc.collect()
+                _tg_send(token, cid,
+                    f"📂 Send your next combo file to check again.\n"
+                    f"Or /start to reset your settings.")
+
+        threading.Thread(target=_paused_resume_run, daemon=True).start()
+        logger.info(f"[BOT] ✅ Proxy-resumed session for chat_id={chat_id}, {len(remaining_lines)} remaining")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -6672,12 +6946,24 @@ def _check_access(token: str, chat_id, from_user: dict) -> bool:
     # ── Maintenance mode: no proxies available ──────────────────
     if not _has_proxies():
         _notify_no_proxy(token, chat_id, from_user)
-        _tg_send(token, chat_id,
-            "🔧 <b>Bot Under Maintenance</b>\n\n"
-            "The bot is currently not available.\n"
-            "Please try again later.\n\n"
-            "<i>Thank you for your patience.</i>"
-        )
+        # Check if user already has a paused session
+        already_paused = False
+        with _proxy_paused_lock:
+            if str(chat_id) in _proxy_paused_users:
+                already_paused = True
+        if already_paused:
+            _tg_send(token, chat_id,
+                "⏳ <b>Still waiting for proxies...</b>\n\n"
+                "Your check will auto-resume as soon as proxies are available.\n\n"
+                "<i>Thank you for your patience.</i>"
+            )
+        else:
+            _tg_send(token, chat_id,
+                "🔧 <b>Bot Under Maintenance</b>\n\n"
+                "No proxies available right now.\n"
+                "Upload your combo file and your check will auto-resume when proxies are back!\n\n"
+                "<i>Thank you for your patience.</i>"
+            )
         return False
 
     uid_str = str(chat_id)
@@ -7879,6 +8165,8 @@ def _handle_callback_query(token: str, cq: dict):
         else:
             target_id = int(data.split(":")[1])
 
+        # Also clear proxy-paused state if they're waiting
+        _unregister_proxy_paused(target_id)
         evt = _stop_events.get(target_id)
         if evt and not evt.is_set():
             evt.set()
@@ -8675,7 +8963,8 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
 
 # ── Auto-resume interrupted sessions on startup ───────────────
 def _auto_resume_sessions(token: str):
-    """Check for interrupted sessions from a crash and resume them."""
+    """Check for interrupted sessions from a crash/restart and resume them.
+    Uses persistent combo files from saved_combos/ directory."""
     sessions = _load_active_sessions()
     if not sessions:
         return
@@ -8685,16 +8974,24 @@ def _auto_resume_sessions(token: str):
     for key, sess in sessions.items():
         chat_id    = sess.get("chat_id")
         file_path  = sess.get("file_path", "")
+        persistent_path = sess.get("persistent_path", "")
         file_name  = sess.get("file_name", "unknown.txt")
         progress   = sess.get("progress", 0)
         total      = sess.get("total_lines", 0)
 
-        if not chat_id or not file_path:
+        if not chat_id:
             continue
 
-        # Check if the combo file still exists on disk
-        if not os.path.exists(file_path):
-            logger.warning(f"[BOT] Resume skip: file gone for chat {chat_id}: {file_path}")
+        # Try persistent path first, then original path, then default saved_combos path
+        combo_path = None
+        for candidate in [persistent_path, file_path,
+                          os.path.join(SAVED_COMBOS_DIR, f"{chat_id}_{file_name}")]:
+            if candidate and os.path.exists(candidate):
+                combo_path = candidate
+                break
+
+        if not combo_path:
+            logger.warning(f"[BOT] Resume skip: file gone for chat {chat_id}")
             _tg_send(token, chat_id,
                 f"⚠️ <b>Bot restarted!</b>\n\n"
                 f"Your previous check (<code>{file_name}</code>) could not resume — "
@@ -8703,17 +9000,15 @@ def _auto_resume_sessions(token: str):
             _remove_active_session(chat_id)
             continue
 
-        # Read remaining lines from the file
-        remaining_lines = []
+        # Read remaining lines from the combo file
+        all_lines = []
         for enc in ["utf-8", "latin-1", "cp1252", "iso-8859-1"]:
             try:
-                with open(file_path, "r", encoding=enc, errors="ignore") as fh:
+                with open(combo_path, "r", encoding=enc, errors="ignore") as fh:
                     all_lines = [l.strip() for l in fh if l.strip() and ":" in l]
                 break
             except Exception:
                 continue
-        else:
-            all_lines = []
 
         if not all_lines:
             _tg_send(token, chat_id,
@@ -8741,7 +9036,7 @@ def _auto_resume_sessions(token: str):
         d["clean_filter"] = sess.get("clean_filter", "both")
         d["combo_limit"]  = sess.get("combo_limit", COMBO_LINE_LIMIT)
 
-        # Write remaining lines to a temp file
+        # Write remaining lines to a temp file for the checker
         save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "combo")
         os.makedirs(save_dir, exist_ok=True)
         resume_path = os.path.join(save_dir, f"resume_{chat_id}_{file_name}")
@@ -8764,7 +9059,7 @@ def _auto_resume_sessions(token: str):
         with _state_lock:
             _bot_state[chat_id] = "RUNNING"
 
-        # Update session with new file path
+        # Update session with new file path (also re-saves to persistent dir)
         _save_active_session(chat_id, resume_path, file_name, remaining_lines, d, 0)
 
         stop_evt = threading.Event()
@@ -8808,7 +9103,7 @@ def _auto_resume_sessions(token: str):
                 if result_folder and os.path.isdir(result_folder):
                     _send_results_zip(token, cid, result_folder, fn)
 
-                # Cleanup
+                # Cleanup temp file (not persistent copy)
                 try:
                     if os.path.exists(rpath):
                         os.remove(rpath)
