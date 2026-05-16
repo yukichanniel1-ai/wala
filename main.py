@@ -7403,12 +7403,25 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
     if cmd == "reset":
         key_id = str(from_user.get("id", chat_id))
         uname  = from_user.get("username", "")
+        # ── Preserve key & expiry before clearing ────────────────────
+        old_d       = _user_data.get(chat_id, {})
+        saved_key   = old_d.get("key") or (_saved_users.get(key_id) or {}).get("key")
+        saved_exp   = old_d.get("key_expires") or (_saved_users.get(key_id) or {}).get("key_expires", 0)
+        # Clear settings but keep key access
         _saved_users.pop(key_id, None)
         if uname:
             _saved_users.pop(uname.lstrip("@").lower(), None)
         _save_users_to_disk()
         _user_data.pop(chat_id, None)
         _bot_state.pop(chat_id, None)
+        # Restore key so user doesn't need to re-redeem
+        if saved_key and saved_exp and time.time() < saved_exp:
+            d = _udata(chat_id)
+            d["key"]         = saved_key
+            d["key_expires"] = saved_exp
+            # Note: intentionally NOT calling _save_profile here,
+            # so /start will go through level/filter picker again.
+            # _check_access will find the key in _udata.
         _tg_send(token, chat_id,
             "🗑 <b>Settings cleared!</b>\n\n"
             "Send /start to choose your level and hit type again.")
