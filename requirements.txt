@@ -5,3 +5,4 @@ rich
 pycryptodome
 numpy
 psutil
+PySocks>=1.7.1
