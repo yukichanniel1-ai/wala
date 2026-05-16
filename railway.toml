@@ -1,0 +1,8 @@
+# Railway configuration — healthcheck for zero-downtime deploys
+# Docs: https://docs.railway.com/config-as-code/reference
+
+[deploy]
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+healthcheckPath = "/health"
+healthcheckTimeout = 300
