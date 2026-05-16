@@ -1,8 +1,16 @@
 {
-  "bot_token": "8564132165:AAGuGLnhQz_rhCH8TBrlodj3ZVBBxgP6fIY",
-  "owner_id": 5028065177,
-  "owner_username": "",
-  "coowner_ids": [],
-  "keysystem_url": "",
-  "keysystem_admin_secret": ""
+  "vip_threads": 3,
+  "free_threads": 2,
+  "timeout": 15,
+  "retry_count": 2,
+  "retry_delay": 3,
+  "vip_keys": [],
+  "proxy_file": "",
+  "use_proxy": false,
+  "output_dir": "results",
+  "auto_fix_combo": true,
+  "min_password_length": 3,
+  "min_username_length": 2,
+  "max_ip_block_retries": 2,
+  "max_conn_retries": 2
 }
