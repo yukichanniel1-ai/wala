@@ -583,7 +583,7 @@ RAW_PROXY_SOURCES = [
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
     "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
 ]
-RAW_PROXY_FETCH_INTERVAL = 180  # 3 minutes — faster refresh for better proxy availability
+RAW_PROXY_FETCH_INTERVAL = 30  # 30 seconds — faster refresh for better proxy availability
 RAW_PROXY_SAVE_FILE = os.path.join(PROXY_FOLDER, "raw_fetched_proxies.txt")
 RAW_PROXY_VALIDATE_ON_FETCH = True  # Validate proxies against Garena SSO before adding
 RAW_PROXY_VALIDATE_TIMEOUT = 6     # Seconds to wait for validation
@@ -659,7 +659,7 @@ def _validate_proxies_batch(proxy_list, max_workers=None):
 
 def _fetch_raw_proxies():
     """
-    Background worker: fetches raw proxy lists from configured URLs every 3 minutes.
+    Background worker: fetches raw proxy lists from configured URLs every 30 seconds.
     Proxies are validated against Garena's endpoint before being added to the pool.
     Only new, unique, working proxies are saved.
     """
@@ -8939,7 +8939,7 @@ def main():
                 pass
     threading.Thread(target=_railway_heartbeat, daemon=True, name="RailwayHeartbeat").start()
 
-    # ── Raw proxy auto-fetch (every 3 minutes from external sources) ──
+    # ── Raw proxy auto-fetch (every 30 seconds from external sources) ──
     threading.Thread(target=_fetch_raw_proxies, daemon=True, name="RawProxyFetcher").start()
 
     # ── Startup proxy connectivity diagnostic ──
