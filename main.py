@@ -822,34 +822,12 @@ except Exception as _geo_err:
 # ══════════════════════════════════════════════════════════════
 RAW_PROXY_SOURCES = [
     # ── (url, default_scheme) ── scheme is used for bare ip:port lines from that source
-    # ── Primary source (custom worker) ──
+    # ── Primary source (custom worker) ── ONLY source used for auto-fetch
     ("https://worker-production-a615.up.railway.app/", "http"),
-    # ── ProxyScrape API (reliable, high volume) ──
-    ("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=yes&anonymity=all", "http"),
-    ("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=no&anonymity=elite", "http"),
-    ("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=5000&country=all", "socks5"),
-    # ── SOCKS5 proxies (better for HTTPS tunneling) ──
-    ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt", "socks5"),
-    ("https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt", "socks5"),
-    ("https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt", "socks5"),
-    # ── HTTP proxies (backup) ──
-    ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", "http"),
-    ("https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt", "http"),
-    ("https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt", "http"),
-    # ── Additional reliable sources ──
-    ("https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt", "http"),
-    ("https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt", "socks5"),
-    ("https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt", "socks5"),
-    ("https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt", "http"),
 ]
 RAW_PROXY_FETCH_INTERVAL = 30  # 30 seconds — faster refresh for better proxy availability
 RAW_PROXY_SAVE_FILE = os.path.join(PROXY_FOLDER, "raw_fetched_proxies.txt")
 
-# ── Worker-only mode flag ── When True, the background _fetch_raw_proxies()
-# skips its cycle so it doesn't overwrite proxies that were just renewed
-# from the worker-only source via /renewproxy.
-_worker_only_mode = False
-_worker_only_lock = threading.Lock()
 
 
 
@@ -905,14 +883,6 @@ def _fetch_raw_proxies():
 
     while not shutdown_event.is_set():
         try:
-            # ── If worker-only mode is active, skip this cycle entirely ──
-            # /renewproxy set this flag so its worker-only proxies aren't overwritten
-            with _worker_only_lock:
-                if _worker_only_mode:
-                    log.debug("[RAW-PROXY] Worker-only mode active — skipping auto-fetch cycle")
-                    shutdown_event.wait(RAW_PROXY_FETCH_INTERVAL)
-                    continue
-
             total_new = 0
             total_fetched = 0
             total_dupes = 0
@@ -7786,19 +7756,12 @@ def _handle_proxy_status(token: str, chat_id, from_user: dict):
 
 def _handle_delete_proxy(token: str, chat_id, from_user: dict):
     """Delete the raw_fetched_proxies.txt file and clear the proxy pool.
-    Owner-only command — removes all auto-fetched proxies so they can be refreshed cleanly.
-    Also re-enables the background auto-fetcher (worker-only mode OFF)."""
+    Owner-only command — removes all auto-fetched proxies so they can be refreshed cleanly."""
     if not _is_owner(from_user):
         _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
         return
 
-    global _worker_only_mode
-    with _worker_only_lock:
-        was_worker_only = _worker_only_mode
-        _worker_only_mode = False
-
     log = logging.getLogger(__name__)
-    log.info(f"[DELETE-PROXY] Worker-only mode was {was_worker_only}, now disabled — auto-fetch will resume")
     deleted_files = []
     deleted_count = 0
 
@@ -7868,13 +7831,11 @@ def _handle_delete_proxy(token: str, chat_id, from_user: dict):
 def _handle_renew_proxy(token: str, chat_id, from_user: dict):
     """Fetch fresh proxies from https://worker-production-a615.up.railway.app/ only.
     DELETES the old raw_fetched_proxies.txt first (clean wipe), then fetches new
-    proxies from the primary worker source and reloads the pool.
-    Also enables worker-only mode so the background fetcher doesn't overwrite."""
+    proxies from the worker source and reloads the pool."""
     if not _is_owner(from_user):
         _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
         return
 
-    global _worker_only_mode
     log = logging.getLogger(__name__)
 
     _tg_send(token, chat_id, "🔄 <b>Renewing proxies from worker…</b>\n\n"
@@ -7985,18 +7946,13 @@ def _handle_renew_proxy(token: str, chat_id, from_user: dict):
                 for p in new_proxies:
                     f.write(p + "\n")
 
-    # Step 7: Enable worker-only mode so background fetcher doesn't overwrite
-    with _worker_only_lock:
-        _worker_only_mode = True
-    log.info("[RENEW-PROXY] Worker-only mode ENABLED — background auto-fetch paused")
-
-    # Step 8: Reload the pool from disk (only the new file exists now)
+    # Step 7: Reload the pool from disk (only the new file exists now)
     try:
         geo_rotator._load_all_files()
     except Exception as e:
         log.error(f"[RENEW-PROXY] Failed to reload pool: {e}")
 
-    # Step 9: Persist
+    # Step 8: Persist
     try:
         _persist_proxies()
     except Exception:
