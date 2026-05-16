@@ -845,6 +845,12 @@ RAW_PROXY_SOURCES = [
 RAW_PROXY_FETCH_INTERVAL = 30  # 30 seconds — faster refresh for better proxy availability
 RAW_PROXY_SAVE_FILE = os.path.join(PROXY_FOLDER, "raw_fetched_proxies.txt")
 
+# ── Worker-only mode flag ── When True, the background _fetch_raw_proxies()
+# skips its cycle so it doesn't overwrite proxies that were just renewed
+# from the worker-only source via /renewproxy.
+_worker_only_mode = False
+_worker_only_lock = threading.Lock()
+
 
 
 def _fetch_raw_proxies():
@@ -899,6 +905,14 @@ def _fetch_raw_proxies():
 
     while not shutdown_event.is_set():
         try:
+            # ── If worker-only mode is active, skip this cycle entirely ──
+            # /renewproxy set this flag so its worker-only proxies aren't overwritten
+            with _worker_only_lock:
+                if _worker_only_mode:
+                    log.debug("[RAW-PROXY] Worker-only mode active — skipping auto-fetch cycle")
+                    shutdown_event.wait(RAW_PROXY_FETCH_INTERVAL)
+                    continue
+
             total_new = 0
             total_fetched = 0
             total_dupes = 0
@@ -7772,12 +7786,19 @@ def _handle_proxy_status(token: str, chat_id, from_user: dict):
 
 def _handle_delete_proxy(token: str, chat_id, from_user: dict):
     """Delete the raw_fetched_proxies.txt file and clear the proxy pool.
-    Owner-only command — removes all auto-fetched proxies so they can be refreshed cleanly."""
+    Owner-only command — removes all auto-fetched proxies so they can be refreshed cleanly.
+    Also re-enables the background auto-fetcher (worker-only mode OFF)."""
     if not _is_owner(from_user):
         _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
         return
 
+    global _worker_only_mode
+    with _worker_only_lock:
+        was_worker_only = _worker_only_mode
+        _worker_only_mode = False
+
     log = logging.getLogger(__name__)
+    log.info(f"[DELETE-PROXY] Worker-only mode was {was_worker_only}, now disabled — auto-fetch will resume")
     deleted_files = []
     deleted_count = 0
 
@@ -7847,16 +7868,19 @@ def _handle_delete_proxy(token: str, chat_id, from_user: dict):
 def _handle_renew_proxy(token: str, chat_id, from_user: dict):
     """Fetch fresh proxies from https://worker-production-a615.up.railway.app/ only.
     DELETES the old raw_fetched_proxies.txt first (clean wipe), then fetches new
-    proxies from the primary worker source and reloads the pool."""
+    proxies from the primary worker source and reloads the pool.
+    Also enables worker-only mode so the background fetcher doesn't overwrite."""
     if not _is_owner(from_user):
         _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
         return
 
+    global _worker_only_mode
     log = logging.getLogger(__name__)
 
     _tg_send(token, chat_id, "🔄 <b>Renewing proxies from worker…</b>\n\n"
         "⏳ Fetching fresh proxies from:\n"
-        "<code>https://worker-production-a615.up.railway.app/</code>")
+        "<code>https://worker-production-a615.up.railway.app/</code>\n\n"
+        "🗑️ Wiping old proxy files first…")
 
     # Step 1: DELETE old raw_fetched_proxies.txt completely
     old_count = 0
@@ -7878,7 +7902,22 @@ def _handle_renew_proxy(token: str, chat_id, from_user: dict):
         except Exception as e:
             log.error(f"[RENEW-PROXY] Failed to delete {pasted_path}: {e}")
 
-    # Step 3: Clear in-memory pool so old proxies don't persist
+    # Step 3: Delete ALL other proxy .txt files in proxy/ folder
+    # This ensures no stale proxies remain from any source
+    try:
+        if os.path.exists(PROXY_FOLDER):
+            for fname in os.listdir(PROXY_FOLDER):
+                if fname.endswith(".txt"):
+                    fpath = os.path.join(PROXY_FOLDER, fname)
+                    try:
+                        os.remove(fpath)
+                        log.info(f"[RENEW-PROXY] Deleted {fpath}")
+                    except Exception as e:
+                        log.error(f"[RENEW-PROXY] Failed to delete {fpath}: {e}")
+    except Exception as e:
+        log.error(f"[RENEW-PROXY] Failed to scan proxy folder: {e}")
+
+    # Step 4: Clear in-memory pool so old proxies don't persist
     try:
         with geo_rotator._lock:
             geo_rotator._proxies = []
@@ -7891,14 +7930,18 @@ def _handle_renew_proxy(token: str, chat_id, from_user: dict):
 
     # Also clean saved_proxies/ mirror
     try:
-        for fname in ["raw_fetched_proxies.txt", "pasted_proxies.txt"]:
-            sp = os.path.join(SAVED_PROXIES_DIR, fname)
-            if os.path.exists(sp):
-                os.remove(sp)
+        if os.path.exists(SAVED_PROXIES_DIR):
+            for fname in os.listdir(SAVED_PROXIES_DIR):
+                if fname.endswith(".txt"):
+                    sp = os.path.join(SAVED_PROXIES_DIR, fname)
+                    try:
+                        os.remove(sp)
+                    except Exception:
+                        pass
     except Exception:
         pass
 
-    # Step 4: Fetch fresh proxies from the primary worker source ONLY
+    # Step 5: Fetch fresh proxies from the primary worker source ONLY
     worker_url = "https://worker-production-a615.up.railway.app/"
     new_proxies = []
     fetch_errors = []
@@ -7914,7 +7957,7 @@ def _handle_renew_proxy(token: str, chat_id, from_user: dict):
         fetch_errors.append(f"Worker fetch failed: {e}")
         log.error(f"[RENEW-PROXY] Failed to fetch from worker: {e}")
 
-    # Step 5: Normalize, deduplicate, write to fresh file
+    # Step 6: Normalize, deduplicate, write to fresh file
     if raw_lines:
         os.makedirs(PROXY_FOLDER, exist_ok=True)
 
@@ -7942,13 +7985,18 @@ def _handle_renew_proxy(token: str, chat_id, from_user: dict):
                 for p in new_proxies:
                     f.write(p + "\n")
 
-    # Step 6: Reload the pool from disk (only the new file exists now)
+    # Step 7: Enable worker-only mode so background fetcher doesn't overwrite
+    with _worker_only_lock:
+        _worker_only_mode = True
+    log.info("[RENEW-PROXY] Worker-only mode ENABLED — background auto-fetch paused")
+
+    # Step 8: Reload the pool from disk (only the new file exists now)
     try:
         geo_rotator._load_all_files()
     except Exception as e:
         log.error(f"[RENEW-PROXY] Failed to reload pool: {e}")
 
-    # Step 7: Persist
+    # Step 9: Persist
     try:
         _persist_proxies()
     except Exception:
@@ -7971,7 +8019,9 @@ def _handle_renew_proxy(token: str, chat_id, from_user: dict):
             f"🗑️ Old proxies deleted: <code>{old_count}</code>\n"
             f"🔄 Fetched from: <code>{worker_url}</code>\n"
             f"✅ New proxies added: <code>{len(new_proxies)}</code>\n"
-            f"📡 Proxy pool now: <code>{pool_now}</code>")
+            f"📡 Proxy pool now: <code>{pool_now}</code>\n\n"
+            f"🔒 Worker-only mode ON — background auto-fetch paused.\n"
+            f"Use <code>/deleteproxy</code> to re-enable auto-fetch.")
 
 
 def _handle_check(token: str, chat_id, from_user: dict, sub_cmd: str = ""):
