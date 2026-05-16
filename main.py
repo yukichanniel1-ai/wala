@@ -500,13 +500,13 @@ class GeoRotator:
             log.warning("[GEO] ⚠️  No proxy .txt files found in proxy/ folder — running without proxy!")
             self._proxies = []
             self._proxy_source = {}
+            # ── Notify owner about no proxies ──────────────────
+            try:
+                if OWNER_ID and BOT_TOKEN:
+                    _notify_no_proxy(BOT_TOKEN)
+            except Exception:
+                pass
             return False
-        # ── Notify owner about no proxies ─────────────────────
-        try:
-            if OWNER_ID and BOT_TOKEN:
-                _notify_no_proxy(BOT_TOKEN)
-        except Exception:
-            pass
 
         seen = set()
         merged = []
@@ -537,13 +537,13 @@ class GeoRotator:
             log.warning("[GEO] ⚠️  All proxy files empty or invalid — running without proxy!")
             self._proxies = []
             self._proxy_source = {}
+            # ── Notify owner about empty proxy pool ──────────────────
+            try:
+                if OWNER_ID and BOT_TOKEN:
+                    _notify_no_proxy(BOT_TOKEN)
+            except Exception:
+                pass
             return False
-        # ── Notify owner about empty proxy pool ──────────────
-        try:
-            if OWNER_ID and BOT_TOKEN:
-                _notify_no_proxy(BOT_TOKEN)
-        except Exception:
-            pass
 
         random.shuffle(merged)
         self._proxies = merged
@@ -804,6 +804,11 @@ except Exception as _geo_err:
                     self._proxy_source = source_map
                     self._thread_idx = {}
                     self.current_proxy = merged[0] if merged else None
+                    # Clear any stale "no proxy" warning
+                    try:
+                        _clear_no_proxy_warning()
+                    except Exception:
+                        pass
                     return True
             except Exception:
                 pass
@@ -5368,15 +5373,20 @@ _no_proxy_warned = False
 def _notify_no_proxy(token, chat_id=None, from_user=None):
     """Notify owner that no proxies are available. Only sends once per empty-pool event."""
     global _no_proxy_warned
+    # Re-check pool right before sending — avoid race condition with upload/fetch
+    if _has_proxies():
+        _clear_no_proxy_warning()
+        return  # pool has proxies now, no need to notify
     if _no_proxy_warned:
         return  # already notified
     _no_proxy_warned = True
     try:
         _now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _pool_size = geo_rotator.total if hasattr(geo_rotator, 'total') else 0
         _tg_send(token, OWNER_ID,
             f"\u26a0\ufe0f <b>No Proxies Available!</b>\n\n"
             f"\ud83d\udd50 <b>Time:</b> {_now}\n"
-            f"\ud83d\udce1 <b>Proxy Pool:</b> 0 proxies\n"
+            f"\ud83d\udce1 <b>Proxy Pool:</b> {_pool_size} proxies\n"
             f"\ud83d\udd27 <b>Action:</b> Upload proxy files to the proxy/ folder\n\n"
             f"<i>Bot is in maintenance mode for non-owner users.</i>"
         )
@@ -7660,6 +7670,9 @@ def _handle_proxy_upload(token: str, chat_id, from_user: dict, message: dict):
     try:
         geo_rotator._load_all_files()
         total_now = geo_rotator.total
+        # Clear any stale "no proxy" warning now that pool is loaded
+        if total_now > 0:
+            _clear_no_proxy_warning()
     except Exception:
         total_now = valid_count
 
