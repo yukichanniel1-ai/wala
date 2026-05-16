@@ -827,7 +827,7 @@ class GracefulThreadPoolExecutor(ThreadPoolExecutor):
 
 class CookieManager:
     COOKIE_MAX_LINES = 1000   # auto-delete threshold
-    COOKIE_KEEP      = 1      # keep only 1 newest cookie after cleanup (delete 999)
+    COOKIE_KEEP      = 100    # keep 100 newest cookies after cleanup (delete 900)
 
     def __init__(self):
         self.banned_cookies = set()
@@ -858,7 +858,7 @@ class CookieManager:
                 with open('fresh_cookie.txt', 'r') as f:
                     lines = [l.strip() for l in f if l.strip()]
                 if len(lines) >= self.COOKIE_MAX_LINES:
-                    keep = lines[-self.COOKIE_KEEP:]   # keep only the newest cookie(s)
+                    keep = lines[-self.COOKIE_KEEP:]   # keep the newest 100 cookies
                     deleted = len(lines) - len(keep)
                     with open('fresh_cookie.txt', 'w') as f:
                         f.write('\n'.join(keep) + '\n')
@@ -1399,7 +1399,9 @@ def applyck(session, cookie_str):
     else:
         logger.warning(f"[WARNING] No valid cookies found in the provided string")
 
-def get_datadome_cookie(session):
+def get_datadome_cookie(session, max_retries=3):
+    """Fetch a fresh DataDome cookie from dd.garena.com/js/.
+    Retries up to max_retries times with proxy rotation on failure."""
     url = 'https://dd.garena.com/js/'
     headers = {
         'accept': '*/*',
@@ -1433,23 +1435,33 @@ def get_datadome_cookie(session):
 
     data = '&'.join(f'{k}={urllib.parse.quote(str(v))}' for k, v in payload.items())
 
-    try:
-        # Use session (which has the thread's proxy set) instead of bare requests
-        # This ensures datadome is fetched through the same proxy as the thread
-        response = session.post(url, headers=headers, data=data, timeout=5)
-        response.raise_for_status()
-        response_json = response.json()
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = session.post(url, headers=headers, data=data, timeout=8)
+            response.raise_for_status()
+            response_json = response.json()
+            
+            if response_json.get('status') == 200 and 'cookie' in response_json:
+                cookie_string = response_json['cookie']
+                datadome = cookie_string.split(';')[0].split('=')[1]
+                return datadome
+            else:
+                _status = response_json.get('status', 'unknown')
+                logger.warning(f"[DATADOME] Attempt {attempt}/{max_retries}: API returned status {_status} (no cookie)")
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"[DATADOME] Attempt {attempt}/{max_retries}: Request failed — {e}")
         
-        if response_json['status'] == 200 and 'cookie' in response_json:
-            cookie_string = response_json['cookie']
-            datadome = cookie_string.split(';')[0].split('=')[1]
-            return datadome
-        else:
-            logger.error(f"DataDome cookie not found in response. Status code: {response_json['status']}")
-            return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error getting DataDome cookie: {e}")
-        return None
+        # Rotate proxy for next attempt (if not the last try)
+        if attempt < max_retries:
+            try:
+                geo_rotator.smart_rotate()
+                session.proxies.update(geo_rotator.get_proxies())
+            except Exception:
+                pass
+            time.sleep(0.3 * attempt)  # small backoff
+
+    logger.error(f"[DATADOME] Failed to get DataDome cookie after {max_retries} attempts")
+    return None
     
 def prelogin(session, account, datadome_manager, telegram_config=None):
     url = 'https://sso.garena.com/api/prelogin'
@@ -2266,6 +2278,13 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
         MAX_IP_BLOCK_RETRIES = 3   # 3 retries (up from 2) — better recovery with improved DD handling
         v1, v2, new_datadome = None, None, None
 
+        # ── If we have no datadome at all, try fetching one before starting ──
+        if not datadome_manager.get_datadome():
+            fresh_dd = get_datadome_cookie(session, max_retries=2)
+            if fresh_dd:
+                datadome_manager.set_datadome(fresh_dd)
+                datadome_manager.set_session_datadome(session, fresh_dd)
+
         for ip_block_attempt in range(MAX_IP_BLOCK_RETRIES):
             # ── Ensure session has a fresh DataDome cookie before each attempt ──
             datadome_manager.clear_session_datadome(session)
@@ -2924,6 +2943,7 @@ def create_thread_session(cookie_manager, datadome_manager):
     if valid_cookies:
         combined_cookie_str = "; ".join(valid_cookies)
         applyck(sess, combined_cookie_str)
+        # Try to extract datadome from the last cookie in the file
         final_cookie_value = valid_cookies[-1]
         datadome_value = (
             final_cookie_value.split('=', 1)[1].strip()
@@ -2932,16 +2952,28 @@ def create_thread_session(cookie_manager, datadome_manager):
         )
         if datadome_value:
             datadome_manager.set_datadome(datadome_value)
-    
-    # Always try to get a fresh DataDome cookie (even if we loaded one from file)
-    if not datadome_manager.current_datadome or datadome_manager.is_cookie_stale():
+        else:
+            # Cookie in file didn't have a valid datadome — fetch fresh one
+            datadome = get_datadome_cookie(sess)
+            if datadome:
+                datadome_manager.set_datadome(datadome)
+    else:
         datadome = get_datadome_cookie(sess)
         if datadome:
             datadome_manager.set_datadome(datadome)
-            datadome_manager.set_session_datadome(sess, datadome)
-        elif not datadome_manager.current_datadome:
-            logger.warning(f"[SESSION] ⚠️ Could not obtain DataDome cookie — accounts may fail with 403")
-    
+    # ── Safety net: if we STILL have no datadome, try one more time with forced rotation ──
+    if not datadome_manager.get_datadome():
+        try:
+            geo_rotator.force_rotate()
+            sess.proxies.update(geo_rotator.get_proxies())
+            datadome = get_datadome_cookie(sess, max_retries=2)
+            if datadome:
+                datadome_manager.set_datadome(datadome)
+                logger.info(f"[DATADOME] ✅ Got cookie on forced rotation retry")
+            else:
+                logger.warning(f"[DATADOME] ⚠️ Still no cookie after forced rotation — thread will retry during processaccount")
+        except Exception as e:
+            logger.warning(f"[DATADOME] ⚠️ Forced rotation failed: {e}")
     return sess
 
 
@@ -3385,6 +3417,7 @@ def _tg_set_commands(token: str):
         {"command": "add_coowner",    "description": "👥 Add a co-owner by Telegram ID"},
         {"command": "remove_coowner", "description": "👥 Remove a co-owner"},
         {"command": "stopall",        "description": "☢️ Stop ALL running checkers"},
+        {"command": "broadcast",      "description": "📢 Send message to all users"},
         {"command": "resetconfig",    "description": "🔧 Re-run bot setup wizard"},
         {"command": "start",          "description": "▶️ Start / restore session"},
         {"command": "reset",          "description": "🔄 Clear settings"},
@@ -8192,6 +8225,61 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
                 f"Sent stop signal to <b>{stopped_count}</b> running checker(s).")
         else:
             _tg_send(token, chat_id, "ℹ️ No checkers are currently running.")
+        return
+
+    # ── /broadcast — owner sends a message to all users ────────────────
+    if cmd == "broadcast":
+        if not _is_owner(from_user):
+            _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+            return
+        if not cmd_args:
+            _tg_send(token, chat_id,
+                "📢 <b>Broadcast Message</b>\n\n"
+                "Usage: <code>/broadcast Your message here</code>\n\n"
+                "This will send your message to all registered bot users.")
+            return
+        # Collect unique chat_ids from _saved_users
+        target_ids = set()
+        for k, v in _saved_users.items():
+            if isinstance(v, dict):
+                _cid = v.get("hits_id")
+                if _cid:
+                    try:
+                        target_ids.add(int(_cid))
+                    except (ValueError, TypeError):
+                        pass
+        # Also add chat_ids from _user_data (in case not yet saved)
+        for _cid in _user_data:
+            try:
+                target_ids.add(int(_cid))
+            except (ValueError, TypeError):
+                pass
+        if not target_ids:
+            _tg_send(token, chat_id, "📢 <b>No users to broadcast to.</b>")
+            return
+        # Build the broadcast message
+        owner_name = from_user.get("first_name", "Owner")
+        broadcast_msg = (
+            f"📢 <b>Announcement from {owner_name}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{cmd_args}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>— Bot Admin</i>"
+        )
+        sent_ok   = 0
+        sent_fail = 0
+        for tid in target_ids:
+            try:
+                _tg_send(token, tid, broadcast_msg)
+                sent_ok += 1
+                time.sleep(0.05)  # rate-limit: ~20 msg/sec
+            except Exception:
+                sent_fail += 1
+        _tg_send(token, chat_id,
+            f"📢 <b>Broadcast Complete!</b>\n\n"
+            f"✅ <b>Delivered:</b> {sent_ok}\n"
+            f"❌ <b>Failed:</b> {sent_fail}\n"
+            f"👥 <b>Total users:</b> {len(target_ids)}")
         return
 
     if cmd == "statuskey":
