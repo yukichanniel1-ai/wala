@@ -2940,21 +2940,85 @@ def _cleanup_stale_files():
 # ══════════════════════════════════════════════════════════════
 CONFIG_FILE = "config.json"
 
-def _load_config() -> dict:
-    """Load config.json if it exists, otherwise return empty dict."""
-    if os.path.exists(CONFIG_FILE):
+# ── Railway / cloud deployment support ──────────────────────────────
+# Environment variables take priority over config.json — this ensures
+# the bot can start on Railway (ephemeral FS) without the setup wizard.
+def _is_railway() -> bool:
+    """Detect if running on Railway (or similar cloud platform)."""
+    return bool(os.environ.get("RAILWAY_SERVICE_ID") or os.environ.get("RAILWAY_PROJECT_ID") or os.environ.get("RAILWAY_ENVIRONMENT"))
+
+def _env_config() -> dict:
+    """Build a config dict from environment variables (if set)."""
+    cfg = {}
+    if os.environ.get("BOT_TOKEN"):
+        cfg["bot_token"] = os.environ["BOT_TOKEN"].strip()
+    if os.environ.get("OWNER_ID"):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
+            cfg["owner_id"] = int(os.environ["OWNER_ID"].strip())
+        except ValueError:
             pass
-    return {}
+    if os.environ.get("OWNER_USERNAME"):
+        cfg["owner_username"] = os.environ["OWNER_USERNAME"].strip().lstrip("@")
+    if os.environ.get("COOWNER_IDS"):
+        try:
+            cfg["coowner_ids"] = [int(x.strip()) for x in os.environ["COOWNER_IDS"].split(",") if x.strip().lstrip("-").isdigit()]
+        except ValueError:
+            pass
+    if os.environ.get("KEYSYSTEM_URL"):
+        cfg["keysystem_url"] = os.environ["KEYSYSTEM_URL"].strip()
+    if os.environ.get("KEYSYSTEM_ADMIN_SECRET"):
+        cfg["keysystem_admin_secret"] = os.environ["KEYSYSTEM_ADMIN_SECRET"].strip()
+    return cfg
+
+def _load_config() -> dict:
+    """Load config: config.json first, then env vars as fallback, then KeyVault state."""
+    # Guard against circular calls (KeySystemAPI.__init__ calls _load_config)
+    if getattr(_load_config, "_in_progress", False):
+        return {}
+    _load_config._in_progress = True
+    try:
+        cfg = {}
+        # 1. Try config.json on disk
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            except Exception:
+                pass
+        # 2. Overlay with environment variables (they take priority)
+        env_cfg = _env_config()
+        if env_cfg:
+            cfg.update(env_cfg)
+        # 3. If still missing critical fields, try KeyVault API (survives redeploy)
+        if not cfg.get("bot_token") or not cfg.get("owner_id"):
+            try:
+                api = _get_keysystem_api()
+                if api and api.enabled:
+                    remote_cfg = api.load_state("bot_config")
+                    if isinstance(remote_cfg, dict):
+                        for k, v in remote_cfg.items():
+                            if k not in cfg or not cfg[k]:
+                                cfg[k] = v
+                        logger.info("[CONFIG] Loaded fallback config from KeyVault API")
+            except Exception as e:
+                logger.debug(f"[CONFIG] KeyVault config fallback failed: {e}")
+        return cfg
+    finally:
+        _load_config._in_progress = False
 
 def _save_config(cfg: dict):
-    """Persist config to config.json."""
+    """Persist config to config.json AND sync to KeyVault API for Railway persistence."""
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     print(f"\033[92m✅ Config saved to {CONFIG_FILE}\033[0m")
+    # Also sync to KeyVault API so config survives Railway redeploy
+    try:
+        api = _get_keysystem_api()
+        if api and api.enabled:
+            api.save_state("bot_config", cfg)
+            logger.info("[CONFIG] Synced config to KeyVault API")
+    except Exception as e:
+        logger.debug(f"[CONFIG] KeyVault config sync failed: {e}")
 
 def _validate_token(token: str) -> bool:
     """Quick check — call getMe and verify ok:true."""
@@ -3023,15 +3087,37 @@ def _setup_wizard() -> dict:
 
 def _get_or_create_config() -> dict:
     """
-    Load config from disk.
-    If missing or incomplete, run the setup wizard.
+    Load config from disk / env vars / KeyVault.
+    If missing AND running interactively, run the setup wizard.
+    If missing AND running on Railway (no stdin), log error and exit gracefully.
     """
     cfg = _load_config()
     needs_setup = (
         not cfg.get("bot_token") or
         not cfg.get("owner_id")
     )
-    if needs_setup:
+    if not needs_setup:
+        return cfg
+
+    # Config is incomplete — check if we can run the setup wizard
+    if _is_railway() or not sys.stdin.isatty():
+        # ── Railway / no-TTY mode: cannot use input() ──
+        logger.error("=" * 60)
+        logger.error("❌ BOT CRASH: Missing required configuration!")
+        logger.error("   On Railway/cloud, set these environment variables:")
+        logger.error("     BOT_TOKEN    = your Telegram bot token")
+        logger.error("     OWNER_ID     = your Telegram numeric user ID")
+        logger.error("     OWNER_USERNAME = your Telegram username (optional)")
+        logger.error("     KEYSYSTEM_URL = KeyVault API URL (optional)")
+        logger.error("     KEYSYSTEM_ADMIN_SECRET = KeyVault admin secret (optional)")
+        logger.error("   Or configure via /keysystem command after first run.")
+        logger.error("=" * 60)
+        print("\n\033[91m❌ FATAL: BOT_TOKEN and OWNER_ID not configured!\033[0m")
+        print("\033[93m   On Railway: set BOT_TOKEN and OWNER_ID environment variables.\033[0m")
+        print("\033[93m   On local: delete config.json and restart to run setup wizard.\033[0m\n")
+        sys.exit(1)
+    else:
+        # ── Interactive mode: run setup wizard ──
         cfg = _setup_wizard()
     return cfg
 
@@ -4780,15 +4866,13 @@ def _add_coowner(uid: int):
     """Add a co-owner ID and persist to config."""
     COOWNER_IDS.add(uid)
     _cfg["coowner_ids"] = list(COOWNER_IDS)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(_cfg, f, indent=2)
+    _save_config(_cfg)
 
 def _remove_coowner(uid: int):
     """Remove a co-owner ID and persist to config."""
     COOWNER_IDS.discard(uid)
     _cfg["coowner_ids"] = list(COOWNER_IDS)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(_cfg, f, indent=2)
+    _save_config(_cfg)
 
 
 def _is_vip_user(chat_id) -> bool:
@@ -7801,11 +7885,18 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
         # Delete config.json so next restart triggers the wizard again
         if os.path.exists(CONFIG_FILE):
             os.remove(CONFIG_FILE)
+        # Also clear KeyVault config state (Railway persistence)
+        try:
+            api = _get_keysystem_api()
+            if api and api.enabled:
+                api.delete_state("bot_config")
+        except Exception:
+            pass
         _tg_send(token, chat_id,
             "🗑 <b>Config deleted!</b>\n\n"
-            "Restart the bot — it will ask for your token and owner ID again.")
+            "On local: restart the bot \u2014 it will ask for your token and owner ID again.\n"
+            "On Railway: set BOT_TOKEN and OWNER_ID env vars, then redeploy.")
         return
-
     if cmd == "stopall":
         if not _is_owner(from_user):
             _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
