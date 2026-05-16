@@ -5888,6 +5888,20 @@ def _handle_status_key(token: str, chat_id, from_user: dict, args: str):
         used_by   = e.get("used_by", [])
         if isinstance(used_by, str):
             used_by = [used_by] if used_by else []
+        # Enrich legacy string entries with name/username from saved profiles
+        enriched = []
+        for u in used_by:
+            if isinstance(u, str):
+                profile = _get_saved_profile(u)
+                name = ""
+                username = ""
+                if profile:
+                    name = profile.get("username", "")
+                    username = profile.get("username", "")
+                enriched.append({"id": u, "name": name, "username": username, "tg_id": u})
+            else:
+                enriched.append(u)
+        used_by = enriched
         max_users  = e.get("max_users", 1)
         slots_used = len(used_by)
         slots_max  = "∞" if max_users == 0 else str(max_users)
@@ -5898,7 +5912,22 @@ def _handle_status_key(token: str, chat_id, from_user: dict, args: str):
         label_disp = e.get("label") or "(none)"
         fmt_disp   = (e.get("format") or "unknown").upper()
         source     = e.get("source", "local")
-        users_list = "\n".join(f"    • <code>{u}</code>" for u in used_by) or "    <i>none yet</i>"
+        # Build rich user list with Name, @username, and ID
+        users_lines = []
+        for u in used_by:
+            if isinstance(u, dict):
+                u_name = u.get("name", "")
+                u_user = u.get("username", "")
+                u_id   = u.get("id", u.get("tg_id", ""))
+                display = f"    • {u_name}"
+                if u_user:
+                    display += f" @{u_user}"
+                display += f" ─ <code>{u_id}</code>"
+                users_lines.append(display)
+            else:
+                # Legacy: plain chat_id string
+                users_lines.append(f"    • <code>{u}</code>")
+        users_list = "\n".join(users_lines) or "    <i>none yet</i>"
         _tg_send(token, chat_id,
             f"🔍 <b>Key Details</b>\n\n"
             f"🔑 <code>{target}</code>\n\n"
@@ -5912,6 +5941,7 @@ def _handle_status_key(token: str, chat_id, from_user: dict, args: str):
             f"📦 <b>Combo Limit:</b> {combo_disp}\n"
             f"👥 <b>Max Redemptions:</b> {slots_used}/{slots_max} used\n"
             f"📡 <b>Source:</b> {source}\n"
+            f"🆔 <b>Key ID:</b> <code>{e.get('api_id', 'N/A')}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"👤 <b>Users redeemed:</b>\n{users_list}"
         )
@@ -5926,6 +5956,7 @@ def _handle_status_key(token: str, chat_id, from_user: dict, args: str):
     def _used_count(v):
         ub = v.get("used_by", [])
         if isinstance(ub, str): return 1 if ub else 0
+        if isinstance(ub, dict): return 1  # single dict entry
         return len(ub)
 
     lines = [
@@ -6214,7 +6245,16 @@ def _handle_redeem(token: str, chat_id, from_user: dict, key_arg: str):
     max_users = entry.get("max_users", 1)   # 0 = unlimited
 
     # ── Already redeemed by this user → refresh + re-ask setup ─
-    if uid_str in used_by:
+    # Support both legacy (string) and new (dict) used_by entries
+    user_already_redeemed = False
+    for u in used_by:
+        if isinstance(u, dict) and str(u.get("id", "")) == uid_str:
+            user_already_redeemed = True
+            break
+        elif isinstance(u, str) and u == uid_str:
+            user_already_redeemed = True
+            break
+    if user_already_redeemed:
         d = _udata(chat_id)
         d["key"]         = key
         d["key_expires"] = entry["expires"]
@@ -6228,6 +6268,7 @@ def _handle_redeem(token: str, chat_id, from_user: dict, key_arg: str):
         _tg_send(token, chat_id,
             f"✅ <b>Access Restored!</b> {'⭐ VIP (no queue)' if entry.get('tier', 'free') == 'vip' else '🆓 Free (queued)'}\n\n"
             f"🔑 <b>Key:</b> <code>{key}</code>\n"
+            f"🆔 <b>Your ID:</b> <code>{from_user.get('id', chat_id)}</code>\n"
             f"⏳ <b>Valid for:</b> {hrs}h {mins}m\n"
             f"👥 <b>Slots:</b> {len(used_by)}/{slots_max}\n"
             f"📦 <b>Combo limit:</b> ∞ Unlimited\n\n"
@@ -6244,8 +6285,28 @@ def _handle_redeem(token: str, chat_id, from_user: dict, key_arg: str):
             f"Ask the owner for a new key.")
         return
 
-    # ── Add this user ──────────────────────────────────────────
-    used_by.append(uid_str)
+    # ── Add this user ──────────────────────────────────────────────────
+    # Store rich user info: {id, name, username} instead of just chat_id
+    user_name     = from_user.get("first_name", "")
+    user_lastname = from_user.get("last_name", "")
+    if user_lastname:
+        user_name += f" {user_lastname}"
+    user_username = from_user.get("username", "")
+    user_tg_id    = from_user.get("id", chat_id)
+
+    # Check if this user (by id) is already in used_by to avoid duplicates
+    already_index = None
+    for idx, u in enumerate(used_by):
+        uid_check = u if isinstance(u, str) else str(u.get("id", ""))
+        if uid_check == uid_str:
+            already_index = idx
+            break
+
+    user_entry = {"id": uid_str, "name": user_name, "username": user_username, "tg_id": user_tg_id}
+    if already_index is not None:
+        used_by[already_index] = user_entry  # update with richer info
+    else:
+        used_by.append(user_entry)
     entry["used_by"] = used_by
     _save_keys(keys)
 
@@ -6263,16 +6324,34 @@ def _handle_redeem(token: str, chat_id, from_user: dict, key_arg: str):
     slots_max  = "∞" if max_users == 0 else str(max_users)
 
     # ── Success message ────────────────────────────────────────
+    # ── Success message ──────────────────────────────────────────────────
     _tg_send(token, chat_id,
         f"✅ <b>Key Redeemed Successfully!</b> {'⭐ VIP (no queue)' if entry.get('tier', 'free') == 'vip' else '🆓 Free (queued)'}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔑 <b>Key:</b> <code>{key}</code>\n"
+        f"🆔 <b>Your ID:</b> <code>{user_tg_id}</code>\n"
+        f"👤 <b>Name:</b> {user_name or 'Unknown'}{' @' + user_username if user_username else ''}\n"
         f"⏳ <b>Valid for:</b> {hrs}h {mins}m\n"
         f"👥 <b>Slots:</b> {slots_used}/{slots_max} used\n"
         f"📦 <b>Combo limit:</b> ∞ Unlimited\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"<i>Now set up your preferences below 👇</i>"
     )
+
+    # ── Notify the owner about the redemption ──────────────────────────
+    try:
+        owner_msg_name = user_name or "Unknown"
+        owner_msg_user = f" @{user_username}" if user_username else ""
+        owner_msg_id   = user_tg_id
+        _tg_send(token, OWNER_ID,
+            f"🔑 <b>Key Redeemed!</b>\n\n"
+            f"👤 <b>User:</b> {owner_msg_name}{owner_msg_user}\n"
+            f"🆔 <b>ID:</b> <code>{owner_msg_id}</code>\n"
+            f"🔑 <b>Key:</b> <code>{key[:20]}{'…' if len(key) > 20 else ''}</code>\n"
+            f"📊 <b>Slots:</b> {slots_used}/{slots_max} used"
+        )
+    except Exception:
+        pass  # don't fail redeem if owner notification fails
 
     # ── Immediately show level picker ──────────────────────────
     _ask_level(token, chat_id)
@@ -7942,7 +8021,6 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
             os.remove(CONFIG_FILE)
         # Also clear KeyVault config state (Railway persistence)
         try:
-            api = _get_keysystem_api()
             if api and api.enabled:
                 api.delete_state("bot_config")
         except Exception:
