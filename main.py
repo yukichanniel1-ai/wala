@@ -823,7 +823,8 @@ except Exception as _geo_err:
 RAW_PROXY_SOURCES = [
     # ── (url, default_scheme) ── scheme is used for bare ip:port lines from that source
     # ── Primary source (custom worker) ── ONLY source used for auto-fetch
-    ("https://worker-production-a615.up.railway.app/", "http"),
+    # ── Uses ?format=json so we get proxy type info (http/socks4/socks5)
+    ("https://worker-production-a615.up.railway.app/?format=json", "http"),
 ]
 RAW_PROXY_FETCH_INTERVAL = 30  # 30 seconds — faster refresh for better proxy availability
 RAW_PROXY_SAVE_FILE = os.path.join(PROXY_FOLDER, "raw_fetched_proxies.txt")
@@ -903,12 +904,48 @@ def _fetch_raw_proxies():
                 try:
                     resp = requests.get(url, timeout=30)
                     resp.raise_for_status()
-                    lines = [l.strip() for l in resp.text.splitlines()
-                             if l.strip() and not l.strip().startswith("#")]
                 except Exception as e:
                     log.debug(f"[RAW-PROXY] Failed to fetch {url}: {e}")
                     continue
 
+                # ── Try JSON format first (worker returns type info per proxy) ──
+                try:
+                    data = resp.json()
+                    proxy_items = data.get("proxies", [])
+                    if isinstance(proxy_items, list) and len(proxy_items) > 0 and isinstance(proxy_items[0], dict):
+                        # JSON format with type info — use it to apply correct scheme
+                        for item in proxy_items:
+                            raw_proxy = item.get("proxy", "").strip()
+                            proxy_type = item.get("type", "").lower().strip()
+                            if not raw_proxy or not proxy_type:
+                                continue
+                            total_fetched += 1
+                            # Determine scheme from the type field
+                            if proxy_type in ("socks5", "socks5h"):
+                                line_scheme = "socks5h"
+                            elif proxy_type == "socks4":
+                                line_scheme = "socks5h"
+                            else:
+                                line_scheme = "http"
+                            try:
+                                normalized = _normalize_with_scheme(raw_proxy, line_scheme)
+                            except Exception:
+                                continue
+                            if not normalized:
+                                continue
+                            if normalized in seen:
+                                total_dupes += 1
+                                continue
+                            seen.add(normalized)
+                            all_normalized.append(normalized)
+                            total_new += 1
+                        continue  # skip the plain-text parsing below
+                except (ValueError, KeyError, TypeError):
+                    pass  # Not JSON or malformed — fall through to plain-text parsing
+
+                # ── Fallback: plain-text parsing (bare ip:port lines) ──
+                lines = [l.strip() for l in resp.text.splitlines()
+                         if l.strip() and not l.strip().startswith("#")]
                 total_fetched += len(lines)
 
                 source_new = 0
@@ -7903,23 +7940,25 @@ def _handle_renew_proxy(token: str, chat_id, from_user: dict):
         pass
 
     # Step 5: Fetch fresh proxies from the primary worker source ONLY
-    worker_url = "https://worker-production-a615.up.railway.app/"
+    # Uses JSON format so we get proxy type info (http/socks4/socks5)
+    worker_url = "https://worker-production-a615.up.railway.app/?format=json"
     new_proxies = []
     fetch_errors = []
+    type_counts = {"http": 0, "socks4": 0, "socks5": 0}
 
     try:
         resp = requests.get(worker_url, timeout=30)
         resp.raise_for_status()
-        raw_lines = [l.strip() for l in resp.text.splitlines()
-                     if l.strip() and not l.strip().startswith("#")]
-        log.info(f"[RENEW-PROXY] Fetched {len(raw_lines)} raw lines from worker")
+        data = resp.json()
+        proxy_items = data.get("proxies", [])
+        log.info(f"[RENEW-PROXY] Fetched {len(proxy_items)} proxies from worker (JSON format)")
     except Exception as e:
-        raw_lines = []
+        proxy_items = []
         fetch_errors.append(f"Worker fetch failed: {e}")
         log.error(f"[RENEW-PROXY] Failed to fetch from worker: {e}")
 
-    # Step 6: Normalize, deduplicate, write to fresh file
-    if raw_lines:
+    # Step 6: Normalize using type info from JSON, deduplicate, write to fresh file
+    if proxy_items:
         os.makedirs(PROXY_FOLDER, exist_ok=True)
 
         # Create FRESH raw_fetched_proxies.txt (not append!)
@@ -7927,16 +7966,35 @@ def _handle_renew_proxy(token: str, chat_id, from_user: dict):
             f.write("# Auto-fetched proxies — renewed from worker\n")
 
         seen = set()
-        for line in raw_lines:
+        for item in proxy_items:
             try:
-                # Use GeoRotator's normalizer for consistent formatting
-                normalized = geo_rotator._normalize_proxy(line)
+                raw_proxy = item.get("proxy", "").strip()
+                proxy_type = item.get("type", "").lower().strip()
+                if not raw_proxy or not proxy_type:
+                    continue
+                # Apply correct scheme based on type
+                if proxy_type in ("socks5", "socks5h"):
+                    scheme = "socks5h"
+                elif proxy_type == "socks4":
+                    scheme = "socks5h"
+                else:
+                    scheme = "http"
+                # Normalize bare ip:port with the correct scheme
+                parts = raw_proxy.split(":")
+                if len(parts) == 2 and parts[1].isdigit():
+                    normalized = f"{scheme}://{parts[0]}:{parts[1]}"
+                elif len(parts) == 4 and parts[1].isdigit():
+                    normalized = f"{scheme}://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+                else:
+                    # Already has scheme or unusual format — use normalizer
+                    normalized = geo_rotator._normalize_proxy(raw_proxy)
                 if not normalized:
                     continue
                 if normalized in seen:
                     continue
                 seen.add(normalized)
                 new_proxies.append(normalized)
+                type_counts[proxy_type] = type_counts.get(proxy_type, 0) + 1
             except Exception:
                 continue
 
@@ -7961,23 +8019,24 @@ def _handle_renew_proxy(token: str, chat_id, from_user: dict):
     pool_now = geo_rotator.total
 
     # Build result message
+    type_str = " | ".join(f"{t}: {c}" for t, c in type_counts.items() if c > 0)
     if fetch_errors:
         err_str = "\n".join(f"  ❌ {e}" for e in fetch_errors)
         _tg_send(token, chat_id,
             f"⚠️ <b>Proxy Renewal — Partial Failure</b>\n\n"
             f"🗑️ Old proxies deleted: <code>{old_count}</code>\n"
             f"✅ New proxies fetched: <code>{len(new_proxies)}</code>\n"
+            f"📊 Types: <code>{type_str}</code>\n"
             f"📡 Proxy pool now: <code>{pool_now}</code>\n\n"
             f"<b>Errors:</b>\n{err_str}")
     else:
         _tg_send(token, chat_id,
             f"✅ <b>Proxy Renewal Complete!</b>\n\n"
             f"🗑️ Old proxies deleted: <code>{old_count}</code>\n"
-            f"🔄 Fetched from: <code>{worker_url}</code>\n"
+            f"🔄 Fetched from: <code>worker-production-a615.up.railway.app</code>\n"
             f"✅ New proxies added: <code>{len(new_proxies)}</code>\n"
-            f"📡 Proxy pool now: <code>{pool_now}</code>\n\n"
-            f"🔒 Worker-only mode ON — background auto-fetch paused.\n"
-            f"Use <code>/deleteproxy</code> to re-enable auto-fetch.")
+            f"📊 Types: <code>{type_str}</code>\n"
+            f"📡 Proxy pool now: <code>{pool_now}</code>")
 
 
 def _handle_check(token: str, chat_id, from_user: dict, sub_cmd: str = ""):
