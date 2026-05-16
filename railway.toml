@@ -3,6 +3,6 @@
 
 [deploy]
 restartPolicyType = "ALWAYS"
-restartPolicyMaxRetries = 0
+restartPolicyMaxRetries = 10
 healthcheckPath = "/health"
 healthcheckTimeout = 30
