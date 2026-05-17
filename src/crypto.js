@@ -5,14 +5,21 @@
 const crypto = require('crypto');
 
 /**
- * AES-ECB encode: encrypts hex plaintext with hex key using AES-256-ECB,
+ * AES-ECB encode: encrypts hex plaintext with hex key using AES-ECB,
  * returns first 32 hex characters of the ciphertext.
  * Python: AES.new(bytes.fromhex(key), AES.MODE_ECB).encrypt(bytes.fromhex(plaintext)).hex()[:32]
+ * Key length determines AES variant: 16 bytes = AES-128, 24 = AES-192, 32 = AES-256
  */
 function encode(key, plaintext) {
   const keyBuf = Buffer.from(key, 'hex');
   const ptBuf  = Buffer.from(plaintext, 'hex');
-  const cipher = crypto.createCipheriv('aes-256-ecb', keyBuf, null);
+  const keyLen = keyBuf.length;
+  let algo;
+  if (keyLen === 16) algo = 'aes-128-ecb';
+  else if (keyLen === 24) algo = 'aes-192-ecb';
+  else if (keyLen === 32) algo = 'aes-256-ecb';
+  else throw new Error(`Invalid AES key length: ${keyLen} bytes`);
+  const cipher = crypto.createCipheriv(algo, keyBuf, null);
   const encrypted = Buffer.concat([cipher.update(ptBuf), cipher.final()]);
   return encrypted.toString('hex').slice(0, 32);
 }
