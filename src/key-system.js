@@ -1,34 +1,97 @@
 /**
  * key-system.js — License key system: local keys + KeyVault API client
- * Ported from Python main.py (lines 3945-4610, 5748-5946)
+ * Fully ported from Python main.py (lines 5710-7350)
  *
  * Two modes:
  *  1. LOCAL — keys stored in data/keys.json (default, no API needed)
  *  2. REMOTE — keys managed via KeyVault API (configured with /keysystem)
  *
- * When KeyVault API is enabled, generate/validate/list/delete/revoke
- * operations call the remote API. State persistence (save_state/load_state)
- * is also available for surviving Railway redeploys.
+ * When KeyVault API is enabled:
+ *  - loadKeys() merges remote keys into local store
+ *  - saveKeys() syncs to API for persistence across Railway redeploys
+ *  - generate_key tries API first, falls back to local
+ *  - redeem validates via API if key not found locally
  */
-const fs   = require('fs');
-const path = require('path');
-const axios = require('axios');
-const { KEYS_FILE, DATA_DIR, loadConfig, saveConfig } = require('./config');
+const fs      = require('fs');
+const path    = require('path');
+const axios   = require('axios');
+const { KEYS_FILE, DATA_DIR, loadConfig, saveConfig, VIP_THREADS_PER_USER } = require('./config');
 
-// ── Local key storage ──────────────────────────────────────────────────
-function loadKeys() {
-  if (!fs.existsSync(KEYS_FILE)) return {};
-  try {
-    return JSON.parse(fs.readFileSync(KEYS_FILE, 'utf-8'));
-  } catch {
-    return {};
+// ── Local key storage (mirrors Python _load_keys / _save_keys) ──────────────
+
+function loadKeys(syncApi = true) {
+  let keys = {};
+  if (fs.existsSync(KEYS_FILE)) {
+    try {
+      keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf-8'));
+    } catch {
+      keys = {};
+    }
   }
+
+  // Merge from KeyVault API (persists across Railway redeploys)
+  if (syncApi) {
+    try {
+      const api = getKeySystemAPI();
+      if (api && api.enabled) {
+        // Synchronous-ish: we load from a cached/local copy first,
+        // the async merge is triggered by callers that await
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return keys;
+}
+
+/**
+ * Async version of loadKeys that merges remote keys from KeyVault API.
+ * Matches Python's _load_keys(sync_api=True).
+ */
+async function loadKeysAsync() {
+  let keys = loadKeys(false); // load local only first
+
+  // Merge from KeyVault API
+  try {
+    const api = getKeySystemAPI();
+    if (api && api.enabled) {
+      const remote = await api.loadState('redeem_keys');
+      if (remote && typeof remote === 'object') {
+        for (const [k, v] of Object.entries(remote)) {
+          if (!(k in keys)) {
+            keys[k] = v;
+          }
+        }
+        if (Object.keys(remote).length > 0) {
+          console.log(`[BOT] Synced ${Object.keys(remote).length} redeem keys from KeyVault API`);
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  return keys;
 }
 
 function saveKeys(keys) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   fs.writeFileSync(KEYS_FILE, JSON.stringify(keys, null, 2), 'utf-8');
+
+  // Sync to KeyVault API for persistence across Railway redeploys
+  try {
+    const api = getKeySystemAPI();
+    if (api && api.enabled) {
+      // Fire-and-forget
+      api.saveState('redeem_keys', keys).catch(() => {});
+    }
+  } catch {
+    // ignore
+  }
 }
+
+// ── Key generation ──────────────────────────────────────────────────────────
 
 function genKey() {
   // Match Python: uuid.uuid4().hex[:20].upper()
@@ -66,13 +129,14 @@ function genLocalKey(keyFormat = 'default', tier = 'free') {
   }
 }
 
-// ── Parse duration string (e.g., "1d", "12hrs", "45min", "2w", "3mo", "1d12h30m") ────
+// ── Parse duration string ───────────────────────────────────────────────────
+// Supports: "1d", "12hrs", "45min", "2w", "3mo", "1d12h30min"
+// Mirrors Python _parse_duration
+
 function parseDuration(str) {
   if (!str) return 0;
   str = str.trim().toLowerCase();
 
-  // Multi-unit parsing (matches Python's re.finditer approach)
-  // Supports: mo(nths?), w(eeks?), d(ays?), h(rs?), min(s?)
   let total = 0;
   const re = /(\d+)\s*(mo(?:n(?:th)?s?)?|w(?:ee)?k?s?|d(?:ay)?s?|hr?s?|min?s?)/g;
   let m;
@@ -94,9 +158,10 @@ function parseDuration(str) {
   return 0;
 }
 
-// ── Duration label ──────────────────────────────────────────────────────
+// ── Duration label ───────────────────────────────────────────────────────────
+// Mirrors Python _dur_label: composite "1d 1h 1m" format
+
 function durLabel(seconds) {
-  // Match Python: composite "1d 1h 1m" format
   const days = Math.floor(seconds / 86400);
   const hrs  = Math.floor((seconds % 86400) / 3600);
   const mins = Math.floor((seconds % 3600) / 60);
@@ -107,83 +172,263 @@ function durLabel(seconds) {
   return parts.length > 0 ? parts.join(' ') : '0m';
 }
 
-// ── Create a key (local) ───────────────────────────────────────────────
-function createKey(duration, comboLimit, maxUsers = 0, keyFormat = 'default', tier = 'free') {
-  const keys = loadKeys();
+// ── Create a key (local) ────────────────────────────────────────────────────
+// Matches Python _finalize_gen_key local fallback
+// Field names match Python exactly for compatibility with existing keys
+
+function createKey(duration, comboLimit, maxUsers = 0, keyFormat = 'default', tier = 'free', label = '') {
+  const keys = loadKeys(false);
   const key = genLocalKey(keyFormat, tier);
+  const now = Date.now() / 1000;
+
   keys[key] = {
-    duration: duration,
-    expires: Date.now() / 1000 + duration,
-    combo_limit: comboLimit,
-    max_users: maxUsers,
-    used_by: [],
-    created_at: Date.now() / 1000,
-    tier: tier || 'free',
-    key_format: keyFormat || 'default',
+    expires:         duration > 0 ? now + duration : now + 86400 * 36500, // ~100 years for "Never"
+    combo_limit:     comboLimit,
+    max_users:       maxUsers,
+    used_by:         [],
+    created:         now,             // Python uses "created" not "created_at"
+    source:          'local',
+    tier:            tier || 'free',
+    format:          keyFormat || 'default', // Python uses "format" not "key_format"
+    label:           label || '',
+    redemption_count: 0,
   };
   saveKeys(keys);
   return key;
 }
 
-// ── Redeem a key (local) ───────────────────────────────────────────────
-function redeemKey(key, userId) {
-  const keys = loadKeys();
-  const keyData = keys[key];
+// ── Redeem a key ────────────────────────────────────────────────────────────
+// Full Python parity: rich user info, case-insensitive match, API fallback,
+// already-redeemed refresh, owner notification
 
-  if (!keyData) {
-    return { success: false, message: '❌ Invalid key. Key not found.' };
-  }
-
+async function redeemKey(keyArg, fromUser, chatId) {
+  const keys = await loadKeysAsync();
   const now = Date.now() / 1000;
-  if (now >= keyData.expires) {
-    return { success: false, message: '❌ This key has expired.' };
+  const uidStr = String(chatId);
+  let key = keyArg.trim().toUpperCase();
+  const api = getKeySystemAPI();
+
+  // Find key in local store (case-insensitive match)
+  let entry = keys[key];
+  if (!entry) {
+    const keyLower = keyArg.trim().toLowerCase();
+    for (const k of Object.keys(keys)) {
+      if (k.toLowerCase() === keyLower) {
+        key = k;
+        entry = keys[k];
+        break;
+      }
+    }
   }
 
-  const usedBy = keyData.used_by || [];
-  if (keyData.max_users > 0 && usedBy.length >= keyData.max_users) {
-    return { success: false, message: '❌ This key has reached its maximum user limit.' };
+  // Key not found locally — try validating via KeyVault API
+  if (!entry && api && api.enabled) {
+    let apiResult = await api.validateKey(keyArg.trim());
+    if (!apiResult || !apiResult.valid) {
+      apiResult = await api.validateKey(key); // try uppercase
+    }
+    if (apiResult && apiResult.valid) {
+      const apiKeyInfo = apiResult.key || {};
+      const expiresAt = apiKeyInfo.expiresAt;
+      const expires = expiresAt ? expiresAt / 1000.0 : now + 86400 * 30;
+      const rateLimit = apiKeyInfo.rateLimit || '1000';
+      const comboLimit = /^\d+$/.test(rateLimit) ? parseInt(rateLimit) : 0;
+      const maxRedemptions = apiKeyInfo.maxRedemptions;
+      keys[key] = {
+        expires:     expires,
+        combo_limit: comboLimit,
+        max_users:   maxRedemptions || 0,
+        used_by:     [],
+        created:     now,
+        api_id:      apiKeyInfo.id || '',
+        source:      'keyvault',
+      };
+      saveKeys(keys);
+      entry = keys[key];
+    } else if (apiResult && !apiResult.valid) {
+      return { success: false, message: `❌ <b>${apiResult.reason || 'Invalid key'}</b>` };
+    } else {
+      return { success: false, message: '❌ <b>Invalid key.</b>\n\nPlease check the key and try again.' };
+    }
   }
 
-  if (usedBy.includes(userId)) {
-    return { success: false, message: 'ℹ️ You have already redeemed this key.' };
+  if (!entry) {
+    return { success: false, message: '❌ <b>Invalid key.</b>\n\nPlease check the key and try again.' };
   }
 
-  usedBy.push(userId);
-  keyData.used_by = usedBy;
-  keys[key] = keyData;
+  // ── Expiry check ──
+  if (now > entry.expires) {
+    return { success: false, message: '⏳ <b>This key has expired.</b>\nAsk the owner for a new one.' };
+  }
+
+  // ── Migrate legacy keys: used_by was a single string ──
+  let usedBy = entry.used_by || [];
+  if (typeof usedBy === 'string') {
+    usedBy = usedBy ? [usedBy] : [];
+    entry.used_by = usedBy;
+  }
+
+  const maxUsers = entry.max_users || 1; // 0 = unlimited
+
+  // ── Already redeemed by this user → refresh + re-ask setup ──
+  let userAlreadyRedeemed = false;
+  for (const u of usedBy) {
+    if (typeof u === 'object' && String(u.id || '') === uidStr) {
+      userAlreadyRedeemed = true;
+      break;
+    } else if (typeof u === 'string' && u === uidStr) {
+      userAlreadyRedeemed = true;
+      break;
+    }
+  }
+
+  if (userAlreadyRedeemed) {
+    const remaining = Math.max(0, Math.floor(entry.expires - now));
+    const hrs = Math.floor(remaining / 3600);
+    const mins = Math.floor((remaining % 3600) / 60);
+    const slotsMax = maxUsers === 0 ? '∞' : String(maxUsers);
+    const tierLabel = entry.tier === 'vip' ? '⭐ VIP (no queue)' : '🆓 Free (queued)';
+    return {
+      success: true,
+      alreadyRedeemed: true,
+      message: `✅ <b>Access Restored!</b> ${tierLabel}\n\n` +
+        `🔑 <b>Key:</b> <code>${key}</code>\n` +
+        `🆔 <b>Your ID:</b> <code>${fromUser?.id || chatId}</code>\n` +
+        `⏳ <b>Valid for:</b> ${hrs}h ${mins}m\n` +
+        `👥 <b>Slots:</b> ${usedBy.length}/${slotsMax}\n` +
+        `📦 <b>Combo limit:</b> ${entry.combo_limit === 0 ? '∞ Unlimited' : entry.combo_limit + ' lines'}\n\n` +
+        `<i>Update your settings below 👇</i>`,
+      key: key,
+      key_expires: entry.expires,
+      combo_limit: entry.combo_limit || 0,
+      key_tier: entry.tier || 'free',
+    };
+  }
+
+  // ── User limit check ──
+  if (maxUsers !== 0 && usedBy.length >= maxUsers) {
+    return {
+      success: false,
+      message: `🔐 <b>Key is full!</b>\n\nThis key already has <b>${usedBy.length}/${maxUsers}</b> users.\nAsk the owner for a new key.`
+    };
+  }
+
+  // ── Add this user with rich info ──
+  const userName = [fromUser?.first_name, fromUser?.last_name].filter(Boolean).join(' ');
+  const userUsername = fromUser?.username || '';
+  const userTgId = fromUser?.id || chatId;
+
+  const userEntry = {
+    id: uidStr,
+    name: userName,
+    username: userUsername,
+    tg_id: userTgId,
+  };
+
+  // Check if this user (by id) is already in used_by to avoid duplicates
+  let alreadyIndex = -1;
+  for (let i = 0; i < usedBy.length; i++) {
+    const u = usedBy[i];
+    const uidCheck = typeof u === 'string' ? u : String(u.id || '');
+    if (uidCheck === uidStr) {
+      alreadyIndex = i;
+      break;
+    }
+  }
+
+  if (alreadyIndex >= 0) {
+    usedBy[alreadyIndex] = userEntry; // update with richer info
+  } else {
+    usedBy.push(userEntry);
+  }
+  entry.used_by = usedBy;
+
+  // Increment redemption count
+  entry.redemption_count = (entry.redemption_count || 0) + 1;
+
   saveKeys(keys);
+
+  const remaining = Math.max(0, Math.floor(entry.expires - now));
+  const hrs = Math.floor(remaining / 3600);
+  const mins = Math.floor((remaining % 3600) / 60);
+  const slotsUsed = usedBy.length;
+  const slotsMax = maxUsers === 0 ? '∞' : String(maxUsers);
+  const tierLabel = entry.tier === 'vip' ? '⭐ VIP (no queue)' : '🆓 Free (queued)';
 
   return {
     success: true,
-    message: `✅ <b>Key redeemed successfully!</b>\n\n🔑 Key: <code>${key}</code>\n⏳ Valid for: <b>${durLabel(keyData.duration)}</b>\n📦 Combo limit: <b>${keyData.combo_limit || 'Unlimited'}</b>`,
-    combo_limit: keyData.combo_limit,
-    key_expires: keyData.expires,
+    alreadyRedeemed: false,
+    message: `✅ <b>Key Redeemed Successfully!</b> ${tierLabel}\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `🔑 <b>Key:</b> <code>${key}</code>\n` +
+      `🆔 <b>Your ID:</b> <code>${userTgId}</code>\n` +
+      `👤 <b>Name:</b> ${userName || 'Unknown'}${userUsername ? ' @' + userUsername : ''}\n` +
+      `⏳ <b>Valid for:</b> ${hrs}h ${mins}m\n` +
+      `👥 <b>Slots:</b> ${slotsUsed}/${slotsMax} used\n` +
+      `📦 <b>Combo limit:</b> ${entry.combo_limit === 0 ? '∞ Unlimited' : entry.combo_limit + ' lines'}\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `<i>Now set up your preferences below 👇</i>`,
+    key: key,
+    key_expires: entry.expires,
+    combo_limit: entry.combo_limit || 0,
+    key_tier: entry.tier || 'free',
+    // Owner notification info
+    ownerNotify: {
+      userName: userName || 'Unknown',
+      userUsername,
+      userTgId,
+      keyShort: key.slice(0, 20) + (key.length > 20 ? '…' : ''),
+      slotsUsed,
+      slotsMax,
+    },
   };
 }
 
-// ── Check access (is user allowed to use the bot?) ─────────────────────
+// ── Check access ────────────────────────────────────────────────────────────
+// Mirrors Python _check_access
+
 function checkAccess(userId, savedUsers) {
   const { getOwnerId, getCoownerIds } = require('./config');
   if (userId === getOwnerId() || getCoownerIds().includes(userId)) {
     return { allowed: true, reason: 'owner' };
   }
 
-  const profile = savedUsers[String(userId)];
+  // Check in-memory profile
+  const profile = savedUsers?.[String(userId)];
   if (profile?.key_expires) {
     if (Date.now() / 1000 < profile.key_expires) {
-      return { allowed: true, reason: 'key' };
+      return { allowed: true, reason: 'key', tier: profile.key_tier || 'free' };
     }
     return { allowed: false, reason: 'expired' };
+  }
+
+  // Also check saved profile on disk
+  try {
+    const { getUsers } = require('./config');
+    const users = getUsers();
+    const saved = users?.[String(userId)];
+    if (saved?.key && Date.now() / 1000 < (saved.key_expires || 0)) {
+      // Restore into memory
+      if (profile) {
+        profile.key = saved.key;
+        profile.key_expires = saved.key_expires;
+        profile.combo_limit = saved.combo_limit || 500;
+        profile.key_tier = saved.key_tier || 'free';
+      }
+      return { allowed: true, reason: 'key', tier: saved.key_tier || 'free' };
+    }
+  } catch {
+    // ignore
   }
 
   return { allowed: false, reason: 'no_key' };
 }
 
 
-// ════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 //  KeySystemAPI — Remote KeyVault API Client
 //  Ported from Python main.py KeySystemAPI class (lines 5748-5946)
-// ════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 
 class KeySystemAPI {
   constructor() {
@@ -212,20 +457,13 @@ class KeySystemAPI {
 
   /**
    * Generate key(s) via the KeyVault API.
-   * @param {number} durationSeconds - Key duration in seconds
-   * @param {number} maxUsers - Max users who can redeem
-   * @param {number} comboLimit - Combo line limit
-   * @param {number} [count=1] - Number of keys to generate
-   * @param {string} [tier='vip'] - 'free' | 'vip'
-   * @param {string} [keyFormat='alphanum'] - 'uuid' | 'hex' | 'alphanum' | 'prefix'
-   * @param {string} [label=''] - Optional key label
-   * @returns {Promise<Array>} - Array of generated key objects
+   * Matches Python KeySystemAPI.generate_key() exactly.
    */
   async generateKey(durationSeconds, maxUsers, comboLimit, count = 1, tier = 'vip', keyFormat = 'alphanum', label = '') {
     if (!this.enabled) return [];
 
-    const { VIP_THREADS_PER_USER } = require('./config');
     const expiryDays = durationSeconds >= 86400 ? Math.max(1, Math.floor(durationSeconds / 86400)) : 0;
+    const vipThreads = VIP_THREADS_PER_USER || 10;
 
     const generated = [];
     for (let i = 0; i < count; i++) {
@@ -236,7 +474,7 @@ class KeySystemAPI {
           format: keyFormat,
           expiryDays: expiryDays,
           rateLimit: comboLimit > 0 ? String(comboLimit) : 'unlimited',
-          threads: tier === 'vip' ? VIP_THREADS_PER_USER : 2,
+          threads: tier === 'vip' ? vipThreads : 2,
           maxRedemptions: maxUsers > 0 ? maxUsers : null,
         };
 
@@ -258,11 +496,7 @@ class KeySystemAPI {
     return generated;
   }
 
-  /**
-   * Validate a key via the KeyVault API.
-   * @param {string} keyValue - The key string to validate
-   * @returns {Promise<Object>} - API response: {valid, reason, key}
-   */
+  /** Validate a key via the KeyVault API */
   async validateKey(keyValue) {
     if (!this.enabled) return {};
     try {
@@ -278,10 +512,7 @@ class KeySystemAPI {
     }
   }
 
-  /**
-   * List all keys from the KeyVault API.
-   * @returns {Promise<Array>} - Array of key objects
-   */
+  /** List all keys from the KeyVault API */
   async listKeys() {
     if (!this.enabled) return [];
     try {
@@ -296,11 +527,7 @@ class KeySystemAPI {
     return [];
   }
 
-  /**
-   * Delete a key by its ID via the KeyVault API.
-   * @param {string} keyId - The key ID to delete
-   * @returns {Promise<boolean>}
-   */
+  /** Delete a key by its ID via the KeyVault API */
   async deleteKey(keyId) {
     if (!this.enabled) return false;
     try {
@@ -315,11 +542,7 @@ class KeySystemAPI {
     }
   }
 
-  /**
-   * Revoke a key by its ID via the KeyVault API.
-   * @param {string} keyId - The key ID to revoke
-   * @returns {Promise<boolean>}
-   */
+  /** Revoke a key by its ID via the KeyVault API */
   async revokeKey(keyId) {
     if (!this.enabled) return false;
     try {
@@ -335,14 +558,8 @@ class KeySystemAPI {
     }
   }
 
-  // ── Bot state persistence (via /api/bot/state) ──────────────────────
+  // ── Bot state persistence (via /api/bot/state) ────────────────────────────
 
-  /**
-   * Save arbitrary JSON data to KeyVault KV for persistence across redeploys.
-   * @param {string} key - State key name
-   * @param {*} data - Data to save (must be JSON-serializable)
-   * @returns {Promise<boolean>}
-   */
   async saveState(key, data) {
     if (!this.enabled) return false;
     try {
@@ -358,11 +575,6 @@ class KeySystemAPI {
     }
   }
 
-  /**
-   * Load previously saved data from KeyVault KV.
-   * @param {string} key - State key name
-   * @returns {Promise<*|null>}
-   */
   async loadState(key) {
     if (!this.enabled) return null;
     try {
@@ -380,11 +592,6 @@ class KeySystemAPI {
     }
   }
 
-  /**
-   * Delete saved state from KeyVault KV.
-   * @param {string} key - State key name
-   * @returns {Promise<boolean>}
-   */
   async deleteState(key) {
     if (!this.enabled) return false;
     try {
@@ -400,7 +607,8 @@ class KeySystemAPI {
   }
 }
 
-// ── Singleton instance ─────────────────────────────────────────────────
+// ── Singleton instance ──────────────────────────────────────────────────────
+
 let _keysystemApi = null;
 
 function getKeySystemAPI() {
@@ -414,9 +622,23 @@ function resetKeySystemAPI() {
   _keysystemApi = null;
 }
 
+/**
+ * Delete a key from the KeyVault API if it was created there.
+ * Matches Python _delete_key_from_api(entry)
+ */
+async function deleteKeyFromApi(entry) {
+  const api = getKeySystemAPI();
+  const apiId = entry?.api_id;
+  if (api && api.enabled && apiId) {
+    return api.deleteKey(apiId);
+  }
+  return false;
+}
+
 
 module.exports = {
   loadKeys,
+  loadKeysAsync,
   saveKeys,
   genKey,
   genLocalKey,
@@ -425,6 +647,7 @@ module.exports = {
   createKey,
   redeemKey,
   checkAccess,
+  deleteKeyFromApi,
   KeySystemAPI,
   getKeySystemAPI,
   resetKeySystemAPI,

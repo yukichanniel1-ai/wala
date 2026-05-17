@@ -28,8 +28,8 @@ const { createSession, applyck, getDatadomeCookie, prelogin, login,
 const { tgApi, tgSend, tgSendButtons, tgAnswerCallback, tgEditMessage,
         tgDeleteMessage, tgDeleteMessagesBulk, tgSendDocument,
         tgGetFileUrl, tgDownloadFile, tgSetCommands, sendResultsZip } = require('./telegram-api');
-const { loadKeys, saveKeys, genKey, parseDuration, durLabel,
-        createKey, redeemKey, checkAccess,
+const { loadKeys, loadKeysAsync, saveKeys, genKey, genLocalKey, parseDuration, durLabel,
+        createKey, redeemKey, checkAccess, deleteKeyFromApi,
         KeySystemAPI, getKeySystemAPI, resetKeySystemAPI } = require('./key-system');
 const { botState, userData, savedUsers, stopEvents, activeBars,
         genkeyWizard, deleteKeySelection,
@@ -701,101 +701,402 @@ function handleProxyStatus(token, chatId) {
   );
 }
 
-// ── Key status handler ─────────────────────────────────────────────────
-function handleStatusKey(token, chatId, keyArg) {
-  const keys = loadKeys();
+// ── Key status handler ──────────────────────────────────────────────────
+async function handleStatusKey(token, chatId, keyArg) {
+  const keys = await loadKeysAsync();
   const keyList = Object.entries(keys);
 
   if (!keyList.length) {
-    tgSend(token, chatId, '📊 <b>No keys found.</b>');
+    tgSend(token, chatId, '📋 <b>No keys found.</b>');
     return;
   }
 
   const now = Date.now() / 1000;
-  let text = `📊 <b>Key Status</b> (${keyList.length} keys)\n━━━━━━━━━━━━━━━━━━━━━━━━\n`;
 
-  for (const [key, data] of keyList) {
-    const expired = now >= (data.expires || 0);
-    const status  = expired ? '❌ Expired' : '✅ Active';
-    const usedBy  = data.used_by?.length || 0;
-    const maxUsers = data.max_users || 0;
-    const expiresIn = expired ? 'Expired' : durLabel(data.expires - now);
-
-    text += `\n🔑 <code>${key.slice(0, 8)}...</code>\n`;
-    text += `   ${status} | ⏳ ${expiresIn} | 👥 ${usedBy}/${maxUsers || '∞'} | 📦 ${data.combo_limit || '∞'}\n`;
+  // ── Specific key requested → show rich details ──
+  if (keyArg && keyArg.trim()) {
+    const target = keyArg.trim().toUpperCase();
+    const entry = keys[target];
+    if (!entry) {
+      // try case-insensitive
+      const lower = keyArg.trim().toLowerCase();
+      for (const [k, v] of Object.entries(keys)) {
+        if (k.toLowerCase() === lower) {
+          handleStatusKeyDetail(token, chatId, k, v, now);
+          return;
+        }
+      }
+      tgSend(token, chatId, `❌ Key <code>${target}</code> not found.`);
+      return;
+    }
+    handleStatusKeyDetail(token, chatId, target, entry, now);
+    return;
   }
 
-  if (text.length > 4000) {
+  // ── Dashboard summary ──
+  const active  = keyList.filter(([k, v]) => now < (v.expires || 0) && !v.revoked);
+  const expired = keyList.filter(([k, v]) => now >= (v.expires || 0) && !v.revoked);
+  const revoked = keyList.filter(([k, v]) => v.revoked);
+
+  function usedCount(v) {
+    const ub = v.used_by;
+    if (!ub) return 0;
+    if (typeof ub === 'string') return ub ? 1 : 0;
+    if (Array.isArray(ub)) return ub.length;
+    return 0;
+  }
+
+  const lines = [];
+  lines.push('📋 <b>Key Status — Dashboard</b>');
+  lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  lines.push(`🔢 <b>Total:</b> ${keyList.length}  |  ✅ Active: ${active.length}  |  ❌ Expired: ${expired.length}  |  🚫 Revoked: ${revoked.length}`);
+  lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+  if (active.length) {
+    lines.push('✅ <b>Active Keys:</b>');
+    for (const [k, v] of active.slice(0, 10)) {
+      const rem = Math.max(0, Math.floor((v.expires || 0) - now));
+      const usedCnt = usedCount(v);
+      const maxU = v.max_users || 1;
+      const redeems = `${usedCnt}/${maxU === 0 ? '∞' : maxU}`;
+      const combo = v.combo_limit === 0 ? '∞' : String(v.combo_limit || 1000);
+      const tierBadge = v.tier === 'vip' ? '⭐' : '🆓';
+      const label = v.label ? ` · ${v.label}` : '';
+
+      // Build user list for this key
+      const keyUsers = [];
+      let ub = v.used_by || [];
+      if (typeof ub === 'string') ub = ub ? [ub] : [];
+      for (const u of ub) {
+        if (typeof u === 'object') {
+          const un = u.username || '';
+          const nm = u.name || '';
+          const uid = u.id || u.tg_id || '';
+          let uCid;
+          try { uCid = parseInt(uid); } catch { uCid = null; }
+          const isOn = uCid && botState[uCid] && ['RUNNING', 'AWAIT_FILE', 'AWAIT_LEVEL', 'AWAIT_FILTER'].includes(botState[uCid]);
+          const badge = isOn ? '🟢' : '⚫';
+          keyUsers.push(`${badge} ${un ? '@' + un : nm || uid}`);
+        } else {
+          const prof = getSavedProfile(String(u));
+          const pn = prof?.username || '';
+          let uCid;
+          try { uCid = parseInt(u); } catch { uCid = null; }
+          const isOn = uCid && botState[uCid] && ['RUNNING', 'AWAIT_FILE', 'AWAIT_LEVEL', 'AWAIT_FILTER'].includes(botState[uCid]);
+          const badge = isOn ? '🟢' : '⚫';
+          keyUsers.push(`${badge} ${pn ? '@' + pn : u}`);
+        }
+      }
+      const usersStr = keyUsers.length ? keyUsers.join(' · ') : '';
+      const usersLine = usersStr ? `\n  👤 ${usersStr}` : '';
+      lines.push(`  ${tierBadge} <code>${k.slice(0, 20)}${k.length > 20 ? '…' : ''}</code>${label}`);
+      lines.push(`  ⏳ ${durLabel(rem)} · 👥 ${redeems} · 📦 ${combo}${usersLine}`);
+    }
+    if (active.length > 10) {
+      lines.push(`  <i>...and ${active.length - 10} more</i>`);
+    }
+  }
+
+  if (expired.length) {
+    lines.push('');
+    lines.push('❌ <b>Expired Keys:</b>');
+    for (const [k, v] of expired.slice(0, 5)) {
+      const usedCnt = usedCount(v);
+      const maxU = v.max_users || 1;
+      const redeems = `${usedCnt}/${maxU === 0 ? '∞' : maxU}`;
+      const tierBadge = v.tier === 'vip' ? '⭐' : '🆓';
+      lines.push(`  ${tierBadge} <code>${k.slice(0, 20)}${k.length > 20 ? '…' : ''}</code> — 👥 ${redeems}`);
+    }
+    if (expired.length > 5) {
+      lines.push(`  <i>...and ${expired.length - 5} more</i>`);
+    }
+  }
+
+  if (revoked.length) {
+    lines.push('');
+    lines.push('🚫 <b>Revoked Keys:</b>');
+    for (const [k, v] of revoked.slice(0, 5)) {
+      const tierBadge = v.tier === 'vip' ? '⭐' : '🆓';
+      lines.push(`  ${tierBadge} <code>${k.slice(0, 20)}${k.length > 20 ? '…' : ''}</code>`);
+    }
+    if (revoked.length > 5) {
+      lines.push(`  <i>...and ${revoked.length - 5} more</i>`);
+    }
+  }
+
+  // ── Active Users Overview ──
+  const allKeyUsers = [];
+  for (const [k, v] of keyList) {
+    let ub = v.used_by || [];
+    if (typeof ub === 'string') ub = ub ? [ub] : [];
+    for (const u of ub) {
+      if (typeof u === 'object') {
+        const uid = u.id || u.tg_id || '';
+        let uCid;
+        try { uCid = parseInt(uid); } catch { uCid = null; }
+        const isOn = uCid && botState[uCid] && ['RUNNING', 'AWAIT_FILE', 'AWAIT_LEVEL', 'AWAIT_FILTER'].includes(botState[uCid]);
+        allKeyUsers.push({ name: u.name || '', username: u.username || '', id: uid, isOn });
+      } else {
+        const prof = getSavedProfile(String(u));
+        const pn = prof?.username || '';
+        let uCid;
+        try { uCid = parseInt(u); } catch { uCid = null; }
+        const isOn = uCid && botState[uCid] && ['RUNNING', 'AWAIT_FILE', 'AWAIT_LEVEL', 'AWAIT_FILTER'].includes(botState[uCid]);
+        allKeyUsers.push({ name: pn, username: pn, id: String(u), isOn });
+      }
+    }
+  }
+  if (allKeyUsers.length) {
+    const onlineCount = allKeyUsers.filter(u => u.isOn).length;
+    const totalCount = allKeyUsers.length;
+    lines.push('');
+    lines.push(`👥 <b>Key Users:</b> ${onlineCount}/${totalCount} online`);
+    for (const u of allKeyUsers.slice(0, 15)) {
+      const badge = u.isOn ? '🟢' : '⚫';
+      const status = u.isOn ? '1/1' : '0/1';
+      const namePart = u.username ? '@' + u.username : u.name || String(u.id);
+      lines.push(`  ${badge} ${namePart} ─ <code>${u.id}</code> [${status}]`);
+    }
+    if (allKeyUsers.length > 15) {
+      lines.push(`  <i>...and ${allKeyUsers.length - 15} more</i>`);
+    }
+  }
+
+  lines.push('');
+  lines.push('<i>Use /statuskey KEY for details · /deletekey to remove</i>');
+
+  const fullText = lines.join('\n');
+
+  // Chunk if too long
+  if (fullText.length > 4000) {
     const chunks = [];
-    let current = `📊 <b>Key Status</b> (${keyList.length} keys)\n━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-    for (const [key, data] of keyList) {
-      const expired = now >= (data.expires || 0);
-      const status  = expired ? '❌ Expired' : '✅ Active';
-      const line = `🔑 <code>${key.slice(0, 8)}...</code> ${status} ⏳${expired ? 'Expired' : durLabel(data.expires - now)} 👥${data.used_by?.length || 0}/${data.max_users || '∞'} 📦${data.combo_limit || '∞'}\n`;
-      if (current.length + line.length > 3800) {
+    let current = '';
+    for (const line of lines) {
+      if (current.length + line.length + 1 > 3800) {
         chunks.push(current);
         current = '';
       }
-      current += line;
+      current += (current ? '\n' : '') + line;
     }
     if (current) chunks.push(current);
     for (const chunk of chunks) tgSend(token, chatId, chunk);
   } else {
-    tgSend(token, chatId, text);
+    tgSend(token, chatId, fullText);
   }
 }
 
-// ── Delete key helpers ─────────────────────────────────────────────────
-function buildDeleteKeyKeyboard(keys, selected, now) {
-  const keyboard = [];
-  for (const [key, data] of Object.entries(keys)) {
-    const expired = now >= (data.expires || 0);
-    const icon = selected.has(key) ? '☑️' : (expired ? '❌' : '✅');
-    keyboard.push([{
-      text: `${icon} ${key.slice(0, 12)}... (${durLabel(data.duration)})`,
-      callback_data: `dk_toggle:${key}`
-    }]);
+function handleStatusKeyDetail(token, chatId, target, entry, now) {
+  const expired = now >= (entry.expires || 0);
+  const status = expired ? '❌ Expired' : '✅ Active';
+  let usedBy = entry.used_by || [];
+  if (typeof usedBy === 'string') usedBy = usedBy ? [usedBy] : [];
+
+  const maxUsers = entry.max_users || 1;
+  const slotsUsed = usedBy.length;
+  const slotsMax = maxUsers === 0 ? '∞' : String(maxUsers);
+  const comboDisp = entry.combo_limit === 0 ? '∞ Unlimited' : `${entry.combo_limit || 500} lines`;
+  const created = new Date((entry.created || 0) * 1000).toISOString().slice(0, 16).replace('T', ' ');
+  const expDt = new Date((entry.expires || 0) * 1000).toISOString().slice(0, 16).replace('T', ' ');
+  const tierDisp = entry.tier === 'vip' ? '⭐ VIP' : '🆓 Free';
+  const labelDisp = entry.label || '(none)';
+  const fmtDisp = (entry.format || 'unknown').toUpperCase();
+  const source = entry.source || 'local';
+
+  // Build rich user list
+  const usersLines = [];
+  for (const u of usedBy) {
+    if (typeof u === 'object') {
+      const uName = u.name || '';
+      const uUser = u.username || '';
+      const uId = u.id || u.tg_id || '';
+      let uCid;
+      try { uCid = parseInt(uId); } catch { uCid = null; }
+      const isOn = uCid && botState[uCid] && ['RUNNING', 'AWAIT_FILE', 'AWAIT_LEVEL', 'AWAIT_FILTER'].includes(botState[uCid]);
+      const activeBadge = isOn ? '🟢 1/1' : '⚫ 0/1';
+      const usernamePart = uUser ? '@' + uUser : uName || String(uId);
+      let display = `    • <code>${target.slice(0, 8)}-${usernamePart}</code>`;
+      display += ` ─ ${uName}`;
+      if (uUser) display += ` @${uUser}`;
+      display += ` ─ <code>${uId}</code> ${activeBadge}`;
+      usersLines.push(display);
+    } else {
+      let uCid;
+      try { uCid = parseInt(u); } catch { uCid = null; }
+      const isOn = uCid && botState[uCid] && ['RUNNING', 'AWAIT_FILE', 'AWAIT_LEVEL', 'AWAIT_FILTER'].includes(botState[uCid]);
+      const activeBadge = isOn ? '🟢 1/1' : '⚫ 0/1';
+      const prof = getSavedProfile(String(u));
+      const pName = prof?.username || '';
+      const usernamePart = pName ? '@' + pName : String(u);
+      usersLines.push(`    • <code>${target.slice(0, 8)}-${usernamePart}</code> ─ <code>${u}</code> ${activeBadge}`);
+    }
   }
-  keyboard.push([
-    { text: '🗑 Expired', callback_data: 'dk_sel:expired' },
-    { text: '� Unused', callback_data: 'dk_sel:unused' },
+  const usersList = usersLines.length ? usersLines.join('\n') : '    <i>none yet</i>';
+
+  tgSend(token, chatId,
+    '🔍 <b>Key Details</b>\n\n' +
+    `🔑 <code>${target}</code>\n\n` +
+    '━━━━━━━━━━━━━━━━━━━━━━━━━━\n' +
+    `📊 <b>Status:</b> ${status}\n` +
+    `🏷 <b>Tier:</b> ${tierDisp}\n` +
+    `🔤 <b>Format:</b> ${fmtDisp}\n` +
+    `📝 <b>Label:</b> ${labelDisp}\n` +
+    `📅 <b>Created:</b> ${created}\n` +
+    `📅 <b>Expires:</b> ${expDt}\n` +
+    `📦 <b>Combo Limit:</b> ${comboDisp}\n` +
+    `👥 <b>Max Redemptions:</b> ${slotsUsed}/${slotsMax} used\n` +
+    `📡 <b>Source:</b> ${source}\n` +
+    `🆔 <b>Key ID:</b> <code>${entry.api_id || 'N/A'}</code>\n` +
+    '━━━━━━━━━━━━━━━━━━━━━━━━━━\n' +
+    `👤 <b>Users redeemed:</b>\n${usersList}`
+  );
+}
+
+// ── Delete key helpers ──────────────────────────────────────────────────
+function buildDeleteKeyKeyboard(keys, selected, now) {
+  const rows = [];
+  const sorted = Object.entries(keys).sort((a, b) => {
+    const aActive = (a[1].expires || 0) > now ? 1 : 0;
+    const bActive = (b[1].expires || 0) > now ? 1 : 0;
+    if (aActive !== bActive) return bActive - aActive;
+    return (b[1].expires || 0) - (a[1].expires || 0);
+  });
+
+  for (const [k, v] of sorted.slice(0, 20)) {
+    const isExpired = now >= (v.expires || 0);
+    const remaining = Math.max(0, Math.floor((v.expires || 0) - now));
+    let usedBy = v.used_by || [];
+    if (typeof usedBy === 'string') usedBy = usedBy ? [usedBy] : [];
+    const maxU = v.max_users || 1;
+    const slots = `${usedBy.length}/${maxU === 0 ? '∞' : maxU}`;
+    const status = isExpired ? '❌' : `⏳${durLabel(remaining)}`;
+    const tick = selected.has(k) ? '✅ ' : '';
+    const label = `${tick}${k.slice(0, 8)}… ${status} 👥${slots}`;
+    rows.push([{ text: label, callback_data: `dk_toggle:${k}` }]);
+  }
+
+  if (Object.keys(keys).length > 20) {
+    rows.push([{ text: `⚠️ Showing 20/${Object.keys(keys).length} keys`, callback_data: 'dk_noop' }]);
+  }
+
+  rows.push([
+    { text: '☑️ All Expired', callback_data: 'dk_sel:expired' },
+    { text: '☑️ All Unused', callback_data: 'dk_sel:unused' },
+    { text: '☑️ Select All', callback_data: 'dk_sel:all' },
   ]);
-  keyboard.push([
-    { text: '✅ All', callback_data: 'dk_sel:all' },
-    { text: '❌ None', callback_data: 'dk_sel:none' },
+
+  const selCount = selected.size;
+  const confirmLabel = selCount ? `🗑 Delete (${selCount})` : '🗑 Delete';
+  rows.push([
+    { text: confirmLabel, callback_data: 'dk_confirm' },
+    { text: '🔲 Clear', callback_data: 'dk_sel:none' },
+    { text: '❌ Cancel', callback_data: 'dk_cancel' },
   ]);
-  keyboard.push([
-    { text: '💥 Delete Selected', callback_data: 'dk_confirm' },
-    { text: '↩️ Cancel', callback_data: 'dk_cancel' },
-  ]);
-  return keyboard;
+  return rows;
 }
 
 function deleteKeyHeader(keys, selected, now) {
   const total = Object.keys(keys).length;
-  const selCount = selected.size;
-  return `🗑 <b>Delete Keys</b> (${selCount}/${total} selected)\n\nTap keys to select/deselect:`;
+  const active = Object.values(keys).filter(v => now < (v.expires || 0)).length;
+  const expired = Object.values(keys).filter(v => now >= (v.expires || 0)).length;
+  const sel = selected.size;
+  return (
+    '🗑 <b>Delete Keys</b>\n' +
+    '━━━━━━━━━━━━━━━━━━━━━━━━━━\n' +
+    `🔢 Total: <b>${total}</b>  ✅ Active: <b>${active}</b>  ❌ Expired: <b>${expired}</b>\n` +
+    '━━━━━━━━━━━━━━━━━━━━━━━━━━\n' +
+    (sel ? `🔘 <b>${sel} key(s) selected</b>` : '<i>Tap keys to select for deletion</i>') + '\n\n' +
+    '<b>Key</b>  ·  <b>Status</b>  ·  <b>Used</b>'
+  );
 }
 
 function handleDeleteKey(token, chatId, fromUser, keyArg) {
-  if (keyArg) {
-    const keys = loadKeys();
-    if (keys[keyArg]) {
-      delete keys[keyArg];
-      saveKeys(keys);
-      tgSend(token, chatId, `✅ Key <code>${keyArg}</code> deleted.`);
-    } else {
-      tgSend(token, chatId, `❌ Key <code>${keyArg}</code> not found.`);
-    }
+  if (!isOwner(fromUser)) {
+    tgSend(token, chatId, '🚫 <b>Owner only command.</b>');
     return;
   }
+
   const keys = loadKeys();
+  const now = Date.now() / 1000;
+
   if (!Object.keys(keys).length) {
-    tgSend(token, chatId, '📊 <b>No keys found.</b>');
+    tgSend(token, chatId, '📋 <b>No keys found.</b>');
     return;
   }
+
+  // Direct one-shot commands: /deletekey expired|unused|all|KEY
+  const args = (keyArg || '').trim();
+  if (args) {
+    if (args.toLowerCase() === 'expired') {
+      const toDel = Object.entries(keys).filter(([k, v]) => now >= (v.expires || 0));
+      if (!toDel.length) {
+        tgSend(token, chatId, '✅ No expired keys to delete.');
+        return;
+      }
+      (async () => {
+        for (const [k, v] of toDel) {
+          await deleteKeyFromApi(v);
+          delete keys[k];
+        }
+        saveKeys(keys);
+        tgSend(token, chatId,
+          `🗑 <b>Deleted ${toDel.length} expired key(s).</b>\n<i>Remaining: ${Object.keys(keys).length}</i>`);
+      })();
+      return;
+    }
+    if (args.toLowerCase() === 'unused') {
+      const toDel = Object.entries(keys).filter(([k, v]) => !v.used_by || (Array.isArray(v.used_by) && !v.used_by.length));
+      if (!toDel.length) {
+        tgSend(token, chatId, '✅ No unused keys to delete.');
+        return;
+      }
+      (async () => {
+        for (const [k, v] of toDel) {
+          await deleteKeyFromApi(v);
+          delete keys[k];
+        }
+        saveKeys(keys);
+        tgSend(token, chatId,
+          `🗑 <b>Deleted ${toDel.length} unused key(s).</b>\n<i>Remaining: ${Object.keys(keys).length}</i>`);
+      })();
+      return;
+    }
+    if (args.toLowerCase() === 'all') {
+      const count = Object.keys(keys).length;
+      (async () => {
+        for (const entry of Object.values(keys)) {
+          await deleteKeyFromApi(entry);
+        }
+        const empty = {};
+        saveKeys(empty);
+        delete deleteKeySelection[chatId];
+        tgSend(token, chatId, `🗑 <b>All ${count} key(s) deleted.</b>`);
+      })();
+      return;
+    }
+    // Specific key
+    const target = args.toUpperCase();
+    if (!keys[target]) {
+      tgSend(token, chatId, `❌ Key <code>${target}</code> not found.`);
+      return;
+    }
+    const entry = keys[target];
+    (async () => {
+      await deleteKeyFromApi(entry);
+      delete keys[target];
+      saveKeys(keys);
+      const expDt = new Date((entry.expires || 0) * 1000).toISOString().slice(0, 16).replace('T', ' ');
+      const used = entry.used_by || 'never used';
+      tgSend(token, chatId,
+        '🗑 <b>Key Deleted</b>\n\n' +
+        `🔑 <code>${target}</code>\n` +
+        `📅 Was expiring: ${expDt}\n` +
+        `👤 Used by: <code>${typeof used === 'object' ? JSON.stringify(used) : used}</code>`);
+    })();
+    return;
+  }
+
+  // Interactive picker
   deleteKeySelection[chatId] = new Set();
-  const now = Date.now() / 1000;
   tgSendButtons(token, chatId,
     deleteKeyHeader(keys, deleteKeySelection[chatId], now),
     buildDeleteKeyKeyboard(keys, deleteKeySelection[chatId], now)
@@ -804,111 +1105,358 @@ function handleDeleteKey(token, chatId, fromUser, keyArg) {
 
 // ── Handle redeem ──────────────────────────────────────────────────────
 function handleRedeem(token, chatId, fromUser, keyArg) {
-  if (!keyArg) {
-    tgSend(token, chatId,
-      '🔑 <b>Redeem Key</b>\n\nType your key:\n<code>/redeem YOUR_KEY</code>');
+  if (!keyArg || !keyArg.trim()) {
+    botState[chatId] = 'AWAIT_REDEEM_KEY';
+    tgSendButtons(token, chatId,
+      '\ud83d\udd11 <b>Redeem Key</b>\n\n' +
+      'Type your key in the chat, or tap the button below:\n\n' +
+      '<i>Format: <code>/redeem YOUR_KEY</code></i>',
+      [
+        [{ text: '\u2328\ufe0f Type my key now', callback_data: 'redeem:prompt' }],
+      ]
+    );
     return;
   }
 
-  const uid = String(fromUser?.id || chatId);
-  const result = redeemKey(keyArg, uid);
+  (async () => {
+    const result = await redeemKey(keyArg, fromUser, chatId);
 
-  if (result.success) {
-    const d = udata(chatId);
-    d.key = keyArg;
-    d.key_expires = result.key_expires;
-    d.combo_limit = result.combo_limit || config.COMBO_LINE_LIMIT;
-    botState[chatId] = 'AWAIT_LEVEL';
-    saveProfile(chatId, d);
-  }
+    if (result.success) {
+      const d = udata(chatId);
+      d.key = result.key || keyArg;
+      d.key_expires = result.key_expires;
+      d.combo_limit = result.combo_limit || config.COMBO_LINE_LIMIT;
+      d.key_tier = result.key_tier || 'free';
+      saveProfile(chatId, d);
 
-  tgSend(token, chatId, result.message);
+      // Notify owner about redemption
+      if (result.ownerNotify && !result.alreadyRedeemed) {
+        try {
+          const n = result.ownerNotify;
+          tgSend(token, config.getOwnerId(),
+            '\ud83d\udd11 <b>Key Redeemed!</b>\n\n' +
+            '\ud83d\udc64 <b>User:</b> ' + n.userName + (n.userUsername ? ' @' + n.userUsername : '') + '\n' +
+            '\ud83c\udd94 <b>ID:</b> <code>' + n.userTgId + '</code>\n' +
+            '\ud83d\udd11 <b>Key:</b> <code>' + n.keyShort + '</code>\n' +
+            '\ud83d\udcca <b>Slots:</b> ' + n.slotsUsed + '/' + n.slotsMax + ' used'
+          );
+        } catch {}
+      }
+
+      // Show level picker after redeem
+      if (typeof askLevel === 'function') {
+        askLevel(token, chatId);
+      } else {
+        botState[chatId] = 'AWAIT_LEVEL';
+      }
+    }
+
+    tgSend(token, chatId, result.message);
+  })();
 }
 
-// ── Genkey wizard helpers ──────────────────────────────────────────────
-function askGenkeyUsers(token, chatId, duration) {
+// ── Genkey wizard helpers (6 steps matching Python) ──────────────────────
+function askGenkeyFormat(token, chatId) {
+  const wiz = genkeyWizard[chatId] || {};
+  const tierDisp = wiz.tier === 'vip' ? '⭐ VIP' : '🆓 Free';
   tgSendButtons(token, chatId,
-    `🔑 <b>Generate Key — Step 2 of 4</b>\n\n` +
-    `⏳ Duration: <b>${durLabel(duration)}</b>\n\n` +
-    `👥 How many users can use this key?\n\n` +
-    `<i>Tap a button or type a number</i>`,
+    '🔑 <b>Generate Key — Step 2 of 6</b>\n\n' +
+    `🏷 Tier: <b>${tierDisp}</b>\n\n` +
+    '🔤 <b>Select Key Format:</b>\n\n' +
+    '<i>How should the key look?</i>',
     [
       [
-        { text: '1 User',  callback_data: 'gk_usr:1' },
-        { text: '3 Users', callback_data: 'gk_usr:3' },
-        { text: '5 Users', callback_data: 'gk_usr:5' },
+        { text: 'UUID v4',      callback_data: 'gk_fmt:uuid' },
+        { text: 'HEX-32',       callback_data: 'gk_fmt:hex' },
       ],
       [
-        { text: '10 Users',  callback_data: 'gk_usr:10' },
-        { text: '∞ Unlimited', callback_data: 'gk_usr:0' },
-        { text: '❌ Cancel',   callback_data: 'gk_cancel' },
-      ],
-    ]
-  );
-}
-
-function askGenkeyLimit(token, chatId, duration, maxUsers) {
-  tgSendButtons(token, chatId,
-    `🔑 <b>Generate Key — Step 3 of 4</b>\n\n` +
-    `⏳ Duration: <b>${durLabel(duration)}</b>\n` +
-    `👥 Max users: <b>${maxUsers || 'Unlimited'}</b>\n\n` +
-    `📦 Combo limit per key?\n\n` +
-    `<i>Tap a button or type a number</i>`,
-    [
-      [
-        { text: '1,000',  callback_data: 'gk_lim:1000' },
-        { text: '5,000',  callback_data: 'gk_lim:5000' },
-        { text: '10,000', callback_data: 'gk_lim:10000' },
+        { text: 'ALPHANUM-24',  callback_data: 'gk_fmt:alphanum' },
+        { text: 'PREFIX-KEY',   callback_data: 'gk_fmt:prefix' },
       ],
       [
-        { text: '50,000', callback_data: 'gk_lim:50000' },
-        { text: '∞ Unlimited', callback_data: 'gk_lim:0' },
-        { text: '❌ Cancel',   callback_data: 'gk_cancel' },
-      ],
-    ]
-  );
-}
-
-function askGenkeyCount(token, chatId, duration, maxUsers, limit) {
-  tgSendButtons(token, chatId,
-    `🔑 <b>Generate Key — Step 4 of 4</b>\n\n` +
-    `⏳ Duration: <b>${durLabel(duration)}</b>\n` +
-    `👥 Max users: <b>${maxUsers || 'Unlimited'}</b>\n` +
-    `📦 Limit: <b>${limit || 'Unlimited'}</b>\n\n` +
-    `🔢 How many keys to generate? (1-500)`,
-    [
-      [
-        { text: '1',  callback_data: 'gk_cnt:1' },
-        { text: '5',  callback_data: 'gk_cnt:5' },
-        { text: '10', callback_data: 'gk_cnt:10' },
-      ],
-      [
-        { text: '25', callback_data: 'gk_cnt:25' },
-        { text: '50', callback_data: 'gk_cnt:50' },
         { text: '❌ Cancel', callback_data: 'gk_cancel' },
       ],
     ]
   );
 }
 
-function finalizeGenKey(token, chatId, duration, comboLimit, count, maxUsers) {
-  const keys = [];
-  for (let i = 0; i < count; i++) {
-    const key = createKey(duration, comboLimit, maxUsers);
-    keys.push(key);
-  }
+function askGenkeyExpiry(token, chatId) {
+  const wiz = genkeyWizard[chatId] || {};
+  const tierDisp = wiz.tier === 'vip' ? '⭐ VIP' : '🆓 Free';
+  const fmtDisp = (wiz.format || 'uuid').toUpperCase();
+  tgSendButtons(token, chatId,
+    '🔑 <b>Generate Key — Step 3 of 6</b>\n\n' +
+    `🏷 Tier: <b>${tierDisp}</b>\n` +
+    `🔤 Format: <b>${fmtDisp}</b>\n\n` +
+    '⏳ <b>Select Expiry:</b>\n\n' +
+    '<i>Pick a preset or type custom (e.g. 1d, 12h, 2w, 3mo):</i>',
+    [
+      [
+        { text: '1 Hour',   callback_data: 'gk_exp_h:1' },
+        { text: '6 Hours',  callback_data: 'gk_exp_h:6' },
+        { text: '12 Hours', callback_data: 'gk_exp_h:12' },
+      ],
+      [
+        { text: '1 Day',    callback_data: 'gk_exp:1' },
+        { text: '3 Days',   callback_data: 'gk_exp:3' },
+        { text: '7 Days',   callback_data: 'gk_exp:7' },
+      ],
+      [
+        { text: '30 Days',  callback_data: 'gk_exp:30' },
+        { text: '90 Days',  callback_data: 'gk_exp:90' },
+        { text: '1 Year',   callback_data: 'gk_exp:365' },
+      ],
+      [
+        { text: '♾ Never',  callback_data: 'gk_exp:0' },
+      ],
+      [
+        { text: '❌ Cancel', callback_data: 'gk_cancel' },
+      ],
+    ]
+  );
+}
 
-  let text = `✅ <b>${keys.length} key(s) generated!</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-  text += `⏳ Duration: <b>${durLabel(duration)}</b>\n`;
-  text += `👥 Max users: <b>${maxUsers || 'Unlimited'}</b>\n`;
-  text += `📦 Combo limit: <b>${comboLimit || 'Unlimited'}</b>\n\n`;
+function wizExpiryDisp(wiz) {
+  const secs = wiz.expiry_seconds || 0;
+  if (secs > 0) return durLabel(secs);
+  const days = wiz.expiry_days || 0;
+  if (days > 0) return `${days}d`;
+  return 'Never';
+}
 
-  for (const key of keys) {
-    text += `🔑 <code>${key}</code>\n`;
-  }
+function askGenkeyCombo(token, chatId) {
+  const wiz = genkeyWizard[chatId] || {};
+  const tierDisp = wiz.tier === 'vip' ? '⭐ VIP' : '🆓 Free';
+  const fmtDisp = (wiz.format || 'uuid').toUpperCase();
+  const expDisp = wizExpiryDisp(wiz);
+  tgSendButtons(token, chatId,
+    '🔑 <b>Generate Key — Step 4 of 6</b>\n\n' +
+    `🏷 Tier: <b>${tierDisp}</b>\n` +
+    `🔤 Format: <b>${fmtDisp}</b>\n` +
+    `⏳ Expiry: <b>${expDisp}</b>\n\n` +
+    '📦 <b>Select Combo Limit:</b>\n\n' +
+    '<i>Pick a preset or type a custom number:</i>',
+    [
+      [
+        { text: '500 lines',    callback_data: 'gk_lim:500' },
+        { text: '1,000 lines',  callback_data: 'gk_lim:1000' },
+        { text: '2,500 lines',  callback_data: 'gk_lim:2500' },
+      ],
+      [
+        { text: '5,000 lines',  callback_data: 'gk_lim:5000' },
+        { text: '10,000 lines', callback_data: 'gk_lim:10000' },
+        { text: '∞ Unlimited',  callback_data: 'gk_lim:0' },
+      ],
+      [
+        { text: '❌ Cancel', callback_data: 'gk_cancel' },
+      ],
+    ]
+  );
+}
 
-  tgSend(token, chatId, text);
-  delete genkeyWizard[chatId];
+function askGenkeyRedeems(token, chatId) {
+  const wiz = genkeyWizard[chatId] || {};
+  const tierDisp = wiz.tier === 'vip' ? '⭐ VIP' : '🆓 Free';
+  const fmtDisp = (wiz.format || 'uuid').toUpperCase();
+  const expDisp = wizExpiryDisp(wiz);
+  const comboDisp = wiz.combo_limit === 0 ? '∞ Unlimited' : `${(wiz.combo_limit || 1000).toLocaleString()} lines`;
+  tgSendButtons(token, chatId,
+    '🔑 <b>Generate Key — Step 5 of 6</b>\n\n' +
+    `🏷 Tier: <b>${tierDisp}</b>\n` +
+    `🔤 Format: <b>${fmtDisp}</b>\n` +
+    `⏳ Expiry: <b>${expDisp}</b>\n` +
+    `📦 Combo: <b>${comboDisp}</b>\n\n` +
+    '👥 <b>Max Redemptions:</b>\n\n' +
+    '<i>Pick a preset or type a custom number:</i>',
+    [
+      [
+        { text: '1',    callback_data: 'gk_usr:1' },
+        { text: '5',    callback_data: 'gk_usr:5' },
+        { text: '10',   callback_data: 'gk_usr:10' },
+      ],
+      [
+        { text: '50',   callback_data: 'gk_usr:50' },
+        { text: '100',  callback_data: 'gk_usr:100' },
+        { text: '∞',    callback_data: 'gk_usr:0' },
+      ],
+      [
+        { text: '❌ Cancel', callback_data: 'gk_cancel' },
+      ],
+    ]
+  );
+}
+
+function askGenkeyCount(token, chatId) {
+  const wiz = genkeyWizard[chatId] || {};
+  const tierDisp = wiz.tier === 'vip' ? '⭐ VIP' : '🆓 Free';
+  const fmtDisp = (wiz.format || 'uuid').toUpperCase();
+  const expDisp = wizExpiryDisp(wiz);
+  const comboDisp = wiz.combo_limit === 0 ? '∞ Unlimited' : `${(wiz.combo_limit || 1000).toLocaleString()} lines`;
+  const redeemsDisp = wiz.max_users === 0 ? '∞ Unlimited' : String(wiz.max_users || 1);
+  tgSendButtons(token, chatId,
+    '🔑 <b>Generate Key — Step 6 of 6</b>\n\n' +
+    `🏷 Tier: <b>${tierDisp}</b>\n` +
+    `🔤 Format: <b>${fmtDisp}</b>\n` +
+    `⏳ Expiry: <b>${expDisp}</b>\n` +
+    `📦 Combo: <b>${comboDisp}</b>\n` +
+    `👥 Redeems: <b>${redeemsDisp}</b>\n\n` +
+    '🔢 <b>How many keys to generate?</b>',
+    [
+      [
+        { text: '1 key',    callback_data: 'gk_cnt:1' },
+        { text: '5 keys',   callback_data: 'gk_cnt:5' },
+        { text: '10 keys',  callback_data: 'gk_cnt:10' },
+      ],
+      [
+        { text: '25 keys',  callback_data: 'gk_cnt:25' },
+        { text: '50 keys',  callback_data: 'gk_cnt:50' },
+        { text: '100 keys', callback_data: 'gk_cnt:100' },
+      ],
+      [
+        { text: '❌ Cancel', callback_data: 'gk_cancel' },
+      ],
+    ]
+  );
+}
+
+function finalizeGenKey(token, chatId) {
+  const wiz = genkeyWizard[chatId];
+  if (!wiz) return;
+
+  const tier = wiz.tier || 'free';
+  const keyFormat = wiz.format || 'uuid';
+  const expiryDays = wiz.expiry_days || 0;
+  const expirySeconds = wiz.expiry_seconds || 0;
+  const comboLimit = wiz.combo_limit || 0;
+  const maxRedemptions = wiz.max_users || 1;
+  const count = wiz.count || 1;
+  const label = wiz.label || '';
+
+  const now = Date.now() / 1000;
+  const duration = expirySeconds > 0 ? expirySeconds : (expiryDays > 0 ? expiryDays * 86400 : 0);
+  const expires = duration > 0 ? now + duration : now + 86400 * 36500;
+
+  (async () => {
+    const keys = loadKeys(false);
+    const newKeys = [];
+    const api = getKeySystemAPI();
+
+    // Try KeyVault API first
+    let apiKeys = [];
+    if (api && api.enabled) {
+      try {
+        apiKeys = await api.generateKey(
+          duration > 0 ? duration : 86400 * 365,
+          maxRedemptions,
+          comboLimit,
+          count,
+          tier,
+          keyFormat,
+          label,
+        );
+      } catch (e) {
+        console.warn(`[BOT] KeyVault API generate failed: ${e.message}`);
+      }
+    }
+
+    if (apiKeys && apiKeys.length) {
+      for (const apiKeyData of apiKeys) {
+        const k = apiKeyData.key || genLocalKey(keyFormat, tier);
+        keys[k] = {
+          expires:          expires,
+          combo_limit:      comboLimit,
+          max_users:        maxRedemptions,
+          used_by:          [],
+          created:          now,
+          api_id:           apiKeyData.id || '',
+          source:           'keyvault',
+          tier:             tier,
+          format:           keyFormat,
+          label:            label || apiKeyData.label || '',
+          redemption_count: 0,
+        };
+        newKeys.push(k);
+      }
+    } else {
+      for (let i = 0; i < count; i++) {
+        const k = genLocalKey(keyFormat, tier);
+        keys[k] = {
+          expires:          expires,
+          combo_limit:      comboLimit,
+          max_users:        maxRedemptions,
+          used_by:          [],
+          created:          now,
+          source:           'local',
+          tier:             tier,
+          format:           keyFormat,
+          label:            label,
+          redemption_count: 0,
+        };
+        newKeys.push(k);
+      }
+    }
+
+    saveKeys(keys);
+    delete genkeyWizard[chatId];
+
+    // Display fields matching KeyVault dashboard
+    const tierDisp = tier === 'vip' ? '⭐ VIP' : '🆓 Free';
+    const fmtDisp = keyFormat.toUpperCase();
+    const comboDisp = comboLimit === 0 ? '∞ Unlimited' : `${comboLimit.toLocaleString()} lines`;
+    const redeemsDisp = maxRedemptions === 0 ? '∞ Unlimited' : String(maxRedemptions);
+    const expDisp = duration === 0 ? 'Never' : durLabel(duration);
+    const expDt = duration === 0 ? 'Never' : new Date(expires * 1000).toISOString().slice(0, 16).replace('T', ' ');
+    const labelDisp = label || '(none)';
+
+    if (count === 1) {
+      tgSend(token, chatId,
+        '✅ <b>Key Generated Successfully!</b>\n\n' +
+        '━━━━━━━━━━━━━━━━━━━━━━━━━━\n' +
+        `🔑 <b>Key:</b>\n<code>${newKeys[0]}</code>\n\n` +
+        `🏷 <b>Tier:</b> ${tierDisp}\n` +
+        `🔤 <b>Format:</b> ${fmtDisp}\n` +
+        `📝 <b>Label:</b> ${labelDisp}\n` +
+        `⏳ <b>Expiry:</b> ${expDisp}\n` +
+        `📅 <b>Expires:</b> ${expDt}\n` +
+        `📦 <b>Combo Limit:</b> ${comboDisp}\n` +
+        `👥 <b>Max Redemptions:</b> ${redeemsDisp}\n` +
+        '━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n' +
+        `<i>Share this key — up to ${redeemsDisp} users can redeem it.</i>`
+      );
+    } else {
+      tgSend(token, chatId,
+        `✅ <b>${count} Keys Generated!</b>\n\n` +
+        '━━━━━━━━━━━━━━━━━━━━━━━━━━\n' +
+        `🏷 <b>Tier:</b> ${tierDisp}\n` +
+        `🔤 <b>Format:</b> ${fmtDisp}\n` +
+        `⏳ <b>Expiry:</b> ${expDisp}\n` +
+        `📅 <b>Expires:</b> ${expDt}\n` +
+        `📦 <b>Combo Limit:</b> ${comboDisp}\n` +
+        `👥 <b>Max Redemptions:</b> ${redeemsDisp}\n` +
+        `🔢 <b>Total keys:</b> ${count}\n` +
+        '━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n' +
+        '<i>Keys attached below as .txt file.</i>'
+      );
+      // Send as file attachment
+      try {
+        const txtContent = newKeys.join('\n') + '\n';
+        const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
+        const fname = `keys_${count}_${ts}.txt`;
+        tgSendDocument(token, chatId, fname, Buffer.from(txtContent, 'utf-8'),
+          `🔑 <b>${count} keys</b> · ${tierDisp} · ${expDisp} · ${comboDisp} · ${redeemsDisp} redeems`
+        );
+      } catch (e) {
+        // Fallback: send keys in chunks
+        console.warn(`[BOT] Key file send failed: ${e.message}`);
+        for (let i = 0; i < newKeys.length; i += 20) {
+          const chunk = newKeys.slice(i, i + 20);
+          tgSend(token, chatId,
+            `🔑 <b>Keys ${i + 1}–${i + chunk.length}:</b>\n\n` +
+            chunk.map(k => `<code>${k}</code>`).join('\n'));
+        }
+      }
+    }
+  })();
 }
 
 // ── Handle /keysystem command ──────────────────────────────────────────
@@ -1173,22 +1721,17 @@ async function handleCallbackQuery(token, cq) {
   // ── Admin panel buttons ─────────────────────────────────────────────
   if (data === 'admin:genkey') {
     if (!isOwner(fromUser)) return;
-    genkeyWizard[chatId] = { step: 'AWAIT_DURATION' };
+    genkeyWizard[chatId] = { step: 'AWAIT_TIER' };
     tgSendButtons(token, chatId,
-      '🔑 <b>Generate Key — Step 1 of 4</b>\n\n⏳ How long should the key be valid?\n\n<i>Tap a button or type a custom duration</i>',
+      '🔑 <b>Generate Key — Step 1 of 6</b>\n\n' +
+      '🏷 <b>Select Tier:</b>\n\n' +
+      '<i>Free = basic access  |  VIP = premium access + more threads</i>',
       [
         [
-          { text: '1 Hour',   callback_data: 'gk_dur:3600' },
-          { text: '6 Hours',  callback_data: 'gk_dur:21600' },
-          { text: '12 Hours', callback_data: 'gk_dur:43200' },
+          { text: '🆓 Free',  callback_data: 'gk_tier:free' },
+          { text: '⭐ VIP',   callback_data: 'gk_tier:vip' },
         ],
         [
-          { text: '1 Day',    callback_data: 'gk_dur:86400' },
-          { text: '3 Days',   callback_data: 'gk_dur:259200' },
-          { text: '7 Days',   callback_data: 'gk_dur:604800' },
-        ],
-        [
-          { text: '30 Days',  callback_data: 'gk_dur:2592000' },
           { text: '❌ Cancel', callback_data: 'gk_cancel' },
         ],
       ]
@@ -1301,15 +1844,21 @@ async function handleCallbackQuery(token, cq) {
     }
     const keys = loadKeys();
     const deleted = [];
-    for (const k of sel) {
-      if (keys[k]) { deleted.push(k); delete keys[k]; }
-    }
-    saveKeys(keys);
-    tgEditMessage(token, chatId, message.message_id,
-      `🗑 <b>Deleted ${deleted.length} key(s)</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-      deleted.map(k => `  🔑 <code>${k}</code>`).join('\n') +
-      `\n\n📊 <b>Remaining keys: ${Object.keys(keys).length}</b>`, []);
-    delete deleteKeySelection[chatId];
+    (async () => {
+      for (const k of sel) {
+        if (keys[k]) {
+          await deleteKeyFromApi(keys[k]);
+          deleted.push(k);
+          delete keys[k];
+        }
+      }
+      saveKeys(keys);
+      tgEditMessage(token, chatId, message.message_id,
+        `🗑 <b>Deleted ${deleted.length} key(s)</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        deleted.map(k => `  🔑 <code>${k}</code>`).join('\n') +
+        `\n\n📋 <b>Remaining keys: ${Object.keys(keys).length}</b>`, []);
+      delete deleteKeySelection[chatId];
+    })();
     return;
   }
 
@@ -1324,40 +1873,95 @@ async function handleCallbackQuery(token, cq) {
   if (data === 'dk_noop') return;
 
   // ── Genkey wizard ────────────────────────────────────────────────────
-  if (data.startsWith('gk_dur:')) {
+  // ── Genkey wizard: Tier (Step 1) ──
+  if (data.startsWith('gk_tier:')) {
     if (!isOwner(fromUser)) return;
-    const duration = parseInt(data.split(':')[1]);
-    genkeyWizard[chatId] = { step: 'AWAIT_USERS', duration };
-    askGenkeyUsers(token, chatId, duration);
+    const tier = data.split(':')[1];
+    genkeyWizard[chatId] = { step: 'AWAIT_FORMAT', tier };
+    askGenkeyFormat(token, chatId);
     return;
   }
 
-  if (data.startsWith('gk_usr:')) {
+  // ── Genkey wizard: Format (Step 2) ──
+  if (data.startsWith('gk_fmt:')) {
     if (!isOwner(fromUser)) return;
     const wiz = genkeyWizard[chatId];
-    if (!wiz || wiz.step !== 'AWAIT_USERS') {
+    if (!wiz || wiz.step !== 'AWAIT_FORMAT') {
       tgSend(token, chatId, '⚠️ Session expired. Use /generate_key again.');
       return;
     }
-    wiz.max_users = parseInt(data.split(':')[1]);
-    wiz.step = 'AWAIT_LIMIT';
-    askGenkeyLimit(token, chatId, wiz.duration, wiz.max_users);
+    wiz.format = data.split(':')[1];
+    wiz.step = 'AWAIT_EXPIRY';
+    askGenkeyExpiry(token, chatId);
     return;
   }
 
+  // ── Genkey wizard: Expiry hours (Step 3 — sub-day) ──
+  if (data.startsWith('gk_exp_h:')) {
+    if (!isOwner(fromUser)) return;
+    const wiz = genkeyWizard[chatId];
+    if (!wiz || wiz.step !== 'AWAIT_EXPIRY') {
+      tgSend(token, chatId, '⚠️ Session expired. Use /generate_key again.');
+      return;
+    }
+    const hours = parseInt(data.split(':')[1]);
+    wiz.expiry_seconds = hours * 3600;
+    wiz.expiry_days = 0;
+    wiz.step = 'AWAIT_COMBO';
+    askGenkeyCombo(token, chatId);
+    return;
+  }
+
+  // ── Genkey wizard: Expiry days (Step 3 — day-based) ──
+  if (data.startsWith('gk_exp:')) {
+    if (!isOwner(fromUser)) return;
+    const wiz = genkeyWizard[chatId];
+    if (!wiz || wiz.step !== 'AWAIT_EXPIRY') {
+      tgSend(token, chatId, '⚠️ Session expired. Use /generate_key again.');
+      return;
+    }
+    const days = parseInt(data.split(':')[1]);
+    if (days === 0) {
+      wiz.expiry_days = 0;
+      wiz.expiry_seconds = 0;
+    } else {
+      wiz.expiry_days = days;
+      wiz.expiry_seconds = 0;
+    }
+    wiz.step = 'AWAIT_COMBO';
+    askGenkeyCombo(token, chatId);
+    return;
+  }
+
+  // ── Genkey wizard: Combo Limit (Step 4) ──
   if (data.startsWith('gk_lim:')) {
     if (!isOwner(fromUser)) return;
     const wiz = genkeyWizard[chatId];
-    if (!wiz || wiz.step !== 'AWAIT_LIMIT') {
+    if (!wiz || wiz.step !== 'AWAIT_COMBO') {
       tgSend(token, chatId, '⚠️ Session expired. Use /generate_key again.');
       return;
     }
     wiz.combo_limit = parseInt(data.split(':')[1]);
-    wiz.step = 'AWAIT_COUNT';
-    askGenkeyCount(token, chatId, wiz.duration, wiz.max_users, wiz.combo_limit);
+    wiz.step = 'AWAIT_REDEEMS';
+    askGenkeyRedeems(token, chatId);
     return;
   }
 
+  // ── Genkey wizard: Max Redemptions (Step 5) ──
+  if (data.startsWith('gk_usr:')) {
+    if (!isOwner(fromUser)) return;
+    const wiz = genkeyWizard[chatId];
+    if (!wiz || wiz.step !== 'AWAIT_REDEEMS') {
+      tgSend(token, chatId, '⚠️ Session expired. Use /generate_key again.');
+      return;
+    }
+    wiz.max_users = parseInt(data.split(':')[1]);
+    wiz.step = 'AWAIT_COUNT';
+    askGenkeyCount(token, chatId);
+    return;
+  }
+
+  // ── Genkey wizard: Count (Step 6) ──
   if (data.startsWith('gk_cnt:')) {
     if (!isOwner(fromUser)) return;
     const wiz = genkeyWizard[chatId];
@@ -1365,8 +1969,8 @@ async function handleCallbackQuery(token, cq) {
       tgSend(token, chatId, '⚠️ Session expired. Use /generate_key again.');
       return;
     }
-    const count = parseInt(data.split(':')[1]);
-    finalizeGenKey(token, chatId, wiz.duration, wiz.combo_limit, count, wiz.max_users);
+    wiz.count = parseInt(data.split(':')[1]);
+    finalizeGenKey(token, chatId);
     return;
   }
 
@@ -1570,49 +2174,55 @@ async function handleBotUpdate(token, update) {
       console.log(`[BOT] 📩 cmd=${cmd} args=${cmdArgs} from=${fromUser.id} chat=${chatId}`);
     }
 
-    // ── Intercept text replies for genkey wizard ──────────────────────
+    // ── Intercept text replies for genkey wizard ────────────────────────────
     if (isOwner(fromUser) && genkeyWizard[chatId]) {
       const wiz = genkeyWizard[chatId];
-      if (wiz.step === 'AWAIT_DURATION' && text && !text.startsWith('/')) {
+      // Step 3: Custom expiry input
+      if (wiz.step === 'AWAIT_EXPIRY' && text && !text.startsWith('/')) {
         const dur = parseDuration(text);
         if (dur > 0) {
-          wiz.step = 'AWAIT_USERS';
-          wiz.duration = dur;
-          askGenkeyUsers(token, chatId, dur);
+          wiz.expiry_seconds = dur;
+          wiz.expiry_days = 0;
+          wiz.step = 'AWAIT_COMBO';
+          askGenkeyCombo(token, chatId);
         } else {
-          tgSend(token, chatId, '❌ Invalid format. Try: <code>1d</code>  <code>12hrs</code>  <code>45min</code>');
+          tgSend(token, chatId, '❌ Invalid format. Try: <code>1d</code>  <code>12h</code>  <code>3mo</code>');
         }
         return;
       }
-      if (wiz.step === 'AWAIT_USERS' && text && !text.startsWith('/')) {
+      // Step 4: Custom combo limit
+      if (wiz.step === 'AWAIT_COMBO' && text && !text.startsWith('/')) {
+        const limit = parseInt(text.trim());
+        if (isNaN(limit) || limit < 0) {
+          tgSend(token, chatId, '❌ Enter a number (e.g. <code>1000</code>) or <code>0</code> for unlimited.');
+          return;
+        }
+        wiz.combo_limit = limit;
+        wiz.step = 'AWAIT_REDEEMS';
+        askGenkeyRedeems(token, chatId);
+        return;
+      }
+      // Step 5: Custom max redemptions
+      if (wiz.step === 'AWAIT_REDEEMS' && text && !text.startsWith('/')) {
         const maxUsers = parseInt(text.trim());
         if (isNaN(maxUsers) || maxUsers < 0) {
           tgSend(token, chatId, '❌ Enter a number (e.g. <code>10</code>) or <code>0</code> for unlimited.');
           return;
         }
-        wiz.step = 'AWAIT_LIMIT';
         wiz.max_users = maxUsers;
-        askGenkeyLimit(token, chatId, wiz.duration, maxUsers);
-        return;
-      }
-      if (wiz.step === 'AWAIT_LIMIT' && text && !text.startsWith('/')) {
-        const limit = parseInt(text.trim());
-        if (isNaN(limit) || limit < 0) {
-          tgSend(token, chatId, '❌ Please enter a valid number (e.g. <code>1000</code>) or <code>0</code> for unlimited.');
-          return;
-        }
         wiz.step = 'AWAIT_COUNT';
-        wiz.combo_limit = limit;
-        askGenkeyCount(token, chatId, wiz.duration, wiz.max_users, limit);
+        askGenkeyCount(token, chatId);
         return;
       }
+      // Step 6: Custom count
       if (wiz.step === 'AWAIT_COUNT' && text && !text.startsWith('/')) {
         const count = parseInt(text.trim());
         if (isNaN(count) || count < 1 || count > 500) {
           tgSend(token, chatId, '❌ Enter a number between <code>1</code> and <code>500</code>.');
           return;
         }
-        finalizeGenKey(token, chatId, wiz.duration, wiz.combo_limit, count, wiz.max_users);
+        wiz.count = count;
+        finalizeGenKey(token, chatId);
         return;
       }
     }
@@ -1635,22 +2245,17 @@ async function handleBotUpdate(token, update) {
         tgSend(token, chatId, '🚫 <b>Owner only command.</b>');
         return;
       }
-      genkeyWizard[chatId] = { step: 'AWAIT_DURATION' };
+      genkeyWizard[chatId] = { step: 'AWAIT_TIER' };
       tgSendButtons(token, chatId,
-        '🔑 <b>Generate Key — Step 1 of 4</b>\n\n⏳ How long should the key be valid?\n\n<i>Tap a button or type a custom duration</i>',
+        '🔑 <b>Generate Key — Step 1 of 6</b>\n\n' +
+        '🏷 <b>Select Tier:</b>\n\n' +
+        '<i>Free = basic access  |  VIP = premium access + more threads</i>',
         [
           [
-            { text: '1 Hour',   callback_data: 'gk_dur:3600' },
-            { text: '6 Hours',  callback_data: 'gk_dur:21600' },
-            { text: '12 Hours', callback_data: 'gk_dur:43200' },
+            { text: '🆓 Free',  callback_data: 'gk_tier:free' },
+            { text: '⭐ VIP',   callback_data: 'gk_tier:vip' },
           ],
           [
-            { text: '1 Day',    callback_data: 'gk_dur:86400' },
-            { text: '3 Days',   callback_data: 'gk_dur:259200' },
-            { text: '7 Days',   callback_data: 'gk_dur:604800' },
-          ],
-          [
-            { text: '30 Days',  callback_data: 'gk_dur:2592000' },
             { text: '❌ Cancel', callback_data: 'gk_cancel' },
           ],
         ]
