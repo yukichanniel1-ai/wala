@@ -31,52 +31,86 @@ function saveKeys(keys) {
 }
 
 function genKey() {
-  return require('crypto').randomBytes(16).toString('hex');
+  // Match Python: uuid.uuid4().hex[:20].upper()
+  return require('crypto').randomUUID().replace(/-/g, '').slice(0, 20).toUpperCase();
 }
 
-// ── Parse duration string (e.g., "1d", "12hrs", "45min", "30days") ──────
+/**
+ * Generate a local key matching KeyVault format options.
+ * Mirrors Python _gen_local_key(key_format, tier).
+ */
+function genLocalKey(keyFormat = 'default', tier = 'free') {
+  const crypto = require('crypto');
+  const ALPHANUM = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+
+  if (keyFormat === 'uuid') {
+    return crypto.randomUUID();
+  } else if (keyFormat === 'hex') {
+    return Array.from(crypto.randomBytes(32))
+      .map(b => (b % 16).toString(16))
+      .join('');
+  } else if (keyFormat === 'alphanum') {
+    const chars = ALPHANUM;
+    return Array.from(crypto.randomBytes(24))
+      .map(b => chars[b % chars.length])
+      .join('');
+  } else if (keyFormat === 'prefix') {
+    const chars = ALPHANUM;
+    const pfx = tier === 'vip' ? 'vip' : 'free';
+    const part1 = Array.from(crypto.randomBytes(8)).map(b => chars[b % chars.length]).join('');
+    const part2 = Array.from(crypto.randomBytes(8)).map(b => chars[b % chars.length]).join('');
+    return `${pfx}_${part1}_${part2}`;
+  } else {
+    // Default: same as genKey() — uuid4 hex[:20].upper()
+    return genKey();
+  }
+}
+
+// ── Parse duration string (e.g., "1d", "12hrs", "45min", "2w", "3mo", "1d12h30m") ────
 function parseDuration(str) {
   if (!str) return 0;
   str = str.trim().toLowerCase();
 
-  const match = str.match(/^(\d+)\s*(d|day|days|h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds|w|week|weeks)$/);
-  if (!match) {
-    const num = parseInt(str);
-    return isNaN(num) ? 0 : num;
+  // Multi-unit parsing (matches Python's re.finditer approach)
+  // Supports: mo(nths?), w(eeks?), d(ays?), h(rs?), min(s?)
+  let total = 0;
+  const re = /(\d+)\s*(mo(?:n(?:th)?s?)?|w(?:ee)?k?s?|d(?:ay)?s?|hr?s?|min?s?)/g;
+  let m;
+  while ((m = re.exec(str)) !== null) {
+    const val = parseInt(m[1]);
+    const unit = m[2];
+    if (unit.startsWith('mo'))      total += val * 86400 * 30;
+    else if (unit.startsWith('w'))   total += val * 86400 * 7;
+    else if (unit.startsWith('d'))   total += val * 86400;
+    else if (unit.startsWith('h'))   total += val * 3600;
+    else if (unit.startsWith('min')) total += val * 60;
   }
+  if (total > 0) return total;
 
-  const val = parseInt(match[1]);
-  const unit = match[2];
+  // Try plain number as days (matches Python fallback)
+  const numMatch = str.match(/^(\d+)$/);
+  if (numMatch) return parseInt(numMatch[1]) * 86400;
 
-  if (unit.startsWith('d')) return val * 86400;
-  if (unit.startsWith('h')) return val * 3600;
-  if (unit.startsWith('m')) return val * 60;
-  if (unit.startsWith('s')) return val;
-  if (unit.startsWith('w')) return val * 604800;
   return 0;
 }
 
 // ── Duration label ──────────────────────────────────────────────────────
 function durLabel(seconds) {
-  if (seconds >= 86400) {
-    const d = Math.floor(seconds / 86400);
-    return d === 1 ? '1 Day' : `${d} Days`;
-  }
-  if (seconds >= 3600) {
-    const h = Math.floor(seconds / 3600);
-    return h === 1 ? '1 Hour' : `${h} Hours`;
-  }
-  if (seconds >= 60) {
-    const m = Math.floor(seconds / 60);
-    return m === 1 ? '1 Minute' : `${m} Minutes`;
-  }
-  return `${seconds} Seconds`;
+  // Match Python: composite "1d 1h 1m" format
+  const days = Math.floor(seconds / 86400);
+  const hrs  = Math.floor((seconds % 86400) / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  const parts = [];
+  if (days) parts.push(`${days}d`);
+  if (hrs)  parts.push(`${hrs}h`);
+  if (mins) parts.push(`${mins}m`);
+  return parts.length > 0 ? parts.join(' ') : '0m';
 }
 
 // ── Create a key (local) ───────────────────────────────────────────────
-function createKey(duration, comboLimit, maxUsers = 0) {
+function createKey(duration, comboLimit, maxUsers = 0, keyFormat = 'default', tier = 'free') {
   const keys = loadKeys();
-  const key = genKey();
+  const key = genLocalKey(keyFormat, tier);
   keys[key] = {
     duration: duration,
     expires: Date.now() / 1000 + duration,
@@ -84,6 +118,8 @@ function createKey(duration, comboLimit, maxUsers = 0) {
     max_users: maxUsers,
     used_by: [],
     created_at: Date.now() / 1000,
+    tier: tier || 'free',
+    key_format: keyFormat || 'default',
   };
   saveKeys(keys);
   return key;
@@ -383,6 +419,7 @@ module.exports = {
   loadKeys,
   saveKeys,
   genKey,
+  genLocalKey,
   parseDuration,
   durLabel,
   createKey,
