@@ -16,7 +16,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock, Event
 from Crypto.Cipher import AES
-from numpy import rint
+# numpy removed — was unused and caused OOM on Railway (numpy ~50MB RAM)
 import requests
 import cloudscraper
 import colorama
@@ -967,16 +967,43 @@ def _fetch_raw_proxies():
                 total_dupes += dupes
                 total_new += source_new
 
-            # ── Full rewrite: replace the entire file with fresh proxies ──
-            # This ensures dead/stale proxies from previous cycles are removed.
-            if all_normalized:
+            # ── Merge new proxies with existing ones in the save file ──
+            # Reads existing proxies from the file, merges with freshly fetched ones,
+            # then writes the combined set back. This prevents losing proxies when the
+            # API returns a partial/empty response, while still allowing dead proxies
+            # (removed by remove_blocked_proxy) to stay gone.
+            if all_normalized or os.path.exists(RAW_PROXY_SAVE_FILE):
                 try:
                     os.makedirs(PROXY_FOLDER, exist_ok=True)
+                    # Load existing proxies from the save file
+                    existing_proxies = set()
+                    existing_order = []  # preserve insertion order
+                    if os.path.exists(RAW_PROXY_SAVE_FILE):
+                        try:
+                            with open(RAW_PROXY_SAVE_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                                for line in f:
+                                    line = line.strip()
+                                    if line and not line.startswith("#"):
+                                        existing_proxies.add(line)
+                                        existing_order.append(line)
+                        except OSError:
+                            pass
+
+                    # Merge: new proxies are added; existing ones are kept
+                    merged = list(existing_order)  # start with existing
+                    new_added = 0
+                    for p in all_normalized:
+                        if p not in existing_proxies:
+                            existing_proxies.add(p)
+                            merged.append(p)
+                            new_added += 1
+
+                    # Write the merged set back
                     with open(RAW_PROXY_SAVE_FILE, "w", encoding="utf-8") as f:
                         f.write("# Auto-fetched proxies — do not edit manually\n")
-                        for p in all_normalized:
+                        for p in merged:
                             f.write(p + "\n")
-                    log.info(f"[RAW-PROXY] Full rewrite: {len(all_normalized)} proxies written to {RAW_PROXY_SAVE_FILE}")
+                    log.info(f"[RAW-PROXY] Merged: {len(merged)} total proxies in {RAW_PROXY_SAVE_FILE} (+{new_added} new)")
                 except OSError as e:
                     log.error(f"[RAW-PROXY] Failed to write {RAW_PROXY_SAVE_FILE}: {e}")
 
@@ -3943,7 +3970,13 @@ _active_sessions_lock = threading.Lock()
 def _save_active_session(chat_id, file_path: str, file_name: str, lines: list,
                          user_data: dict, progress: int = 0):
     """Persist an active checking session to disk for crash recovery.
-    Also saves a copy of the combo file to saved_combos/ so it survives restarts."""
+    Also saves a copy of the combo file to saved_combos/ so it survives restarts.
+    
+    The 'lines' parameter should contain the REMAINING lines to check.
+    'progress' is the number of lines already processed from the original file.
+    On resume, the bot reads the persistent combo file and skips 'progress' lines
+    to continue from where it left off.
+    """
     # ── Save combo file to persistent directory ──
     os.makedirs(SAVED_COMBOS_DIR, exist_ok=True)
     persistent_path = os.path.join(SAVED_COMBOS_DIR, f"{chat_id}_{file_name}")
@@ -3973,12 +4006,33 @@ def _save_active_session(chat_id, file_path: str, file_name: str, lines: list,
 
 
 def _update_session_progress(chat_id, progress: int):
-    """Update the progress counter for an active session."""
+    """Update the progress counter for an active session.
+    Also trims the persistent combo file by removing already-processed lines.
+    This ensures that on crash/restart, the file only contains remaining lines,
+    so resume never re-checks already-processed accounts."""
     with _active_sessions_lock:
         key = str(chat_id)
         if key in _active_sessions:
             _active_sessions[key]["progress"] = progress
             _flush_active_sessions()
+            # ── Trim persistent combo file: remove processed lines ──
+            # This is the KEY fix — by trimming the file as we go,
+            # on restart the bot only sees remaining lines.
+            persistent_path = _active_sessions[key].get("persistent_path", "")
+            if persistent_path and os.path.exists(persistent_path):
+                try:
+                    with open(persistent_path, "r", encoding="utf-8", errors="ignore") as fh:
+                        all_lines = [l.strip() for l in fh if l.strip() and ":" in l]
+                    remaining = all_lines[progress:]
+                    if len(remaining) < len(all_lines):
+                        with open(persistent_path, "w", encoding="utf-8") as fh:
+                            fh.write("\n".join(remaining) + "\n")
+                        # Update total_lines to reflect remaining
+                        _active_sessions[key]["total_lines"] = len(remaining)
+                        _active_sessions[key]["progress"] = 0  # reset since file is now trimmed
+                        _flush_active_sessions()
+                except Exception as e:
+                    logger.debug(f"[BOT] Could not trim persistent combo for {chat_id}: {e}")
 
 
 def _remove_active_session(chat_id, delete_combo=True):
@@ -5117,8 +5171,8 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
                 speed   = int(done_count[0] / elapsed)
                 _active_bars[bar_key]["done"]  = done_count[0]
                 _active_bars[bar_key]["speed"] = speed
-        # Persist progress every 50 accounts for crash recovery
-        if chat_id and done_count[0] % 50 == 0:
+        # Persist progress every 10 accounts for crash recovery
+        if chat_id and done_count[0] % 10 == 0:
             _update_session_progress(chat_id, done_count[0])
 
     # ════════════════════════════════════════════════════════════════
@@ -5423,12 +5477,41 @@ _proxy_paused_lock = threading.Lock()
 
 def _register_proxy_paused(chat_id, combo_path: str, file_name: str, lines: list, user_data: dict):
     """Register a user whose check is paused because no proxies are available.
-    Their combo file and progress will be saved so it can auto-resume later."""
+    Their combo file and progress will be saved so it can auto-resume later.
+    
+    If the user already has an active session with progress (e.g. mid-check
+    when proxies ran out), that progress is carried over so we don't re-check
+    already-processed accounts."""
+    # ── Carry over progress from existing active session if present ──
+    existing_progress = 0
+    existing_persistent_path = ""
+    with _active_sessions_lock:
+        key = str(chat_id)
+        if key in _active_sessions:
+            existing_progress = _active_sessions[key].get("progress", 0)
+            existing_persistent_path = _active_sessions[key].get("persistent_path", "")
+    
+    # Also check if user was already proxy-paused (carry over that progress)
+    with _proxy_paused_lock:
+        if str(chat_id) in _proxy_paused_users:
+            prev = _proxy_paused_users[str(chat_id)]
+            if prev.get("progress", 0) > existing_progress:
+                existing_progress = prev["progress"]
+            if not existing_persistent_path and prev.get("persistent_path"):
+                existing_persistent_path = prev["persistent_path"]
+    
     os.makedirs(SAVED_COMBOS_DIR, exist_ok=True)
     persistent_path = os.path.join(SAVED_COMBOS_DIR, f"paused_{chat_id}_{file_name}")
+    
+    # If we have existing progress, trim the lines to only include remaining ones
+    remaining_lines = lines
+    if existing_progress > 0 and existing_progress < len(lines):
+        remaining_lines = lines[existing_progress:]
+        logger.info(f"[BOT] Proxy-paused user {chat_id}: trimming {existing_progress} already-processed lines, {len(remaining_lines)} remaining")
+    
     try:
         with open(persistent_path, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(lines) + "\n")
+            fh.write("\n".join(remaining_lines) + "\n")
     except Exception as e:
         logger.warning(f"[BOT] Could not save paused combo for {chat_id}: {e}")
         persistent_path = combo_path
@@ -5439,8 +5522,8 @@ def _register_proxy_paused(chat_id, combo_path: str, file_name: str, lines: list
             "combo_path": combo_path,
             "persistent_path": persistent_path,
             "file_name": file_name,
-            "total_lines": len(lines),
-            "progress": 0,
+            "total_lines": len(remaining_lines),
+            "progress": 0,  # Reset to 0 because we already trimmed the file
             "level": user_data.get("level", [1]),
             "clean_filter": user_data.get("clean_filter", "both"),
             "hits_id": user_data.get("hits_id", chat_id),
@@ -5448,7 +5531,7 @@ def _register_proxy_paused(chat_id, combo_path: str, file_name: str, lines: list
             "combo_limit": user_data.get("combo_limit", COMBO_LINE_LIMIT),
             "paused_at": time.time(),
         }
-    logger.info(f"[BOT] Registered proxy-paused user: chat_id={chat_id}, file={file_name}")
+    logger.info(f"[BOT] Registered proxy-paused user: chat_id={chat_id}, file={file_name}, lines={len(remaining_lines)}")
 
 
 def _unregister_proxy_paused(chat_id):
@@ -5467,7 +5550,11 @@ def _unregister_proxy_paused(chat_id):
 
 def _resume_proxy_paused_users(token: str):
     """Called when proxies become available after being empty.
-    Auto-resumes all users who were paused due to no proxy."""
+    Auto-resumes all users who were paused due to no proxy.
+    
+    Key fix: The persistent combo file is trimmed by _update_session_progress,
+    so we read ALL lines from it (they're already the remaining lines).
+    """
     with _proxy_paused_lock:
         paused = dict(_proxy_paused_users)  # copy
         _proxy_paused_users.clear()
@@ -5496,7 +5583,7 @@ def _resume_proxy_paused_users(token: str):
                 "But your combo file was lost. Please re-upload it.")
             continue
 
-        # Read lines from the combo file
+        # Read lines from the combo file — the file already contains only remaining lines
         all_lines = []
         for enc in ["utf-8", "latin-1", "cp1252", "iso-8859-1"]:
             try:
@@ -5512,9 +5599,10 @@ def _resume_proxy_paused_users(token: str):
                 "But your combo file is empty. Please re-upload it.")
             continue
 
+        # The persistent file is already trimmed, so remaining_lines = all_lines
+        remaining_lines = all_lines
         progress = sess.get("progress", 0)
-        total = sess.get("total_lines", len(all_lines))
-        remaining_lines = all_lines[progress:]
+        total = sess.get("total_lines", len(remaining_lines))
 
         if not remaining_lines:
             _tg_send(token, chat_id,
@@ -5548,8 +5636,7 @@ def _resume_proxy_paused_users(token: str):
         _tg_send(token, chat_id,
             f"✅ <b>Proxies are back — Auto-Resuming!</b>\n\n"
             f"📄 <b>File:</b> <code>{file_name}</code>\n"
-            f"📊 <b>Progress:</b> {progress}/{total} done\n"
-            f"▶️ <b>Remaining:</b> {len(remaining_lines)} accounts\n\n"
+            f"📊 <b>Already done:</b> {progress} | <b>Remaining:</b> {len(remaining_lines)} accounts\n\n"
             f"<i>Resuming now... Send /stop to cancel.</i>")
 
         # Start checker thread
@@ -9486,7 +9573,13 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
 # ── Auto-resume interrupted sessions on startup ───────────────
 def _auto_resume_sessions(token: str):
     """Check for interrupted sessions from a crash/restart and resume them.
-    Uses persistent combo files from saved_combos/ directory."""
+    Uses persistent combo files from saved_combos/ directory.
+    
+    Key fix: The persistent combo file is trimmed as progress is made
+    (by _update_session_progress), so on resume it only contains remaining
+    lines. We read the file directly — no need to slice by progress offset
+    since the file is already trimmed to only unprocessed lines.
+    """
     sessions = _load_active_sessions()
     if not sessions:
         return
@@ -9523,6 +9616,8 @@ def _auto_resume_sessions(token: str):
             continue
 
         # Read remaining lines from the combo file
+        # The persistent file is already trimmed by _update_session_progress,
+        # so it only contains unprocessed lines. Read ALL of them.
         all_lines = []
         for enc in ["utf-8", "latin-1", "cp1252", "iso-8859-1"]:
             try:
@@ -9540,15 +9635,18 @@ def _auto_resume_sessions(token: str):
             _remove_active_session(chat_id)
             continue
 
-        # Skip already-processed lines
-        remaining_lines = all_lines[progress:]
+        # The file is already trimmed, so remaining_lines = all_lines
+        remaining_lines = all_lines
         if not remaining_lines:
             _tg_send(token, chat_id,
                 f"✅ <b>Bot restarted!</b>\n\n"
-                f"Your previous check (<code>{file_name}</code>) was already complete ({progress}/{total}).\n\n"
+                f"Your previous check (<code>{file_name}</code>) was already complete.\n\n"
                 f"📂 Send a new combo file to start again.")
             _remove_active_session(chat_id)
             continue
+
+        # Calculate original total for display (progress already done + remaining)
+        original_total = progress + len(remaining_lines)
 
         # Restore user data
         d = _udata(chat_id)
@@ -9570,8 +9668,7 @@ def _auto_resume_sessions(token: str):
             f"🔄 <b>Auto-Resuming!</b>\n\n"
             f"Bot restarted — resuming your check automatically.\n\n"
             f"📄 <b>File:</b> <code>{file_name}</code>\n"
-            f"📊 <b>Progress:</b> {progress}/{total} done\n"
-            f"▶️ <b>Remaining:</b> {len(remaining_lines)} accounts\n\n"
+            f"📊 <b>Already done:</b> {progress} | <b>Remaining:</b> {len(remaining_lines)} accounts\n\n"
             f"<i>Resuming now... Send /stop to cancel.</i>")
 
         # Start checker thread for remaining lines
