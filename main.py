@@ -54,6 +54,7 @@ CY  = Fore.CYAN
 
 # Global shutdown event for Ctrl+C handling
 shutdown_event = Event()
+_shutting_down = False  # Set to True when bot is intentionally shutting down
 
 
 # ── Liveness tracking — updated by key operations, checked by watchdog ──
@@ -3958,6 +3959,7 @@ except Exception as _users_err:
 
 # ── Active session persistence for auto-resume on crash ────────
 _active_sessions: dict = {}  # chat_id -> session info dict
+_resume_notify_ts: dict = {}  # chat_id -> last auto-resume notification timestamp (cooldown)
 _active_sessions_lock = threading.Lock()
 
 
@@ -9601,11 +9603,15 @@ def _auto_resume_sessions(token: str):
 
         if not combo_path:
             logger.warning(f"[BOT] Resume skip: file gone for chat {chat_id}")
-            _tg_send(token, chat_id,
-                f"⚠️ <b>Bot restarted!</b>\n\n"
-                f"Your previous check (<code>{file_name}</code>) could not resume — "
-                f"the file was lost during restart.\n\n"
-                f"📂 Please re-upload your combo file to continue.")
+            # Only notify user if we haven't notified them recently (cooldown 5 min)
+            _last_notify = _resume_notify_ts.get(str(chat_id), 0)
+            if time.time() - _last_notify > 300:
+                _tg_send(token, chat_id,
+                    f"⚠️ <b>Bot restarted!</b>\n\n"
+                    f"Your previous check (<code>{file_name}</code>) could not resume — "
+                    f"the file was lost during restart.\n\n"
+                    f"📂 Please re-upload your combo file to continue.")
+                _resume_notify_ts[str(chat_id)] = time.time()
             _remove_active_session(chat_id)
             continue
 
@@ -9622,20 +9628,26 @@ def _auto_resume_sessions(token: str):
                 continue
 
         if not all_lines:
-            _tg_send(token, chat_id,
-                f"⚠️ <b>Bot restarted!</b>\n\n"
-                f"Could not resume <code>{file_name}</code> — file is empty or unreadable.\n\n"
-                f"📂 Please re-upload your combo file.")
+            _last_notify = _resume_notify_ts.get(str(chat_id), 0)
+            if time.time() - _last_notify > 300:
+                _tg_send(token, chat_id,
+                    f"⚠️ <b>Bot restarted!</b>\n\n"
+                    f"Could not resume <code>{file_name}</code> — file is empty or unreadable.\n\n"
+                    f"📂 Please re-upload your combo file.")
+                _resume_notify_ts[str(chat_id)] = time.time()
             _remove_active_session(chat_id)
             continue
 
         # The file is already trimmed, so remaining_lines = all_lines
         remaining_lines = all_lines
         if not remaining_lines:
-            _tg_send(token, chat_id,
-                f"✅ <b>Bot restarted!</b>\n\n"
-                f"Your previous check (<code>{file_name}</code>) was already complete.\n\n"
-                f"📂 Send a new combo file to start again.")
+            _last_notify = _resume_notify_ts.get(str(chat_id), 0)
+            if time.time() - _last_notify > 300:
+                _tg_send(token, chat_id,
+                    f"✅ <b>Bot restarted!</b>\n\n"
+                    f"Your previous check (<code>{file_name}</code>) was already complete.\n\n"
+                    f"📂 Send a new combo file to start again.")
+                _resume_notify_ts[str(chat_id)] = time.time()
             _remove_active_session(chat_id)
             continue
 
@@ -9657,13 +9669,16 @@ def _auto_resume_sessions(token: str):
         with open(resume_path, "w", encoding="utf-8") as fh:
             fh.write("\n".join(remaining_lines) + "\n")
 
-        # Notify user
-        _tg_send(token, chat_id,
-            f"🔄 <b>Auto-Resuming!</b>\n\n"
-            f"Bot restarted — resuming your check automatically.\n\n"
-            f"📄 <b>File:</b> <code>{file_name}</code>\n"
-            f"📊 <b>Already done:</b> {progress} | <b>Remaining:</b> {len(remaining_lines)} accounts\n\n"
-            f"<i>Resuming now... Send /stop to cancel.</i>")
+        # Notify user (with 5-min cooldown to prevent spam on restart loops)
+        _last_notify = _resume_notify_ts.get(str(chat_id), 0)
+        if time.time() - _last_notify > 300:
+            _tg_send(token, chat_id,
+                f"🔄 <b>Auto-Resuming!</b>\n\n"
+                f"Bot restarted — resuming your check automatically.\n\n"
+                f"📄 <b>File:</b> <code>{file_name}</code>\n"
+                f"📊 <b>Already done:</b> {progress} | <b>Remaining:</b> {len(remaining_lines)} accounts\n\n"
+                f"<i>Resuming now... Send /stop to cancel.</i>")
+            _resume_notify_ts[str(chat_id)] = time.time()
 
         # Start checker thread for remaining lines
         hits_id = d["hits_id"]
@@ -9850,6 +9865,18 @@ def _start_healthcheck_server():
     class HealthHandler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path == "/health":
+                # During graceful shutdown, always return 503
+                # This tells Railway "I'm going down on purpose, don't panic"
+                if _shutting_down:
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "status": "shutting_down",
+                        "message": "Bot is shutting down gracefully",
+                    }).encode())
+                    logger.info("[HEALTH] 503 — shutting down")
+                    return
                 age = _get_liveness_age()
                 # If no liveness touch in 15 minutes → 503 (unhealthy)
                 # Was 5 min but that was too aggressive — caused Railway restart loops
@@ -9894,8 +9921,17 @@ def _start_healthcheck_server():
 
 
 def _railway_redeploy():
-    """Trigger a Railway redeploy via the API using RAILWAY_TOKEN.
-    Falls back to os.execv (full process restart) if API is unavailable."""
+    """Trigger a clean shutdown so Railway can restart the container naturally.
+
+    IMPORTANT: We do NOT use os.execv anymore — it caused infinite restart loops
+    because it replaces the process in-place, bypassing Railway's health monitoring.
+    Instead, we set shutdown_event and let the process exit cleanly.
+    Railway detects the exit and starts a fresh container automatically.
+    """
+    global _shutting_down
+    _shutting_down = True
+
+    # Try Railway API redeploy first (only if token is configured)
     token = os.environ.get("RAILWAY_TOKEN", "").strip()
     service_id = os.environ.get("RAILWAY_SERVICE_ID", "").strip()
     environment_id = os.environ.get("RAILWAY_ENVIRONMENT_ID", "").strip()
@@ -9903,22 +9939,11 @@ def _railway_redeploy():
     if token and service_id:
         try:
             logger.info("[RAILWAY] 🔄 Triggering redeploy via Railway API...")
-            # Notify owner before redeploying
-            try:
-                _tg_send(BOT_TOKEN, OWNER_ID,
-                    "🔄 <b>Auto-Redeploy Triggered</b>\n\n"
-                    "Bot detected a critical failure and is redeploying itself.\n"
-                    "<i>You don't need to do anything — it will be back online shortly.</i>"
-                )
-            except Exception:
-                pass
-
             # Use Railway's GraphQL API to trigger a redeploy
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
             }
-            # First get the latest deployment ID
             query = """
             mutation { deployTrigger(serviceId: "%s", environmentId: "%s") { id } }
             """ % (service_id, environment_id)
@@ -9929,28 +9954,25 @@ def _railway_redeploy():
                 timeout=10,
             )
             if resp.ok:
-                logger.info("[RAILWAY] ✅ Redeploy triggered successfully via API")
-                # Give the message time to send, then exit so Railway can redeploy
-                time.sleep(3)
-                os._exit(1)  # non-zero exit so Railway knows this instance is done
+                logger.info("[RAILWAY] ✅ Redeploy triggered successfully via API — exiting cleanly")
+                # Set shutdown event and return — main() will exit cleanly
+                shutdown_event.set()
+                with _stop_events_lock:
+                    for evt in _stop_events.values():
+                        evt.set()
+                return
             else:
-                logger.warning(f"[RAILWAY] API redeploy failed ({resp.status_code}), falling back to execv")
+                logger.warning(f"[RAILWAY] API redeploy failed ({resp.status_code}) — falling back to clean exit")
         except Exception as e:
-            logger.warning(f"[RAILWAY] API redeploy error: {e}, falling back to execv")
+            logger.warning(f"[RAILWAY] API redeploy error: {e} — falling back to clean exit")
 
-    # Fallback: full process restart via os.execv
-    # This is the nuclear option — re-exec the Python process from scratch
-    logger.info("[RAILWAY] 🔄 Restarting process via os.execv...")
-    try:
-        _tg_send(BOT_TOKEN, OWNER_ID,
-            "🔄 <b>Auto-Restart Triggered</b>\n\n"
-            "Bot is restarting itself after detecting a critical failure.\n"
-            "<i>It will be back online in a moment.</i>"
-        )
-        time.sleep(3)  # give Telegram message time to send
-    except Exception:
-        pass
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    # Fallback: clean exit (NOT os.execv — that caused restart loops!)
+    # Railway will detect the process exit and restart the container automatically.
+    logger.info("[RAILWAY] 🔄 Triggering clean shutdown — Railway will restart the container...")
+    shutdown_event.set()
+    with _stop_events_lock:
+        for evt in _stop_events.values():
+            evt.set()
 
 
 
@@ -9960,12 +9982,20 @@ def main():
 
     # ── Railway-safe signal handling (SIGTERM for graceful shutdown) ──
     def _graceful_shutdown(signum, frame):
+        global _shutting_down
+        if _shutting_down:
+            return  # Already shutting down — don't double-process
+        _shutting_down = True
         logger.warning(f"[MAIN] Received signal {signum} — shutting down gracefully...")
         shutdown_event.set()
         # Set all user stop events so running checkers stop
         with _stop_events_lock:
             for evt in _stop_events.values():
                 evt.set()
+        # Don't exit immediately — give Railway time to see the 503 healthcheck
+        # and give in-progress operations time to finish (up to 10 seconds).
+        # Railway sends SIGTERM, then waits ~30s before SIGKILL.
+        # We want to use that time wisely instead of vanishing instantly.
     signal.signal(signal.SIGTERM, _graceful_shutdown)
     signal.signal(signal.SIGINT,  _graceful_shutdown)
 
@@ -9995,7 +10025,11 @@ def main():
             new_token = os.environ.get("BOT_TOKEN", "").strip()
             if new_token:
                 logger.info("[MAIN] ✅ BOT_TOKEN detected! Restarting...")
-                os.execv(sys.executable, [sys.executable] + sys.argv)
+                # Clean exit — Railway will restart the container with new env vars
+                global _shutting_down
+                _shutting_down = True
+                shutdown_event.set()
+                return
         return
     start_bot_polling(BOT_TOKEN, None)
     _tg_set_commands(BOT_TOKEN)
@@ -10193,11 +10227,18 @@ def main():
                         time.sleep(3)  # give message time to send
                     except Exception:
                         pass
-                    # Self-heal: full process restart
+                    # Self-heal: trigger clean shutdown (NOT os.execv — that caused loops)
+                    # Railway will restart the container automatically after the process exits.
                     if _is_railway():
                         _railway_redeploy()
                     else:
-                        os.execv(sys.executable, [sys.executable] + sys.argv)
+                        # Non-Railway: clean exit, the crash guard in __main__ will handle retry
+                        global _shutting_down
+                        _shutting_down = True
+                        shutdown_event.set()
+                        with _stop_events_lock:
+                            for evt in _stop_events.values():
+                                evt.set()
 
                 elif age > 900:  # 15 minutes — concerning (was 5 min)
                     if not stuck_warned:
@@ -10298,8 +10339,23 @@ def main():
             logger.error(f"[MAIN] Unexpected error in main loop: {e}")
             time.sleep(2)   # brief pause then continue — don't exit
 
+    # ── Grace period: wait for in-progress operations to finish ──
+    # Railway gives us ~30s between SIGTERM and SIGKILL.
+    # Use up to 10s of that for cleanup before exiting.
+    if _shutting_down:
+        logger.info("[MAIN] Shutdown requested — waiting up to 10s for in-progress operations...")
+        for _ in range(10):
+            # Check if any checkers are still running
+            active = sum(1 for s in _bot_state.values() if s == "RUNNING")
+            if active == 0:
+                break
+            logger.info(f"[MAIN] Waiting for {active} active checker(s) to stop...")
+            time.sleep(1)
+        logger.info("[MAIN] Grace period complete — exiting cleanly.")
+
 
 if __name__ == "__main__":
+    # _shutting_down is a module-level variable — no `global` needed at module level
     # Top-level crash guard with exponential backoff + self-healing on Railway.
     # Instead of "giving up", triggers Railway redeploy or process restart.
     # KEY FIX: SystemExit is NOT treated as a crash — it means the bot shut down
@@ -10308,6 +10364,7 @@ if __name__ == "__main__":
     crash_count = 0
     while crash_count < MAX_CRASH_RETRIES:
         try:
+            _shutting_down = False  # reset for new attempt
             shutdown_event.clear()   # reset shutdown flag for restart
             gc.collect()  # clean up before each run
             main()
@@ -10360,6 +10417,7 @@ if __name__ == "__main__":
                 pass
             _railway_redeploy()
         else:
-            # Not on Railway: just restart the process
-            logger.info("[MAIN] Restarting process via os.execv...")
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+            # Not on Railway: let the process exit cleanly.
+            # If running in a process manager (systemd, etc.), it will restart automatically.
+            # os.execv was removed — it caused infinite restart loops by bypassing cleanup.
+            logger.info("[MAIN] All retries exhausted — exiting. Process manager will restart if configured.")
