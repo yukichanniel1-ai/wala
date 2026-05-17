@@ -883,6 +883,9 @@ def _fetch_raw_proxies():
         return None
 
     while not shutdown_event.is_set():
+        # Touch liveness at the start of every fetch cycle so the watchdog
+        # knows the proxy fetcher thread is alive even if no new proxies found
+        _touch_liveness()
         try:
             total_new = 0
             total_fetched = 0
@@ -1051,20 +1054,11 @@ def _fetch_raw_proxies():
         # Wait for next cycle (interruptible by shutdown)
         shutdown_event.wait(RAW_PROXY_FETCH_INTERVAL)
 
-def signal_handler(signum, frame):
-    """Handle SIGINT (Ctrl+C) and SIGTERM (process manager shutdown) gracefully."""
-    sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
-    shutdown_event.set()   # signal all polling loops and checkers to stop
-    print(f"\n  ⚠️  {sig_name} received — shutting down gracefully...")
-    # Don't call os._exit(0) — it bypasses Python cleanup and can look like a crash.
-    # Instead, let the main loop detect shutdown_event and exit cleanly.
-    # Give threads up to 3 seconds to finish current work, then raise SystemExit
-    time.sleep(1)
-    raise SystemExit(0)
-
-# Register both SIGINT (Ctrl+C) and SIGTERM (Wispbyte/systemd kill)
-signal.signal(signal.SIGINT,  signal_handler)
-signal.signal(signal.SIGTERM, signal_handler) 
+# NOTE: Signal handlers are registered in main() via _graceful_shutdown().
+# Do NOT register signal handlers at module level — they conflict with the
+# ones in main() and cause SystemExit crashes that trigger Railway restart loops.
+# The old module-level signal_handler raised SystemExit(0) which killed the
+# process instantly instead of letting the main loop shut down gracefully. 
 
 class Colors:
     LIGHTGREEN_EX = colorama.Fore.LIGHTGREEN_EX
@@ -9857,8 +9851,11 @@ def _start_healthcheck_server():
         def do_GET(self):
             if self.path == "/health":
                 age = _get_liveness_age()
-                # If no liveness touch in 5 minutes → 503 (unhealthy)
-                if age > 300:
+                # If no liveness touch in 15 minutes → 503 (unhealthy)
+                # Was 5 min but that was too aggressive — caused Railway restart loops
+                # when the bot had brief network issues.
+                # 5-15 min range: return 200 but with "degraded" status (no restart)
+                if age > 900:
                     self.send_response(503)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
@@ -10003,28 +10000,56 @@ def main():
     start_bot_polling(BOT_TOKEN, None)
     _tg_set_commands(BOT_TOKEN)
 
-    # ── Notify owner that bot has started/restarted ───────────────────
+    # ── Notify owner that bot has started/restarted ──
+    # Anti-spam: skip notification if we restarted less than 5 minutes ago.
+    # This prevents notification spam when the bot is in a crash loop.
     try:
         _restart_count = _keysystem_api.load_state("restart_count") if _keysystem_api.enabled else {}
         if not isinstance(_restart_count, dict):
             _restart_count = {}
         count = _restart_count.get("count", 0) + 1
+        last_restart_ts = _restart_count.get("last_restart", 0)
+        time_since_last = time.time() - last_restart_ts if last_restart_ts else 9999
         _restart_count["count"] = count
         _restart_count["last_restart"] = time.time()
+
+        # ── Restart loop detection ──
+        # Track recent restarts to detect crash loops
+        recent_restarts = _restart_count.get("recent", [])
+        now_ts = time.time()
+        # Keep only restarts from the last 10 minutes
+        recent_restarts = [t for t in recent_restarts if now_ts - t < 600]
+        recent_restarts.append(now_ts)
+        _restart_count["recent"] = recent_restarts[-20:]  # keep last 20
+        in_restart_loop = len(recent_restarts) >= 3
+
         if _keysystem_api.enabled:
             _keysystem_api.save_state("restart_count", _restart_count)
-        _now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        _total_users = len({v.get("hits_id") for v in _saved_users.values() if isinstance(v, dict) and "hits_id" in v})
-        _proxy_info = f"{geo_rotator.total} proxies" if hasattr(geo_rotator, "total") else "N/A"
-        _tg_send(BOT_TOKEN, OWNER_ID,
-            f"🤖 <b>Bot Restarted!</b>\n\n"
-            f"🕐 <b>Time:</b> {_now}\n"
-            f"🔄 <b>Restart #:</b> {count}\n"
-            f"👥 <b>Total Users:</b> {_total_users}\n"
-            f"🌐 <b>Proxies:</b> {_proxy_info}\n"
-            f"🚀 <b>Status:</b> Online & Ready\n\n"
-            f"👥 <b>Active Users:</b> Send /statuskey to see details"
-        )
+
+        # ── Cooldown: skip notification if restarted <5 min ago (unless first start) ──
+        if time_since_last < 300 and count > 1:
+            logger.warning(f"[MAIN] Restarted {time_since_last:.0f}s after last restart — skipping notification (cooldown)")
+        else:
+            _now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _total_users = len({v.get("hits_id") for v in _saved_users.values() if isinstance(v, dict) and "hits_id" in v})
+            _proxy_info = f"{geo_rotator.total} proxies" if hasattr(geo_rotator, "total") else "N/A"
+            loop_warn = ""
+            if in_restart_loop:
+                loop_warn = (
+                    f"\n\n⚠️ <b>RESTART LOOP DETECTED!</b> ({len(recent_restarts)} restarts in 10 min)\n"
+                    f"📋 <b>Check Railway logs for the root cause.</b>\n"
+                    f"🔇 <b>Further notifications suppressed until stable for 5 min.</b>"
+                )
+            _tg_send(BOT_TOKEN, OWNER_ID,
+                f"🤖 <b>Bot Restarted!</b>\n\n"
+                f"⏰ <b>Time:</b> {_now}\n"
+                f"🔄 <b>Restart #:</b> {count}\n"
+                f"👥 <b>Total Users:</b> {_total_users}\n"
+                f"🌐 <b>Proxies:</b> {_proxy_info}\n"
+                f"🚀 <b>Status:</b> Online & Ready\n\n"
+                f"👥 <b>Active Users:</b> Send /statuskey to see details"
+                f"{loop_warn}"
+            )
     except Exception as e:
         logger.warning(f"[MAIN] Failed to send restart notification: {e}")
 
@@ -10123,22 +10148,46 @@ def main():
     def _liveness_watchdog():
         """Enhanced heartbeat + liveness watchdog.
         Every 60s: log heartbeat and check liveness.
-        If no activity for 5 minutes: warn.
-        If no activity for 10 minutes: trigger self-healing restart."""
+        WARNING thresholds are generous to avoid false-positive restarts:
+        - 15 minutes: warning message (was 5 min — too aggressive)
+        - 30 minutes: self-healing restart (was 10 min — too aggressive)
+        The bot touches liveness every 30s via the main loop, and on every
+        successful Telegram poll + proxy fetch. Only trigger self-heal if
+        ALL of these are dead for a sustained period.
+        """
         stuck_warned = False
+        restart_loop_count = 0  # track how many self-heals we've done
         while not shutdown_event.is_set():
             time.sleep(60)  # check every minute
             try:
                 age = _get_liveness_age()
                 active = sum(1 for s in _bot_state.values() if s == "RUNNING")
 
-                if age > 600:  # 10 minutes — no activity at all
-                    logger.error(f"[WATCHDOG] 🚨 Bot appears DEAD — no activity for {int(age)}s! Triggering self-healing restart...")
+                if age > 1800:  # 30 minutes — no activity at all (was 10 min)
+                    restart_loop_count += 1
+                    # If we've self-healed 3 times already, just log and wait
+                    # instead of restarting forever
+                    if restart_loop_count > 3:
+                        logger.error(f"[WATCHDOG] Self-healed {restart_loop_count} times — stopping restart loop. Bot will stay alive but idle.")
+                        try:
+                            _tg_send(BOT_TOKEN, OWNER_ID,
+                                f"🛑 <b>Self-Heal Stopped</b>\n\n"
+                                f"Bot has self-healed {restart_loop_count} times.\n"
+                                f"Stopping auto-restart to prevent loop.\n\n"
+                                f"📋 <b>Check Railway logs for root cause.</b>\n"
+                                f"🔄 <b>Restart the service manually when ready.</b>"
+                            )
+                        except Exception:
+                            pass
+                        # Stop the loop — don't restart anymore
+                        return
+
+                    logger.error(f"[WATCHDOG] 🚨 Bot appears DEAD — no activity for {int(age)}s! Triggering self-healing restart (attempt {restart_loop_count})...")
                     try:
                         _tg_send(BOT_TOKEN, OWNER_ID,
                             f"🚨 <b>Bot Self-Heal Triggered</b>\n\n"
                             f"No activity detected for <b>{int(age/60)} minutes</b>.\n"
-                            f"Bot is restarting itself automatically.\n\n"
+                            f"Bot is restarting itself automatically (attempt {restart_loop_count}).\n\n"
                             f"<i>You don't need to do anything.</i>"
                         )
                         time.sleep(3)  # give message time to send
@@ -10150,7 +10199,7 @@ def main():
                     else:
                         os.execv(sys.executable, [sys.executable] + sys.argv)
 
-                elif age > 300:  # 5 minutes — concerning
+                elif age > 900:  # 15 minutes — concerning (was 5 min)
                     if not stuck_warned:
                         logger.warning(f"[WATCHDOG] ⚠️ Bot may be stuck — no activity for {int(age)}s")
                         stuck_warned = True
@@ -10158,12 +10207,13 @@ def main():
                             _tg_send(BOT_TOKEN, OWNER_ID,
                                 f"⚠️ <b>Bot May Be Stuck</b>\n\n"
                                 f"No activity for <b>{int(age/60)} minutes</b>.\n"
-                                f"Will auto-restart in 5 min if no recovery."
+                                f"Will auto-restart in 15 min if no recovery."
                             )
                         except Exception:
                             pass
                 else:
                     stuck_warned = False  # recovered
+                    restart_loop_count = 0  # reset on recovery
                     logger.info(f"[HEARTBEAT] 💓 Bot alive | {active} active | liveness: {int(age)}s ago | threads: {MAX_GLOBAL_THREADS}")
             except Exception:
                 pass
@@ -10252,6 +10302,8 @@ def main():
 if __name__ == "__main__":
     # Top-level crash guard with exponential backoff + self-healing on Railway.
     # Instead of "giving up", triggers Railway redeploy or process restart.
+    # KEY FIX: SystemExit is NOT treated as a crash — it means the bot shut down
+    # intentionally (SIGTERM, etc.) and should NOT be retried.
     MAX_CRASH_RETRIES = 5         # internal retry limit
     crash_count = 0
     while crash_count < MAX_CRASH_RETRIES:
@@ -10260,6 +10312,12 @@ if __name__ == "__main__":
             gc.collect()  # clean up before each run
             main()
             crash_count = 0  # reset on clean exit (shutdown_event set)
+            break
+        except SystemExit:
+            # SystemExit = intentional shutdown (SIGTERM handled gracefully, etc.)
+            # Do NOT retry — this is NOT a crash.
+            logger = logging.getLogger(__name__)
+            logger.info("[MAIN] Bot exited via SystemExit — intentional shutdown, not a crash.")
             break
         except KeyboardInterrupt:
             bot_console.print(f"\n[yellow]⚠️  Bot stopped by user[/yellow]")
