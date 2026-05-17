@@ -52,6 +52,7 @@ const datadomeManager = new DataDomeManager();
 // ── Thread / concurrency management ──────────────────────────────────
 const MAX_GLOBAL_THREADS   = config.MAX_GLOBAL_THREADS;
 const MAX_THREADS_PER_USER = config.MAX_THREADS_PER_USER;
+const MAX_CONCURRENT_USERS = config.MAX_CONCURRENT_USERS;
 const VIP_THREADS_PER_USER = config.VIP_THREADS_PER_USER;
 
 // Simple async semaphore
@@ -80,6 +81,7 @@ class AsyncSemaphore {
 }
 
 const globalSem = new AsyncSemaphore(MAX_GLOBAL_THREADS);
+const userSlotSem = new AsyncSemaphore(MAX_CONCURRENT_USERS); // Limits how many users can check at once
 
 // ── Print banner ──────────────────────────────────────────────────────
 function printBanner() {
@@ -374,6 +376,8 @@ async function handleFile(token, chatId, msg, fromUser) {
 
   // ── Run checker in background ────────────────────────────────────
   (async () => {
+    // Acquire a user slot (wait if too many users checking at once)
+    await userSlotSem.acquire();
     let done = 0;
 
     // Progress updater
@@ -415,10 +419,11 @@ async function handleFile(token, chatId, msg, fromUser) {
       await globalSem.acquire();
       await userSem.acquire();
 
+      let session;
       try {
-        // Create a per-request session with current proxy
+        // Create a per-request session with current proxy (lightweight — destroyed after)
         const proxyUrl = geoRotator.getCurrentProxy();
-        const session = createSession(proxyUrl);
+        session = createSession(proxyUrl);
 
         await processaccount(
           session, account, password,
@@ -432,13 +437,27 @@ async function handleFile(token, chatId, msg, fromUser) {
         liveStats.recordError();
       } finally {
         done++;
+        // Clean up session to free memory
+        if (session) {
+          session.defaults._cookies = {};
+          session.interceptors.request.handlers = [];
+          session.interceptors.response.handlers = [];
+        }
+        session = null;
         globalSem.release();
         userSem.release();
       }
     }
 
-    // Run all combos — semaphores control actual concurrency
-    await Promise.all(combos.map(c => processCombo(c)));
+    // Process in small chunks to avoid memory spike from all promises at once
+    const CHUNK_SIZE = threadsPerUser * 2;
+    for (let i = 0; i < combos.length; i += CHUNK_SIZE) {
+      if (stopEvt.isSet() || config.shutdownEvent.isSet()) break;
+      const chunk = combos.slice(i, i + CHUNK_SIZE);
+      await Promise.all(chunk.map(c => processCombo(c)));
+      // Free memory between chunks
+      if (global.gc) global.gc();
+    }
 
     clearInterval(progressInterval);
     clearInterval(progressTgInterval);
@@ -470,9 +489,13 @@ async function handleFile(token, chatId, msg, fromUser) {
     // Clean up combo file
     try { fs.unlinkSync(comboPath); } catch {}
 
+    // Release user slot so another user can start checking
+    userSlotSem.release();
+
   })().catch(e => {
     console.error('[CHECKER] Fatal error:', e);
     botState[chatId] = 'AWAIT_FILE';
+    userSlotSem.release();
   });
 }
 
@@ -1790,6 +1813,7 @@ async function startBotPolling(token) {
 
 // ── Memory watchdog ───────────────────────────────────────────────────
 function startMemoryWatchdog() {
+  const RAILWAY_RAM_MB = 512; // Free plan limit
   const interval = setInterval(() => {
     if (config.shutdownEvent.isSet()) {
       clearInterval(interval);
@@ -1798,24 +1822,23 @@ function startMemoryWatchdog() {
 
     const mem = process.memoryUsage();
     const rss = mem.rss / (1024 * 1024);
-    const totalMem = require('os').totalmem();
-    const freeMem = require('os').freemem();
-    const usedPct = ((totalMem - freeMem) / totalMem * 100);
+    const heapUsed = mem.heapUsed / (1024 * 1024);
+    const usedPct = (rss / RAILWAY_RAM_MB) * 100;
 
-    if (usedPct >= 93) {
-      console.warn(`[WATCHDOG] 🚨 EMERGENCY — RAM ${usedPct.toFixed(1)}% — throttling to 1 thread`);
+    if (usedPct >= 90) {
+      console.warn(`[WATCHDOG] 🚨 EMERGENCY — RSS ${rss.toFixed(0)}MB / ${RAILWAY_RAM_MB}MB (${usedPct.toFixed(1)}%) — throttling to 1 thread`);
       global.globalSem = new AsyncSemaphore(1);
-      try { tgSend(BOT_TOKEN, OWNER_ID, `🚨 <b>Server RAM Emergency!</b>\n\nRAM at <b>${usedPct.toFixed(1)}%</b>\nThrottled to 1 checker thread.\n<i>Consider stopping some checkers with /stopall</i>`); } catch {}
-    } else if (usedPct >= 87) {
-      console.warn(`[WATCHDOG] 🔴 CRITICAL — RAM ${usedPct.toFixed(1)}% — throttling to 2 threads`);
-      global.globalSem = new AsyncSemaphore(2);
+      try { tgSend(BOT_TOKEN, OWNER_ID, `🚨 <b>Server RAM Emergency!</b>\n\nRSS at <b>${rss.toFixed(0)}MB / ${RAILWAY_RAM_MB}MB</b>\nThrottled to 1 checker thread.\n<i>Consider /stop some checkers</i>`); } catch {}
     } else if (usedPct >= 80) {
-      console.warn(`[WATCHDOG] 🟡 WARNING — RAM ${usedPct.toFixed(1)}% — throttling to 3 threads`);
+      console.warn(`[WATCHDOG] 🔴 CRITICAL — RSS ${rss.toFixed(0)}MB / ${RAILWAY_RAM_MB}MB (${usedPct.toFixed(1)}%) — throttling to 3 threads`);
       global.globalSem = new AsyncSemaphore(3);
+    } else if (usedPct >= 70) {
+      console.warn(`[WATCHDOG] 🟡 WARNING — RSS ${rss.toFixed(0)}MB / ${RAILWAY_RAM_MB}MB (${usedPct.toFixed(1)}%) — throttling to 5 threads`);
+      global.globalSem = new AsyncSemaphore(5);
     }
 
     // Force GC if available
-    if (global.gc && usedPct >= 80) {
+    if (global.gc && usedPct >= 70) {
       global.gc();
     }
   }, 8000);

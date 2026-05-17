@@ -14,11 +14,11 @@ const PROXY_DIR    = path.join(__dirname, '..', 'proxies');
 const RESULTS_DIR  = path.join(DATA_DIR, 'results');
 
 // ── Thread / concurrency constants ─────────────────────────────────────
-const MAX_GLOBAL_THREADS    = 20;
-const MAX_THREADS_PER_USER  = 5;
-const MAX_CONCURRENT_USERS  = 10;
-const VIP_THREADS_PER_USER  = 5;
-const COMBO_LINE_LIMIT      = 50000;
+const MAX_GLOBAL_THREADS    = 10;   // Max concurrent checks across ALL users (free plan optimized)
+const MAX_THREADS_PER_USER  = 5;    // 5 threads per user ✅
+const MAX_CONCURRENT_USERS  = 4;    // Max users checking at same time
+const VIP_THREADS_PER_USER  = 5;    // Owner also gets 5 (same, fair on free plan)
+const COMBO_LINE_LIMIT      = 15000; // Reduced for 512MB RAM
 
 // ── Garena constants ──────────────────────────────────────────────────
 const GARENA_APP_ID     = 10100;
