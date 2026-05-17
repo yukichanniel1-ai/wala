@@ -1,10 +1,15 @@
 /**
  * geo-rotator.js — Proxy rotation with normalize, load files, get/rotate/remove
  * Ported from Python main.py GeoRotator class (lines 167-496)
+ * Enhanced with: SOCKS5 auto-detection by port, socks5h support,
+ *                no-proxy notification support
  */
 const fs   = require('fs');
 const path = require('path');
 const { PROXY_DIR, getProxyFiles } = require('./config');
+
+// ── SOCKS5 auto-detection: well-known SOCKS5 ports ─────────────────────
+const SOCKS5_PORTS = new Set([1080, 1081, 4145, 4146, 9050, 9051, 9052, 9053, 10800, 10801, 28100]);
 
 class GeoRotator {
   constructor() {
@@ -21,47 +26,93 @@ class GeoRotator {
 
   /**
    * Normalize a proxy line into a standard format.
-   * Supports: host:port, host:port:user:pass, user:pass@host:port,
-   * and protocol://host:port (http/https/socks4/socks5)
+   * Enhanced with: SOCKS5 auto-detection by port number, socks5h support
+   *
+   * Supported formats:
+   *   1. http://host:port
+   *   2. https://host:port
+   *   3. socks5://host:port / socks5h://host:port
+   *   4. http://user:pass@host:port
+   *   5. host:port → auto-detect: SOCKS5 if known port, else http
+   *   6. user:pass@host:port
+   *   7. ip:port:username:password
    */
   static normalizeProxy(line) {
     line = line.trim();
     if (!line || line.startsWith('#')) return null;
 
-    // Already has protocol prefix
-    const protoMatch = line.match(/^(https?|socks[45]):\/\/(.+)$/i);
-    if (protoMatch) {
-      const proto = protoMatch[1].toLowerCase();
-      const rest  = protoMatch[2];
-      // proto://user:pass@host:port
-      const authMatch = rest.match(/^(.+?):(.+?)@(.+?):(\d+)$/);
-      if (authMatch) {
-        return `${proto}://${authMatch[1]}:${authMatch[2]}@${authMatch[3]}:${authMatch[4]}`;
-      }
-      // proto://host:port
-      const hostPort = rest.match(/^(.+?):(\d+)$/);
-      if (hostPort) {
-        return `${proto}://${hostPort[1]}:${hostPort[2]}`;
+    // Detect and strip explicit scheme
+    let scheme = 'http'; // default
+    const low = line.toLowerCase();
+
+    if (low.startsWith('socks5h://')) {
+      scheme = 'socks5h';
+      line = line.slice(10);
+    } else if (low.startsWith('socks5://')) {
+      scheme = 'socks5h'; // upgrade to socks5h for remote DNS resolution
+      line = line.slice(9);
+    } else if (low.startsWith('socks4://')) {
+      scheme = 'socks5h'; // upgrade socks4 to socks5h
+      line = line.slice(9);
+    } else if (low.startsWith('https://')) {
+      scheme = 'https';
+      line = line.slice(8);
+    } else if (low.startsWith('http://')) {
+      scheme = 'http';
+      line = line.slice(7);
+    }
+
+    // user:pass@host:port format (already has @)
+    if (line.includes('@')) {
+      const atIndex = line.lastIndexOf('@');
+      const creds = line.slice(0, atIndex);
+      const hostport = line.slice(atIndex + 1);
+      const parts = hostport.split(':');
+      if (parts.length >= 2) {
+        const portStr = parts[parts.length - 1];
+        if (/^\d+$/.test(portStr)) {
+          // Auto-detect SOCKS5 by port even with auth
+          if (scheme === 'http' && SOCKS5_PORTS.has(parseInt(portStr))) {
+            scheme = 'socks5h';
+          }
+          return `${scheme}://${creds}@${hostport}`;
+        }
       }
       return null;
     }
 
-    // user:pass@host:port
-    const atMatch = line.match(/^(.+?):(.+?)@(.+?):(\d+)$/);
-    if (atMatch) {
-      return `http://${atMatch[1]}:${atMatch[2]}@${atMatch[3]}:${atMatch[4]}`;
-    }
+    // Split by ':' to detect format
+    const colonParts = line.split(':');
 
-    // host:port:user:pass
-    const fourPart = line.match(/^(.+?):(\d+):(.+?):(.+)$/);
-    if (fourPart) {
-      return `http://${fourPart[3]}:${fourPart[4]}@${fourPart[1]}:${fourPart[2]}`;
-    }
-
-    // host:port (no auth)
-    const simple = line.match(/^(.+?):(\d+)$/);
-    if (simple) {
-      return `http://${simple[1]}:${simple[2]}`;
+    if (colonParts.length === 2) {
+      // host:port
+      const [host, portStr] = colonParts;
+      if (host && /^\d+$/.test(portStr)) {
+        // Auto-detect SOCKS5 by well-known ports
+        if (scheme === 'http' && SOCKS5_PORTS.has(parseInt(portStr))) {
+          scheme = 'socks5h';
+        }
+        return `${scheme}://${host}:${portStr}`;
+      }
+    } else if (colonParts.length === 4) {
+      // ip:port:username:password
+      const [ip, portStr, username, password] = colonParts;
+      if (ip && /^\d+$/.test(portStr)) {
+        // Auto-detect SOCKS5 by port
+        if (scheme === 'http' && SOCKS5_PORTS.has(parseInt(portStr))) {
+          scheme = 'socks5h';
+        }
+        return `${scheme}://${username}:${password}@${ip}:${portStr}`;
+      }
+    } else if (colonParts.length === 3) {
+      // Ambiguous — treat as host:port (ignore third segment)
+      const [host, portStr, extra] = colonParts;
+      if (host && /^\d+$/.test(portStr)) {
+        if (scheme === 'http' && SOCKS5_PORTS.has(parseInt(portStr))) {
+          scheme = 'socks5h';
+        }
+        return `${scheme}://${host}:${portStr}`;
+      }
     }
 
     return null;
@@ -102,8 +153,12 @@ class GeoRotator {
   }
 
   /**
-   * Get the current proxy for a given "thread" (just returns current).
+   * Check if there are any available (non-blocked) proxies.
    */
+  hasProxies() {
+    return this.getProxies().length > 0;
+  }
+
   getProxies() {
     return this.proxies.filter(p => !this.blockedSet.has(p));
   }
@@ -119,16 +174,12 @@ class GeoRotator {
     }
   }
 
-  /**
-   * Force rotate to the next available (non-blocked) proxy.
-   */
   forceRotate() {
     const available = this.getProxies();
     if (available.length === 0) {
       this.currentProxy = null;
       return null;
     }
-    // Move to next index
     this.currentIndex = (this.currentIndex + 1) % this.proxies.length;
     let attempts = 0;
     while (this.blockedSet.has(this.proxies[this.currentIndex]) && attempts < this.proxies.length) {
@@ -139,10 +190,6 @@ class GeoRotator {
     return this.currentProxy;
   }
 
-  /**
-   * Smart rotate: rotate and return new proxy. If no proxies available,
-   * try reloading from files.
-   */
   smartRotate() {
     const p = this.forceRotate();
     if (!p) {

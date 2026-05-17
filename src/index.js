@@ -1,25 +1,27 @@
 /**
  * index.js — Main entry point: signal handling, polling, watchdog, heartbeat,
- *            bot command routing, callback query handling, checker runner
+ *            bot command routing, callback query handling, checker runner,
+ *            KeySystemAPI integration, auto-fetch proxy, persistent storage,
+ *            setup wizard, liveness tracking, no-proxy notification,
+ *            proxy-paused users auto-resume
  * Ported from Python main.py (the entire bot flow)
  */
 const fs        = require('fs');
 const path      = require('path');
 const axios     = require('axios');
 
-// ── Load config ───────────────────────────────────────────────────────
+// ── Load config ────────────────────────────────────────────────────────
 const config = require('./config');
 config.ensureDirs();
 const cfg = config.loadConfig();
-if (!cfg || !config.getBotToken()) {
-  console.error('[MAIN] No config.json or bot_token not set. Exiting.');
-  process.exit(1);
-}
 
-const BOT_TOKEN = config.getBotToken();
-const OWNER_ID  = config.getOwnerId();
+// ── Handle missing config: setup wizard or wait loop ───────────────────
+// If no config.json and no env vars, we need to either:
+//   1. Run setup wizard (interactive / TTY mode)
+//   2. Wait for env vars (Railway / cloud mode)
+// This is handled below in main() after all imports are ready.
 
-// ── Module imports ────────────────────────────────────────────────────
+// ── Module imports ─────────────────────────────────────────────────────
 const { createSession, applyck, getDatadomeCookie, prelogin, login,
         checkCodmAccount, parseAccountDetails, processaccount,
         updateSessionProxy, backoff } = require('./garena');
@@ -27,7 +29,8 @@ const { tgApi, tgSend, tgSendButtons, tgAnswerCallback, tgEditMessage,
         tgDeleteMessage, tgDeleteMessagesBulk, tgSendDocument,
         tgGetFileUrl, tgDownloadFile, tgSetCommands, sendResultsZip } = require('./telegram-api');
 const { loadKeys, saveKeys, genKey, parseDuration, durLabel,
-        createKey, redeemKey, checkAccess } = require('./key-system');
+        createKey, redeemKey, checkAccess,
+        KeySystemAPI, getKeySystemAPI, resetKeySystemAPI } = require('./key-system');
 const { botState, userData, savedUsers, stopEvents, activeBars,
         genkeyWizard, deleteKeySelection,
         proxyAccumulator, proxyMsgIds,
@@ -37,19 +40,21 @@ const { botState, userData, savedUsers, stopEvents, activeBars,
         setActiveBar, getActiveBar, removeActiveBar } = require('./session');
 const { isGarenaCredential, parseComboLines, removeDuplicates } = require('./combo-parser');
 const { normalizeProxyLine, preprocessProxyText, saveProxiesFromLines,
-        uniqueProxyPath, flushProxyAccumulator } = require('./proxy-upload');
+        uniqueProxyPath, flushProxyAccumulator,
+        persistProxies, restoreAllProxies } = require('./proxy-upload');
+const { startProxyFetcher } = require('./proxy-fetcher');
 const GeoRotator     = require('./geo-rotator');
 const CookieManager  = require('./cookie-manager');
 const DataDomeManager = require('./datadome-manager');
 const LiveStats      = require('./live-stats');
 const { startHealthcheckServer, stopHealthcheckServer } = require('./healthcheck');
 
-// ── Global instances ──────────────────────────────────────────────────
+// ── Global instances ───────────────────────────────────────────────────
 const geoRotator     = new GeoRotator();
 const cookieManager  = new CookieManager();
 const datadomeManager = new DataDomeManager();
 
-// ── Thread / concurrency management ──────────────────────────────────
+// ── Thread / concurrency management ────────────────────────────────────
 const MAX_GLOBAL_THREADS   = config.MAX_GLOBAL_THREADS;
 const MAX_THREADS_PER_USER = config.MAX_THREADS_PER_USER;
 const MAX_CONCURRENT_USERS = config.MAX_CONCURRENT_USERS;
@@ -81,9 +86,97 @@ class AsyncSemaphore {
 }
 
 const globalSem = new AsyncSemaphore(MAX_GLOBAL_THREADS);
-const userSlotSem = new AsyncSemaphore(MAX_CONCURRENT_USERS); // Limits how many users can check at once
+const userSlotSem = new AsyncSemaphore(MAX_CONCURRENT_USERS);
 
-// ── Print banner ──────────────────────────────────────────────────────
+// ── Liveness tracking ──────────────────────────────────────────────────
+let _livenessTs = Date.now();
+function touchLiveness() {
+  _livenessTs = Date.now();
+}
+function getLivenessAge() {
+  return (Date.now() - _livenessTs) / 1000;
+}
+
+// ── No-proxy notification ──────────────────────────────────────────────
+let _noProxyWarned = false;
+
+function notifyNoProxy(token, chatId = null) {
+  // Re-check pool right before sending — avoid race condition
+  if (geoRotator.hasProxies()) {
+    clearNoProxyWarning();
+    return;
+  }
+  if (_noProxyWarned) return;
+  _noProxyWarned = true;
+
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const poolSize = geoRotator.total;
+  try {
+    tgSend(token, config.getOwnerId(),
+      `⚠️ <b>No Proxies Available!</b>\n\n` +
+      `⏱ <b>Time:</b> ${now}\n` +
+      `📡 <b>Proxy Pool:</b> ${poolSize} proxies\n` +
+      `🔧 <b>Action:</b> Upload proxy files to the proxy/ folder\n\n` +
+      `<i>Bot is in maintenance mode for non-owner users.</i>`
+    );
+  } catch { /* ignore */ }
+}
+
+function clearNoProxyWarning() {
+  _noProxyWarned = false;
+}
+
+// ── Proxy-paused users: auto-resume when proxies become available ──────
+const _proxyPausedUsers = {}; // chatId -> {combo_path, file_name, lines, user_data}
+
+function registerProxyPaused(chatId, comboPath, fileName, lines, userData) {
+  _proxyPausedUsers[String(chatId)] = {
+    chat_id: chatId,
+    combo_path: comboPath,
+    file_name: fileName,
+    total_lines: lines.length,
+    progress: 0,
+    level: userData.level || [1],
+    clean_filter: userData.clean_filter || 'both',
+    hits_id: userData.hits_id || chatId,
+    username: userData.username || '',
+    combo_limit: userData.combo_limit || config.COMBO_LINE_LIMIT,
+    paused_at: Date.now() / 1000,
+  };
+  console.log(`[BOT] Registered proxy-paused user: chat_id=${chatId}, file=${fileName}, lines=${lines.length}`);
+}
+
+function unregisterProxyPaused(chatId) {
+  delete _proxyPausedUsers[String(chatId)];
+}
+
+function resumeProxyPausedUsers(token) {
+  const paused = { ..._proxyPausedUsers };
+  for (const key of Object.keys(_proxyPausedUsers)) {
+    delete _proxyPausedUsers[key];
+  }
+
+  if (!Object.keys(paused).length) return;
+
+  console.log(`[BOT] ✅ Proxies available! Resuming ${Object.keys(paused).length} paused user(s)...`);
+
+  for (const [key, sess] of Object.entries(paused)) {
+    const chatId = sess.chat_id;
+    const fileName = sess.file_name || 'unknown.txt';
+
+    tgSend(token, chatId,
+      `✅ <b>Proxies are back — Auto-Resuming!</b>\n\n` +
+      `📄 <b>File:</b> <code>${fileName}</code>\n` +
+      `📊 <b>Remaining:</b> ${sess.total_lines} accounts\n\n` +
+      `<i>Please re-upload your combo file to start checking again.</i>`
+    );
+  }
+}
+
+// ── Broadcast accumulator ──────────────────────────────────────────────
+const _broadcastAccumulator = {}; // chatId -> [textLine, ...]
+
+// ── Print banner ───────────────────────────────────────────────────────
 function printBanner() {
   console.log(`
 ╔══════════════════════════════════════════════════════════╗
@@ -93,7 +186,7 @@ function printBanner() {
   `);
 }
 
-// ── Cleanup stale files ──────────────────────────────────────────────
+// ── Cleanup stale files ────────────────────────────────────────────────
 function cleanupStaleFiles() {
   const dataDir = config.DATA_DIR;
   if (!fs.existsSync(dataDir)) return;
@@ -103,7 +196,7 @@ function cleanupStaleFiles() {
       const fp = path.join(dataDir, f);
       try {
         const stat = fs.statSync(fp);
-        if (Date.now() - stat.mtimeMs > 3600000) { // > 1 hour old
+        if (Date.now() - stat.mtimeMs > 3600000) {
           fs.unlinkSync(fp);
         }
       } catch {}
@@ -111,7 +204,7 @@ function cleanupStaleFiles() {
   }
 }
 
-// ── Find nearest account file ─────────────────────────────────────────
+// ── Find nearest account file ──────────────────────────────────────────
 function findNearestAccountFile(resultFolder) {
   if (!fs.existsSync(resultFolder)) return null;
   const files = fs.readdirSync(resultFolder);
@@ -121,7 +214,7 @@ function findNearestAccountFile(resultFolder) {
   return null;
 }
 
-// ── Owner check helpers ───────────────────────────────────────────────
+// ── Owner check helpers ────────────────────────────────────────────────
 function isOwner(fromUser) {
   return config.isOwner(fromUser);
 }
@@ -130,12 +223,11 @@ function isPrimaryOwner(fromUser) {
   return config.isPrimaryOwner(fromUser);
 }
 
-// ── Handle /start ─────────────────────────────────────────────────────
+// ── Handle /start ──────────────────────────────────────────────────────
 function handleStart(token, chatId, fromUser) {
   const tgId   = fromUser?.id || chatId;
   const uname  = fromUser?.username || '';
 
-  // Auto-detect user ID
   const d = udata(chatId);
   d.hits_id = tgId;
   if (uname) d.username = uname;
@@ -144,7 +236,7 @@ function handleStart(token, chatId, fromUser) {
     `👋 <b>Welcome to Garena Checker!</b>\n\n` +
     `🔑 Your ID: <code>${tgId}</code>\n` +
     (uname ? `👤 Username: @${uname}\n` : '') +
-    `\n━━━━━━━━━━━━━━━━━━━━\n` +
+    `\n━━━━━━━━━━━━━━━━━━━━━━━━\n` +
     `Choose your preferred level:`,
     [
       [
@@ -162,7 +254,7 @@ function handleStart(token, chatId, fromUser) {
   );
 }
 
-// ── Ask level (text fallback) ─────────────────────────────────────────
+// ── Ask level (text fallback) ──────────────────────────────────────────
 function askLevel(token, chatId) {
   tgSend(token, chatId,
     '🎯 <b>Choose your level filter:</b>\n\n' +
@@ -187,7 +279,7 @@ function askLevel(token, chatId) {
   );
 }
 
-// ── Ask filter ────────────────────────────────────────────────────────
+// ── Ask filter ─────────────────────────────────────────────────────────
 function askFilter(token, chatId, levelLabel) {
   tgSendButtons(token, chatId,
     `🔍 <b>Level: ${levelLabel}</b>\n\nWhat type of hits do you want?`,
@@ -203,7 +295,7 @@ function askFilter(token, chatId, levelLabel) {
   );
 }
 
-// ── Handle level input ────────────────────────────────────────────────
+// ── Handle level input ─────────────────────────────────────────────────
 function handleLevel(token, chatId, text) {
   const levelMap = {
     '100': ([100], 'Level 100+'),
@@ -223,7 +315,7 @@ function handleLevel(token, chatId, text) {
   askFilter(token, chatId, label);
 }
 
-// ── Handle filter input ───────────────────────────────────────────────
+// ── Handle filter input ────────────────────────────────────────────────
 function handleFilter(token, chatId, text) {
   const filterMap = {
     'clean':    ('clean',    '✅ CLEAN only'),
@@ -248,19 +340,19 @@ function handleFilter(token, chatId, text) {
 
   tgSend(token, chatId,
     `✅ <b>Config saved!</b>\n\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━━━\n` +
     `  🔑 Hits ID:  <code>${d.hits_id || chatId}</code>\n` +
     `  🎮 Level:    <code>${lvlLabel}</code>\n` +
     `  🔍 Hit type: <code>${cfLabel}</code>\n` +
     `  📦 Limit:    <code>${userLimit} lines</code>\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
     `📂 <b>Upload your combo file to start!</b>\n\n` +
     `<i>Use /reset to change settings.</i>\n\n` +
     `<i>Send your file now ⬇️</i>`
   );
 }
 
-// ── Check access gate ─────────────────────────────────────────────────
+// ── Check access gate ──────────────────────────────────────────────────
 function checkAccessGate(token, chatId, fromUser) {
   const uid = fromUser?.id || chatId;
   if (isOwner(fromUser)) return true;
@@ -291,7 +383,7 @@ function checkAccessGate(token, chatId, fromUser) {
   return false;
 }
 
-// ── Handle file upload & start checker ────────────────────────────────
+// ── Handle file upload & start checker ─────────────────────────────────
 async function handleFile(token, chatId, msg, fromUser) {
   const doc = msg.document;
   if (!doc) {
@@ -305,6 +397,21 @@ async function handleFile(token, chatId, msg, fromUser) {
       '❌ <b>Invalid file name!</b>\n\n' +
       'File name must contain <code>garena</code> or <code>codm</code>\n' +
       '(e.g. <code>garena.txt</code>, <code>codm.txt</code>, <code>Yuki_garena.txt</code>)');
+    return;
+  }
+
+  // Check if proxies are available before starting
+  if (!geoRotator.hasProxies()) {
+    notifyNoProxy(token, chatId);
+    tgSend(token, chatId,
+      '⚠️ <b>No proxies available!</b>\n\n' +
+      'The bot cannot check accounts without proxies.\n' +
+      'Your check will auto-resume when proxies are available.\n\n' +
+      '<i>Contact the owner to upload proxies.</i>'
+    );
+    // Register for auto-resume
+    const d = udata(chatId);
+    registerProxyPaused(chatId, '', doc.file_name, [], d);
     return;
   }
 
@@ -337,7 +444,6 @@ async function handleFile(token, chatId, msg, fromUser) {
     return;
   }
 
-  // Apply limit
   if (combos.length > userLimit) {
     combos = combos.slice(0, userLimit);
   }
@@ -374,17 +480,16 @@ async function handleFile(token, chatId, msg, fromUser) {
     `Use /stop to cancel.`
   );
 
-  // ── Run checker in background ────────────────────────────────────
+  clearNoProxyWarning();
+
+  // ── Run checker in background ────────────────────────────────────────
   (async () => {
-    // Acquire a user slot (wait if too many users checking at once)
     await userSlotSem.acquire();
     let done = 0;
 
     // Progress updater
     const progressInterval = setInterval(async () => {
       try {
-        const pct = total > 0 ? (done / total * 100).toFixed(1) : '0.0';
-        const fancyProgress = liveStats.getFancyTelegramProgress();
         setActiveBar(chatId, { done, total, live_stats: liveStats });
       } catch {}
     }, 5000);
@@ -421,8 +526,13 @@ async function handleFile(token, chatId, msg, fromUser) {
 
       let session;
       try {
-        // Create a per-request session with current proxy (lightweight — destroyed after)
         const proxyUrl = geoRotator.getCurrentProxy();
+
+        // If no proxy available mid-check, notify and pause
+        if (!proxyUrl && !geoRotator.hasProxies()) {
+          notifyNoProxy(token);
+        }
+
         session = createSession(proxyUrl);
 
         await processaccount(
@@ -432,12 +542,13 @@ async function handleFile(token, chatId, msg, fromUser) {
           resultFolder, telegramConfig,
           tgSend
         );
+
+        touchLiveness();
       } catch (e) {
         console.error(`[CHECKER] Error processing ${account}:`, e.message);
         liveStats.recordError();
       } finally {
         done++;
-        // Clean up session to free memory
         if (session) {
           session.defaults._cookies = {};
           session.interceptors.request.handlers = [];
@@ -449,24 +560,20 @@ async function handleFile(token, chatId, msg, fromUser) {
       }
     }
 
-    // Process in small chunks to avoid memory spike from all promises at once
+    // Process in small chunks to avoid memory spike
     const CHUNK_SIZE = threadsPerUser * 2;
     for (let i = 0; i < combos.length; i += CHUNK_SIZE) {
       if (stopEvt.isSet() || config.shutdownEvent.isSet()) break;
       const chunk = combos.slice(i, i + CHUNK_SIZE);
       await Promise.all(chunk.map(c => processCombo(c)));
-      // Free memory between chunks
       if (global.gc) global.gc();
     }
 
     clearInterval(progressInterval);
     clearInterval(progressTgInterval);
 
-    // Send final stats
     const finalStats = liveStats.getFancyTelegramProgress();
-    await tgSend(token, chatId,
-      `✅ <b>Checker Complete!</b>\n\n${finalStats}`
-    );
+    await tgSend(token, chatId, `✅ <b>Checker Complete!</b>\n\n${finalStats}`);
 
     // Send results
     if (fs.existsSync(resultFolder)) {
@@ -474,10 +581,8 @@ async function handleFile(token, chatId, msg, fromUser) {
         f.endsWith('.txt') || f.endsWith('.zip')
       );
       if (hasFiles) {
-        // Check for subdirectories (organized CODM folders)
         const allItems = fs.readdirSync(resultFolder, { recursive: true });
         const txtFiles = allItems.filter(f => String(f).endsWith('.txt'));
-
         if (txtFiles.length > 0) {
           await sendResultsZip(token, chatId, resultFolder);
         }
@@ -485,11 +590,7 @@ async function handleFile(token, chatId, msg, fromUser) {
     }
 
     botState[chatId] = 'AWAIT_FILE';
-
-    // Clean up combo file
     try { fs.unlinkSync(comboPath); } catch {}
-
-    // Release user slot so another user can start checking
     userSlotSem.release();
 
   })().catch(e => {
@@ -499,7 +600,7 @@ async function handleFile(token, chatId, msg, fromUser) {
   });
 }
 
-// ── Handle help (owner menu with inline buttons) ─────────────────────
+// ── Handle help (owner menu with inline buttons) ───────────────────────
 function handleHelp(token, chatId, fromUser) {
   if (!isOwner(fromUser)) {
     tgSend(token, chatId,
@@ -529,42 +630,53 @@ function handleHelp(token, chatId, fromUser) {
         { text: '📤 Upload Proxy', callback_data: 'admin:upload_proxy' },
       ],
       [
+        { text: '🔗 KeyVault Config', callback_data: 'admin:keysystem' },
         { text: '🔄 Refresh', callback_data: 'admin:refresh' },
       ],
     ]
   );
 }
 
-// ── Handle server status ──────────────────────────────────────────────
+// ── Handle server status ───────────────────────────────────────────────
 function handleServerStatus(token, chatId) {
   const mem = process.memoryUsage();
   const rss = Math.round(mem.rss / 1024 / 1024);
   const heapUsed = Math.round(mem.heapUsed / 1024 / 1024);
   const heapTotal = Math.round(mem.heapTotal / 1024 / 1024);
+  const livenessAge = Math.round(getLivenessAge());
 
   const activeCheckers = Object.values(botState).filter(s => s === 'RUNNING').length;
   const totalProxies = geoRotator.total;
   const currentProxy = geoRotator.currentProxy || 'None';
+  const pausedUsers = Object.keys(_proxyPausedUsers).length;
+
+  // KeyVault status
+  const api = getKeySystemAPI();
+  const keysystemStatus = api.enabled ? '✅ Connected' : '❌ Not configured';
 
   tgSend(token, chatId,
     `🖥 <b>Server Status</b>\n\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━━━\n` +
     `💾 Memory: <b>${rss}MB</b> RSS / <b>${heapUsed}MB</b> / <b>${heapTotal}MB</b>\n` +
     `🔄 Active Checkers: <b>${activeCheckers}</b>\n` +
     `🌐 Proxy: <code>${currentProxy}</code>\n` +
     `📡 Total Proxies: <b>${totalProxies}</b>\n` +
+    `⏸ Paused Users: <b>${pausedUsers}</b>\n` +
     `🧵 Max Threads: <b>${MAX_GLOBAL_THREADS}</b>\n` +
     `⏱ Uptime: <b>${Math.floor(process.uptime())}s</b>\n` +
-    `━━━━━━━━━━━━━━━━━━━━`
+    `💓 Liveness: <b>${livenessAge}s ago</b>\n` +
+    `🔗 KeyVault: <b>${keysystemStatus}</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━━━`
   );
 }
 
-// ── Handle proxy status ───────────────────────────────────────────────
+// ── Handle proxy status ────────────────────────────────────────────────
 function handleProxyStatus(token, chatId) {
   const proxyFiles = config.getProxyFiles();
   const total = geoRotator.total;
   const current = geoRotator.currentProxy || 'None';
   const blocked = geoRotator.blockedSet.size;
+  const available = geoRotator.getProxies().length;
 
   let filesInfo = 'None';
   if (proxyFiles.length) {
@@ -579,16 +691,17 @@ function handleProxyStatus(token, chatId) {
 
   tgSend(token, chatId,
     `📡 <b>Proxy Status</b>\n\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━━━\n` +
     `🌐 Current: <code>${current}</code>\n` +
     `📊 Total: <b>${total}</b>\n` +
+    `✅ Available: <b>${available}</b>\n` +
     `🚫 Blocked: <b>${blocked}</b>\n` +
     `📂 Files:\n<code>${filesInfo}</code>\n` +
-    `━━━━━━━━━━━━━━━━━━━━`
+    `━━━━━━━━━━━━━━━━━━━━━━━━`
   );
 }
 
-// ── Key status handler ────────────────────────────────────────────────
+// ── Key status handler ─────────────────────────────────────────────────
 function handleStatusKey(token, chatId, keyArg) {
   const keys = loadKeys();
   const keyList = Object.entries(keys);
@@ -599,7 +712,7 @@ function handleStatusKey(token, chatId, keyArg) {
   }
 
   const now = Date.now() / 1000;
-  let text = `📊 <b>Key Status</b> (${keyList.length} keys)\n━━━━━━━━━━━━━━━━━━━━\n`;
+  let text = `📊 <b>Key Status</b> (${keyList.length} keys)\n━━━━━━━━━━━━━━━━━━━━━━━━\n`;
 
   for (const [key, data] of keyList) {
     const expired = now >= (data.expires || 0);
@@ -612,10 +725,9 @@ function handleStatusKey(token, chatId, keyArg) {
     text += `   ${status} | ⏳ ${expiresIn} | 👥 ${usedBy}/${maxUsers || '∞'} | 📦 ${data.combo_limit || '∞'}\n`;
   }
 
-  // Split if too long
   if (text.length > 4000) {
     const chunks = [];
-    let current = `📊 <b>Key Status</b> (${keyList.length} keys)\n━━━━━━━━━━━━━━━━━━━━\n`;
+    let current = `📊 <b>Key Status</b> (${keyList.length} keys)\n━━━━━━━━━━━━━━━━━━━━━━━━\n`;
     for (const [key, data] of keyList) {
       const expired = now >= (data.expires || 0);
       const status  = expired ? '❌ Expired' : '✅ Active';
@@ -627,15 +739,13 @@ function handleStatusKey(token, chatId, keyArg) {
       current += line;
     }
     if (current) chunks.push(current);
-    for (const chunk of chunks) {
-      tgSend(token, chatId, chunk);
-    }
+    for (const chunk of chunks) tgSend(token, chatId, chunk);
   } else {
     tgSend(token, chatId, text);
   }
 }
 
-// ── Delete key helpers ────────────────────────────────────────────────
+// ── Delete key helpers ─────────────────────────────────────────────────
 function buildDeleteKeyKeyboard(keys, selected, now) {
   const keyboard = [];
   for (const [key, data] of Object.entries(keys)) {
@@ -646,11 +756,9 @@ function buildDeleteKeyKeyboard(keys, selected, now) {
       callback_data: `dk_toggle:${key}`
     }]);
   }
-
-  // Bulk actions
   keyboard.push([
     { text: '🗑 Expired', callback_data: 'dk_sel:expired' },
-    { text: '📭 Unused', callback_data: 'dk_sel:unused' },
+    { text: '� Unused', callback_data: 'dk_sel:unused' },
   ]);
   keyboard.push([
     { text: '✅ All', callback_data: 'dk_sel:all' },
@@ -660,7 +768,6 @@ function buildDeleteKeyKeyboard(keys, selected, now) {
     { text: '💥 Delete Selected', callback_data: 'dk_confirm' },
     { text: '↩️ Cancel', callback_data: 'dk_cancel' },
   ]);
-
   return keyboard;
 }
 
@@ -682,7 +789,6 @@ function handleDeleteKey(token, chatId, fromUser, keyArg) {
     }
     return;
   }
-  // Show interactive picker
   const keys = loadKeys();
   if (!Object.keys(keys).length) {
     tgSend(token, chatId, '📊 <b>No keys found.</b>');
@@ -696,7 +802,7 @@ function handleDeleteKey(token, chatId, fromUser, keyArg) {
   );
 }
 
-// ── Handle redeem ─────────────────────────────────────────────────────
+// ── Handle redeem ──────────────────────────────────────────────────────
 function handleRedeem(token, chatId, fromUser, keyArg) {
   if (!keyArg) {
     tgSend(token, chatId,
@@ -719,7 +825,7 @@ function handleRedeem(token, chatId, fromUser, keyArg) {
   tgSend(token, chatId, result.message);
 }
 
-// ── Genkey wizard helpers ─────────────────────────────────────────────
+// ── Genkey wizard helpers ──────────────────────────────────────────────
 function askGenkeyUsers(token, chatId, duration) {
   tgSendButtons(token, chatId,
     `🔑 <b>Generate Key — Step 2 of 4</b>\n\n` +
@@ -792,7 +898,7 @@ function finalizeGenKey(token, chatId, duration, comboLimit, count, maxUsers) {
     keys.push(key);
   }
 
-  let text = `✅ <b>${keys.length} key(s) generated!</b>\n━━━━━━━━━━━━━━━━━━━━\n`;
+  let text = `✅ <b>${keys.length} key(s) generated!</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n`;
   text += `⏳ Duration: <b>${durLabel(duration)}</b>\n`;
   text += `👥 Max users: <b>${maxUsers || 'Unlimited'}</b>\n`;
   text += `📦 Combo limit: <b>${comboLimit || 'Unlimited'}</b>\n\n`;
@@ -805,11 +911,131 @@ function finalizeGenKey(token, chatId, duration, comboLimit, count, maxUsers) {
   delete genkeyWizard[chatId];
 }
 
-// ── Handle proxy upload ───────────────────────────────────────────────
+// ── Handle /keysystem command ──────────────────────────────────────────
+function handleKeySystemConfig(token, chatId, fromUser, args) {
+  if (!isOwner(fromUser)) {
+    tgSend(token, chatId, '🚫 <b>Owner only command.</b>');
+    return;
+  }
+
+  const api = getKeySystemAPI();
+  const parts = args.trim().split(/\s+/);
+  const subcmd = (parts[0] || '').toLowerCase();
+  const value = parts.slice(1).join(' ').trim();
+
+  if (!subcmd) {
+    // Show current config
+    const status = api.enabled ? '✅ Connected' : '❌ Not configured';
+    const urlDisplay = api.base_url || '<i>not set</i>';
+    const secretDisplay = api.admin_secret ? '***' : '<i>not set</i>';
+    tgSend(token, chatId,
+      `🔗 <b>KeyVault API Config</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `📡 <b>Status:</b> ${status}\n` +
+      `🌐 <b>URL:</b> ${urlDisplay}\n` +
+      `🔐 <b>Secret:</b> ${secretDisplay}\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `<b>Usage:</b>\n` +
+      `  <code>/keysystem url https://your-app.vercel.app</code>\n` +
+      `  <code>/keysystem secret YOUR_ADMIN_SECRET</code>\n` +
+      `  <code>/keysystem status</code> — test connection`
+    );
+    return;
+  }
+
+  if (subcmd === 'url') {
+    if (!value) {
+      tgSend(token, chatId, '❌ Provide a URL: <code>/keysystem url https://...</code>');
+      return;
+    }
+    const cfg = config.loadConfig() || {};
+    cfg.keysystem_url = value.replace(/\/+$/, '');
+    config.saveConfig(cfg);
+    api.reloadConfig();
+    resetKeySystemAPI(); // recreate singleton with new config
+    tgSend(token, chatId,
+      `✅ <b>KeyVault URL set!</b>\n\n` +
+      `🌐 <code>${value}</code>\n\n` +
+      `<i>Use /keysystem status to test the connection.</i>`
+    );
+    return;
+  }
+
+  if (subcmd === 'secret') {
+    if (!value) {
+      tgSend(token, chatId, '❌ Provide the secret: <code>/keysystem secret YOUR_SECRET</code>');
+      return;
+    }
+    const cfg = config.loadConfig() || {};
+    cfg.keysystem_admin_secret = value;
+    config.saveConfig(cfg);
+    api.reloadConfig();
+    resetKeySystemAPI();
+    tgSend(token, chatId,
+      `✅ <b>Admin secret updated!</b>\n\n` +
+      `<i>Use /keysystem status to test the connection.</i>`
+    );
+    return;
+  }
+
+  if (subcmd === 'status') {
+    if (!api.enabled) {
+      tgSend(token, chatId,
+        '❌ <b>KeyVault not configured.</b>\n\n' +
+        'Set the URL first: <code>/keysystem url https://your-app.vercel.app</code>'
+      );
+      return;
+    }
+    (async () => {
+      try {
+        const resp = await axios.get(
+          `${api.base_url}/api/keys/list`,
+          { headers: api._headers(), timeout: 10000 }
+        );
+        if (resp.status === 200) {
+          const keyCount = Array.isArray(resp.data) ? resp.data.length : 0;
+          tgSend(token, chatId,
+            `✅ <b>KeyVault Connected!</b>\n\n` +
+            `📡 ${api.base_url}\n` +
+            `🔑 ${keyCount} key(s) in remote store\n\n` +
+            `<i>Keys generated with /generate_key will now sync to KeyVault.</i>`
+          );
+        } else if (resp.status === 401) {
+          tgSend(token, chatId,
+            '🔐 <b>Authentication failed.</b>\n\n' +
+            'Check your admin secret: <code>/keysystem secret YOUR_SECRET</code>'
+          );
+        } else {
+          tgSend(token, chatId,
+            `⚠️ <b>Unexpected response:</b> HTTP ${resp.status}\n\n` +
+            `<code>${String(resp.data).slice(0, 200)}</code>`
+          );
+        }
+      } catch (e) {
+        tgSend(token, chatId,
+          `❌ <b>Connection failed:</b>\n\n` +
+          `<code>${e.message.slice(0, 200)}</code>\n\n` +
+          `Check the URL: <code>/keysystem url ...</code>`
+        );
+      }
+    })();
+    return;
+  }
+
+  tgSend(token, chatId,
+    '❌ Unknown sub-command.\n\n' +
+    '<b>Usage:</b>\n' +
+    '  <code>/keysystem</code> — show config\n' +
+    '  <code>/keysystem url &lt;URL&gt;</code> — set API URL\n' +
+    '  <code>/keysystem secret &lt;SECRET&gt;</code> — set admin secret\n' +
+    '  <code>/keysystem status</code> — test connection'
+  );
+}
+
+// ── Handle proxy upload ────────────────────────────────────────────────
 async function handleProxyUpload(token, chatId, fromUser, msg) {
   const doc = msg?.document;
   if (doc) {
-    // File upload
     const fileId = doc.file_id;
     const tmpPath = path.join(config.PROXY_DIR, `upload_${Date.now()}.txt`);
     const downloadResult = await tgDownloadFile(token, fileId, tmpPath);
@@ -819,6 +1045,8 @@ async function handleProxyUpload(token, chatId, fromUser, msg) {
       const result = saveProxiesFromLines(lines);
       if (result) {
         geoRotator.reload();
+        clearNoProxyWarning();
+        persistProxies();
         tgSend(token, chatId,
           `✅ <b>Proxy file uploaded!</b>\n\n` +
           `📊 ${lines.length} lines processed\n` +
@@ -833,7 +1061,6 @@ async function handleProxyUpload(token, chatId, fromUser, msg) {
     return;
   }
 
-  // Text-based proxy upload
   const text = msg?.text || '';
   if (!text || text.startsWith('/')) {
     tgSendButtons(token, chatId,
@@ -848,14 +1075,11 @@ async function handleProxyUpload(token, chatId, fromUser, msg) {
     return;
   }
 
-  // Accumulate proxy lines
   if (!proxyAccumulator[chatId]) proxyAccumulator[chatId] = [];
   const lines = text.split('\n');
   for (const line of lines) {
     const normalized = normalizeProxyLine(line);
-    if (normalized) {
-      proxyAccumulator[chatId].push(normalized);
-    }
+    if (normalized) proxyAccumulator[chatId].push(normalized);
   }
 
   const count = proxyAccumulator[chatId].length;
@@ -870,7 +1094,7 @@ async function handleProxyUpload(token, chatId, fromUser, msg) {
   );
 }
 
-// ── Build stop keyboard ───────────────────────────────────────────────
+// ── Build stop keyboard ────────────────────────────────────────────────
 function buildStopKeyboard(includeStopAll = false) {
   const keyboard = [];
   for (const [chatId, evt] of Object.entries(stopEvents)) {
@@ -899,7 +1123,7 @@ function buildStopKeyboard(includeStopAll = false) {
   return [keyboard, activeCount];
 }
 
-// ── Handle stop panel ─────────────────────────────────────────────────
+// ── Handle stop panel ──────────────────────────────────────────────────
 function handleStopPanel(token, chatId, fromUser) {
   if (isOwner(fromUser)) {
     const [kb, count] = buildStopKeyboard(true);
@@ -931,14 +1155,13 @@ function handleStopPanel(token, chatId, fromUser) {
   }
 }
 
-// ── Handle callback query ─────────────────────────────────────────────
+// ── Handle callback query ──────────────────────────────────────────────
 async function handleCallbackQuery(token, cq) {
   const cqId = cq.id;
   const fromUser = cq.from || {};
   const message = cq.message;
   const data = cq.data || '';
 
-  // Always answer callback first
   tgAnswerCallback(token, cqId);
 
   if (!message) return;
@@ -947,7 +1170,7 @@ async function handleCallbackQuery(token, cq) {
 
   console.log(`[BOT] 🔘 callback data=${data} from=${fromUser.id} chat=${chatId}`);
 
-  // ── Admin panel buttons ──────────────────────────────────────────
+  // ── Admin panel buttons ─────────────────────────────────────────────
   if (data === 'admin:genkey') {
     if (!isOwner(fromUser)) return;
     genkeyWizard[chatId] = { step: 'AWAIT_DURATION' };
@@ -1016,13 +1239,19 @@ async function handleCallbackQuery(token, cq) {
     return;
   }
 
+  if (data === 'admin:keysystem') {
+    if (!isOwner(fromUser)) return;
+    handleKeySystemConfig(token, chatId, fromUser, '');
+    return;
+  }
+
   if (data === 'admin:refresh') {
     if (!isOwner(fromUser)) return;
     handleHelp(token, chatId, fromUser);
     return;
   }
 
-  // ── Delete key picker ────────────────────────────────────────────
+  // ── Delete key picker ────────────────────────────────────────────────
   if (data.startsWith('dk_toggle:')) {
     if (!isOwner(fromUser)) return;
     const keyName = data.slice('dk_toggle:'.length);
@@ -1077,7 +1306,7 @@ async function handleCallbackQuery(token, cq) {
     }
     saveKeys(keys);
     tgEditMessage(token, chatId, message.message_id,
-      `🗑 <b>Deleted ${deleted.length} key(s)</b>\n━━━━━━━━━━━━━━━━━━━━\n` +
+      `🗑 <b>Deleted ${deleted.length} key(s)</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n` +
       deleted.map(k => `  🔑 <code>${k}</code>`).join('\n') +
       `\n\n📊 <b>Remaining keys: ${Object.keys(keys).length}</b>`, []);
     delete deleteKeySelection[chatId];
@@ -1094,7 +1323,7 @@ async function handleCallbackQuery(token, cq) {
 
   if (data === 'dk_noop') return;
 
-  // ── Genkey wizard ────────────────────────────────────────────────
+  // ── Genkey wizard ────────────────────────────────────────────────────
   if (data.startsWith('gk_dur:')) {
     if (!isOwner(fromUser)) return;
     const duration = parseInt(data.split(':')[1]);
@@ -1147,7 +1376,7 @@ async function handleCallbackQuery(token, cq) {
     return;
   }
 
-  // ── User menu buttons ────────────────────────────────────────────
+  // ── User menu buttons ────────────────────────────────────────────────
   if (data === 'user:start') {
     if (!checkAccessGate(token, chatId, fromUser)) return;
     handleStart(token, chatId, fromUser);
@@ -1171,7 +1400,7 @@ async function handleCallbackQuery(token, cq) {
     return;
   }
 
-  // ── Stop buttons ─────────────────────────────────────────────────
+  // ── Stop buttons ────────────────────────────────────────────────────
   if (data.startsWith('stop_user:')) {
     const targetId = parseInt(data.split(':')[1]);
     if (!isOwner(fromUser) && targetId !== chatId) {
@@ -1229,7 +1458,7 @@ async function handleCallbackQuery(token, cq) {
     return;
   }
 
-  // ── Level picker ─────────────────────────────────────────────────
+  // ── Level picker ────────────────────────────────────────────────────
   if (data.startsWith('lvl:')) {
     if (!checkAccessGate(token, chatId, fromUser)) return;
     const val = data.slice(4);
@@ -1248,7 +1477,7 @@ async function handleCallbackQuery(token, cq) {
     return;
   }
 
-  // ── Filter picker ────────────────────────────────────────────────
+  // ── Filter picker ───────────────────────────────────────────────────
   if (data.startsWith('flt:')) {
     if (!checkAccessGate(token, chatId, fromUser)) return;
     const val = data.slice(4);
@@ -1269,12 +1498,12 @@ async function handleCallbackQuery(token, cq) {
 
     tgSend(token, chatId,
       `✅ <b>Config saved!</b>\n\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━\n` +
       `  🔑 Hits ID:  <code>${d.hits_id || chatId}</code>\n` +
       `  🎮 Level:    <code>${lvlLabel}</code>\n` +
       `  🔍 Hit type: <code>${cfLabel}</code>\n` +
       `  📦 Limit:    <code>${userLimit} lines</code>\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
       `📂 <b>Upload your combo file to start!</b>\n\n` +
       `<i>Use /reset to change settings.</i>\n\n` +
       `<i>Send your file now ⬇️</i>`
@@ -1282,12 +1511,14 @@ async function handleCallbackQuery(token, cq) {
     return;
   }
 
-  // ── Proxy accumulator buttons ────────────────────────────────────
+  // ── Proxy accumulator buttons ───────────────────────────────────────
   if (data === 'proxy:done') {
     if (!isOwner(fromUser)) return;
     const result = flushProxyAccumulator(chatId, proxyAccumulator, proxyMsgIds);
     if (result) {
       geoRotator.reload();
+      clearNoProxyWarning();
+      persistProxies();
       tgSend(token, chatId,
         `✅ <b>Proxies saved!</b>\n\n📊 ${result.count} lines\n📡 Total: <b>${geoRotator.total}</b>`);
     } else {
@@ -1309,20 +1540,19 @@ async function handleCallbackQuery(token, cq) {
   }
 }
 
-// ── Parse command ─────────────────────────────────────────────────────
+// ── Parse command ──────────────────────────────────────────────────────
 function parseCommand(text) {
   if (!text || !text.startsWith('/')) return ['', text];
   const parts = text.split(/\s+/);
-  let cmd = parts[0].toLowerCase().slice(1); // remove /
+  let cmd = parts[0].toLowerCase().slice(1);
   if (cmd.includes('@')) cmd = cmd.split('@')[0];
   const args = parts.slice(1).join(' ').trim();
   return [cmd, args];
 }
 
-// ── Handle bot update (main message/command router) ──────────────────
+// ── Handle bot update (main message/command router) ───────────────────
 async function handleBotUpdate(token, update) {
   try {
-    // Callback queries
     if (update.callback_query) {
       await handleCallbackQuery(token, update.callback_query);
       return;
@@ -1340,7 +1570,7 @@ async function handleBotUpdate(token, update) {
       console.log(`[BOT] 📩 cmd=${cmd} args=${cmdArgs} from=${fromUser.id} chat=${chatId}`);
     }
 
-    // ── Intercept text replies for genkey wizard ──────────────────
+    // ── Intercept text replies for genkey wizard ──────────────────────
     if (isOwner(fromUser) && genkeyWizard[chatId]) {
       const wiz = genkeyWizard[chatId];
       if (wiz.step === 'AWAIT_DURATION' && text && !text.startsWith('/')) {
@@ -1387,19 +1617,19 @@ async function handleBotUpdate(token, update) {
       }
     }
 
-    // ── /stop ──────────────────────────────────────────────────────
+    // ── /stop ─────────────────────────────────────────────────────────
     if (cmd === 'stop') {
       handleStopPanel(token, chatId, fromUser);
       return;
     }
 
-    // ── /help ──────────────────────────────────────────────────────
+    // ── /help ─────────────────────────────────────────────────────────
     if (cmd === 'help') {
       handleHelp(token, chatId, fromUser);
       return;
     }
 
-    // ── Owner-only commands ────────────────────────────────────────
+    // ── Owner-only commands ───────────────────────────────────────────
     if (cmd === 'generate_key') {
       if (!isOwner(fromUser)) {
         tgSend(token, chatId, '🚫 <b>Owner only command.</b>');
@@ -1454,6 +1684,8 @@ async function handleBotUpdate(token, update) {
         const result = flushProxyAccumulator(chatId, proxyAccumulator, proxyMsgIds);
         if (result) {
           geoRotator.reload();
+          clearNoProxyWarning();
+          persistProxies();
           tgSend(token, chatId,
             `✅ <b>Proxies saved!</b>\n\n📊 ${result.count} lines\n📡 Total: <b>${geoRotator.total}</b>`);
         }
@@ -1485,7 +1717,7 @@ async function handleBotUpdate(token, update) {
           ? coowners.map(uid => `  • <code>${uid}</code>`).join('\n')
           : '  <i>None</i>';
         tgSend(token, chatId,
-          `👥 <b>Co-Owner Management</b>\n\n━━━━━━━━━━━━━━━━━━━━\n📋 <b>Current co-owners:</b>\n${colist}\n━━━━━━━━━━━━━━━━━━━━\n\n<b>Usage:</b>\n<code>/add_coowner 123456789</code> — add a co-owner\n<code>/remove_coowner 123456789</code> — remove a co-owner`);
+          `👥 <b>Co-Owner Management</b>\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📋 <b>Current co-owners:</b>\n${colist}\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n<b>Usage:</b>\n<code>/add_coowner 123456789</code> — add a co-owner\n<code>/remove_coowner 123456789</code> — remove a co-owner`);
         return;
       }
       const coUid = parseInt(cmdArgs);
@@ -1493,7 +1725,7 @@ async function handleBotUpdate(token, update) {
         tgSend(token, chatId, '❌ <b>Invalid ID.</b> Use a numeric Telegram user ID.');
         return;
       }
-      if (coUid === OWNER_ID) {
+      if (coUid === config.getOwnerId()) {
         tgSend(token, chatId, "⚠️ That's already the primary owner ID.");
         return;
       }
@@ -1591,7 +1823,12 @@ async function handleBotUpdate(token, update) {
       return;
     }
 
-    // ── Proxy file upload state ────────────────────────────────────
+    if (cmd === 'keysystem') {
+      handleKeySystemConfig(token, chatId, fromUser, cmdArgs);
+      return;
+    }
+
+    // ── Proxy file upload state ───────────────────────────────────────
     if (botState[chatId] === 'AWAIT_PROXY') {
       if (msg.document) {
         delete proxyMsgIds[chatId];
@@ -1606,6 +1843,8 @@ async function handleBotUpdate(token, update) {
         const result = flushProxyAccumulator(chatId, proxyAccumulator, proxyMsgIds);
         if (result) {
           geoRotator.reload();
+          clearNoProxyWarning();
+          persistProxies();
           tgSend(token, chatId,
             `✅ <b>Proxies saved!</b>\n\n📊 ${result.count} lines\n📡 Total: <b>${geoRotator.total}</b>`);
         }
@@ -1626,13 +1865,13 @@ async function handleBotUpdate(token, update) {
       return;
     }
 
-    // ── /start — always allowed ────────────────────────────────────
+    // ── /start — always allowed ───────────────────────────────────────
     if (cmd === 'start') {
       handleStart(token, chatId, fromUser);
       return;
     }
 
-    // ── /reset — always allowed ────────────────────────────────────
+    // ── /reset — always allowed ───────────────────────────────────────
     if (cmd === 'reset') {
       const keyId = String(fromUser.id || chatId);
       const uname = fromUser.username || '';
@@ -1645,13 +1884,13 @@ async function handleBotUpdate(token, update) {
       return;
     }
 
-    // ── /redeem — always allowed ───────────────────────────────────
+    // ── /redeem — always allowed ──────────────────────────────────────
     if (cmd === 'redeem') {
       handleRedeem(token, chatId, fromUser, cmdArgs);
       return;
     }
 
-    // ── AWAIT_REDEEM_KEY state ─────────────────────────────────────
+    // ── AWAIT_REDEEM_KEY state ────────────────────────────────────────
     if (botState[chatId] === 'AWAIT_REDEEM_KEY') {
       if (text && !text.startsWith('/')) {
         delete botState[chatId];
@@ -1665,10 +1904,10 @@ async function handleBotUpdate(token, update) {
       return;
     }
 
-    // ── Access gate ────────────────────────────────────────────────
+    // ── Access gate ───────────────────────────────────────────────────
     if (!checkAccessGate(token, chatId, fromUser)) return;
 
-    // ── Auto-restore saved profile ─────────────────────────────────
+    // ── Auto-restore saved profile ────────────────────────────────────
     if (!(chatId in botState)) {
       const tgId  = fromUser.id || chatId;
       const uname = fromUser.username || '';
@@ -1734,9 +1973,8 @@ async function handleBotUpdate(token, update) {
   }
 }
 
-// ── Long-polling ──────────────────────────────────────────────────────
+// ── Long-polling ───────────────────────────────────────────────────────
 async function startBotPolling(token) {
-  // Delete any existing webhook to allow polling
   try {
     await axios.post(`https://api.telegram.org/bot${token}/deleteWebhook`, { drop_pending_updates: false });
     console.log('[BOT] Webhook deleted — polling mode active');
@@ -1756,7 +1994,7 @@ async function startBotPolling(token) {
         {
           params: { timeout: 30, offset },
           timeout: 35000,
-          validateStatus: () => true, // Don't throw on non-2xx
+          validateStatus: () => true,
         }
       );
 
@@ -1786,17 +2024,13 @@ async function startBotPolling(token) {
 
       for (const upd of updates) {
         offset = upd.update_id + 1;
-        // Process update asynchronously (don't block polling)
         handleBotUpdate(token, upd).catch(e => {
           console.error('[BOT] Update error:', e.message);
         });
       }
 
     } catch (e) {
-      if (e.code === 'ECONNABORTED' || e.code === 'ETIMEDOUT') {
-        // Long-poll timeout — normal
-        continue;
-      }
+      if (e.code === 'ECONNABORTED' || e.code === 'ETIMEDOUT') continue;
 
       consecutiveErrors++;
       const wait = Math.min(5 * consecutiveErrors, 30);
@@ -1811,9 +2045,9 @@ async function startBotPolling(token) {
   }
 }
 
-// ── Memory watchdog ───────────────────────────────────────────────────
+// ── Memory watchdog ────────────────────────────────────────────────────
 function startMemoryWatchdog() {
-  const RAILWAY_RAM_MB = 512; // Free plan limit
+  const RAILWAY_RAM_MB = 512;
   const interval = setInterval(() => {
     if (config.shutdownEvent.isSet()) {
       clearInterval(interval);
@@ -1822,13 +2056,15 @@ function startMemoryWatchdog() {
 
     const mem = process.memoryUsage();
     const rss = mem.rss / (1024 * 1024);
-    const heapUsed = mem.heapUsed / (1024 * 1024);
     const usedPct = (rss / RAILWAY_RAM_MB) * 100;
+
+    const token = config.getBotToken();
+    const ownerId = config.getOwnerId();
 
     if (usedPct >= 90) {
       console.warn(`[WATCHDOG] 🚨 EMERGENCY — RSS ${rss.toFixed(0)}MB / ${RAILWAY_RAM_MB}MB (${usedPct.toFixed(1)}%) — throttling to 1 thread`);
       global.globalSem = new AsyncSemaphore(1);
-      try { tgSend(BOT_TOKEN, OWNER_ID, `🚨 <b>Server RAM Emergency!</b>\n\nRSS at <b>${rss.toFixed(0)}MB / ${RAILWAY_RAM_MB}MB</b>\nThrottled to 1 checker thread.\n<i>Consider /stop some checkers</i>`); } catch {}
+      try { tgSend(token, ownerId, `🚨 <b>Server RAM Emergency!</b>\n\nRSS at <b>${rss.toFixed(0)}MB / ${RAILWAY_RAM_MB}MB</b>\nThrottled to 1 checker thread.\n<i>Consider /stop some checkers</i>`); } catch {}
     } else if (usedPct >= 80) {
       console.warn(`[WATCHDOG] 🔴 CRITICAL — RSS ${rss.toFixed(0)}MB / ${RAILWAY_RAM_MB}MB (${usedPct.toFixed(1)}%) — throttling to 3 threads`);
       global.globalSem = new AsyncSemaphore(3);
@@ -1837,33 +2073,155 @@ function startMemoryWatchdog() {
       global.globalSem = new AsyncSemaphore(5);
     }
 
-    // Force GC if available
-    if (global.gc && usedPct >= 70) {
-      global.gc();
+    if (global.gc && usedPct >= 70) global.gc();
+
+    // Check liveness — if no activity for 5 minutes, something may be stuck
+    const livenessAge = getLivenessAge();
+    if (livenessAge > 300) {
+      console.warn(`[WATCHDOG] 💓 No liveness touch for ${Math.round(livenessAge)}s — bot may be stuck`);
     }
   }, 8000);
 }
 
-// ── Railway heartbeat ─────────────────────────────────────────────────
+// ── Railway heartbeat ──────────────────────────────────────────────────
 function startRailwayHeartbeat() {
   setInterval(() => {
     if (config.shutdownEvent.isSet()) return;
     const active = Object.values(botState).filter(s => s === 'RUNNING').length;
-    console.log(`[HEARTBEAT] 💓 Bot alive | ${active} active checker(s) | threads: ${MAX_GLOBAL_THREADS}`);
-  }, 300000); // every 5 minutes
+    const proxyCount = geoRotator.total;
+    const pausedCount = Object.keys(_proxyPausedUsers).length;
+    const livenessAge = Math.round(getLivenessAge());
+    console.log(`[HEARTBEAT] 💓 Bot alive | ${active} checker(s) | ${proxyCount} proxies | ${pausedCount} paused | liveness ${livenessAge}s`);
+  }, 300000);
 }
 
-// ══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 // MAIN
-// ══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 async function main() {
   printBanner();
 
-  // ── Signal handling ──────────────────────────────────────────────
+  // ── Handle missing config: setup wizard or wait loop ────────────────
+  let BOT_TOKEN = config.getBotToken();
+  let OWNER_ID  = config.getOwnerId();
+
+  if (!BOT_TOKEN || !OWNER_ID) {
+    if (config.isRailway() || !process.stdin.isTTY) {
+      // Railway / no-TTY mode: wait for env vars
+      console.warn('='.repeat(60));
+      console.warn('⚠️  BOT_TOKEN and/or OWNER_ID not configured!');
+      console.warn('   On Railway/cloud, set these environment variables:');
+      console.warn('     BOT_TOKEN    = your Telegram bot token');
+      console.warn('     OWNER_ID     = your Telegram numeric user ID');
+      console.warn('     OWNER_USERNAME = your Telegram username (optional)');
+      console.warn('     KEYSYSTEM_URL = KeyVault API URL (optional)');
+      console.warn('     KEYSYSTEM_ADMIN_SECRET = KeyVault admin secret (optional)');
+      console.warn('   Bot will wait and retry every 30 seconds...');
+      console.warn('='.repeat(60));
+
+      // Wait loop — keep checking for env vars
+      while (!BOT_TOKEN || !OWNER_ID) {
+        await new Promise(r => setTimeout(r, 30000));
+        const env = config.envConfig();
+        if (env.bot_token && env.owner_id) {
+          BOT_TOKEN = env.bot_token;
+          OWNER_ID = env.owner_id;
+          // Merge into config
+          const cfg = config.loadConfig();
+          cfg.bot_token = BOT_TOKEN;
+          cfg.owner_id = OWNER_ID;
+          config.saveConfig(cfg);
+          console.log('[CONFIG] ✅ Environment variables detected — starting bot!');
+          break;
+        }
+        // Also try KeyVault API
+        try {
+          const api = getKeySystemAPI();
+          if (api && api.enabled) {
+            const remoteCfg = await api.loadState('bot_config');
+            if (remoteCfg?.bot_token && remoteCfg?.owner_id) {
+              BOT_TOKEN = remoteCfg.bot_token;
+              OWNER_ID = remoteCfg.owner_id;
+              const cfg = { ...remoteCfg };
+              config.saveConfig(cfg);
+              console.log('[CONFIG] ✅ KeyVault config detected — starting bot!');
+              break;
+            }
+          }
+        } catch { /* ignore */ }
+        console.log('[CONFIG] Still waiting for BOT_TOKEN and OWNER_ID...');
+      }
+    } else {
+      // Interactive mode: run setup wizard
+      const readline = require('readline');
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+      console.log('\n╔══════════════════════════════════════════════════════════╗');
+      console.log('║        🤖  FIRST-RUN SETUP WIZARD               ║');
+      console.log('╚══════════════════════════════════════════════════════════╝\n');
+      console.log('\x1b[93mNo config.json found — let\'s set up your bot now.\x1b[0m\n');
+
+      // Get bot token
+      BOT_TOKEN = await new Promise(resolve => {
+        function askToken() {
+          rl.question('\x1b[1;37m🔑 Enter your Bot Token (from @BotFather):\x1b[0m\n> ', async (token) => {
+            token = token.trim();
+            if (!token) {
+              console.log('\x1b[91m❌ Token cannot be empty. Try again.\x1b[0m\n');
+              askToken();
+              return;
+            }
+            console.log('\x1b[93m⏳ Validating token...\x1b[0m');
+            const botInfo = await config.validateToken(token);
+            if (botInfo) {
+              console.log(`\x1b[92m✅ Token valid! Bot: ${botInfo.first_name} (@${botInfo.username})\x1b[0m\n`);
+              resolve(token);
+            } else {
+              console.log('\x1b[91m❌ Invalid token or Telegram unreachable. Try again.\x1b[0m\n');
+              askToken();
+            }
+          });
+        }
+        askToken();
+      });
+
+      // Get owner ID
+      OWNER_ID = await new Promise(resolve => {
+        console.log('\x1b[93mℹ️  To find your Telegram ID, message @userinfobot on Telegram.\x1b[0m');
+        rl.question('\n\x1b[1;37m🔍 Enter your Telegram numeric ID (numbers only):\x1b[0m\n> ', (idStr) => {
+          const id = parseInt(idStr.trim());
+          if (isNaN(id)) {
+            console.log('\x1b[91m❌ Must be a number. Using 0 — set it later.\x1b[0m');
+            resolve(0);
+          } else {
+            resolve(id);
+          }
+        });
+      });
+
+      // Get owner username (optional)
+      const ownerUsername = await new Promise(resolve => {
+        rl.question('\n\x1b[1;37m👤 Enter your Telegram username WITHOUT @ (or press Enter to skip):\x1b[0m\n> ', (uname) => {
+          resolve(uname.trim().replace(/^@+/, ''));
+        });
+      });
+
+      rl.close();
+
+      const setupCfg = {
+        bot_token: BOT_TOKEN,
+        owner_id: OWNER_ID,
+        owner_username: ownerUsername,
+      };
+      config.saveConfig(setupCfg);
+      console.log('\n\x1b[1;92m🚀 Setup complete! Starting bot...\x1b[0m\n');
+    }
+  }
+
+  // ── Signal handling ─────────────────────────────────────────────────
   function gracefulShutdown(signum) {
     console.warn(`[MAIN] Received signal ${signum} — shutting down gracefully...`);
     config.shutdownEvent.set();
-    // Set all stop events
     for (const evt of Object.values(stopEvents)) {
       evt.set();
     }
@@ -1871,31 +2229,46 @@ async function main() {
   process.on('SIGTERM', gracefulShutdown);
   process.on('SIGINT', gracefulShutdown);
 
-  // ── Log proxy status ─────────────────────────────────────────────
+  // ── Restore proxies from persistent storage ─────────────────────────
+  await restoreAllProxies();
+  geoRotator.reload(); // reload after restore
+
+  // ── Log proxy status ────────────────────────────────────────────────
   const proxyFileNames = config.getProxyFiles().map(p => path.basename(p));
   console.log(
     `[GEO] Proxy rotator active -> ${geoRotator.currentProxy} ` +
     `(${geoRotator.total} proxies) | Files: ${proxyFileNames.join(', ') || 'none found'}`
   );
 
-  // ── Load saved users ─────────────────────────────────────────────
+  // ── Load saved users ────────────────────────────────────────────────
   loadSavedUsers();
 
-  // ── Start healthcheck server ─────────────────────────────────────
+  // ── Start healthcheck server ────────────────────────────────────────
   const port = process.env.PORT;
   if (port) startHealthcheckServer(parseInt(port));
 
-  // ── Start Telegram bot ───────────────────────────────────────────
+  // ── Start auto-fetch proxy background worker ────────────────────────
+  const stopProxyFetcher = startProxyFetcher(geoRotator, {
+    onProxiesAvailable: () => {
+      resumeProxyPausedUsers(BOT_TOKEN);
+    },
+    touchLiveness: touchLiveness,
+    persistProxies: persistProxies,
+  });
+
+  // ── Start Telegram bot ──────────────────────────────────────────────
   cleanupStaleFiles();
   startBotPolling(BOT_TOKEN);
   tgSetCommands(BOT_TOKEN);
 
-  // ── Start watchdog & heartbeat ───────────────────────────────────
+  // ── Start watchdog & heartbeat ──────────────────────────────────────
   startMemoryWatchdog();
   startRailwayHeartbeat();
 
   console.log('🤖 Bot is running!');
   console.log('Flow: /start → level → hit type → upload file → progress bar → hits sent to your ID');
+  console.log('New commands: /keysystem, /add_coowner, /remove_coowner, /resetconfig, /stopall');
+  console.log('Auto-fetch proxy: ON (30s interval from ' + RAW_PROXY_SOURCES_COUNT + ' source(s))');
   console.log('Press Ctrl+C to stop.\n');
 
   // Keep main thread alive
@@ -1904,13 +2277,15 @@ async function main() {
   }
 }
 
-// ── Auto-restart on crash ─────────────────────────────────────────────
+const RAW_PROXY_SOURCES_COUNT = 1; // for the banner message
+
+// ── Auto-restart on crash ──────────────────────────────────────────────
 (async () => {
   while (true) {
     try {
       config.shutdownEvent.clear();
       await main();
-      break; // clean exit
+      break;
     } catch (e) {
       if (e.message?.includes('SIGINT') || e.message?.includes('SIGTERM')) break;
       console.error(`✘ Unexpected error: ${e.message} — restarting in 5s...`);
