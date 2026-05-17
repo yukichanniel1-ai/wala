@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+__pycache__/
+
+# Data directories
+data/
+proxies/
+
+# Config (contains sensitive token)
+config.json
+
+# Cookie files
+fresh_cookie.txt
+banned_cookies.txt
+
+# Combo files
+data/combos/
+
+# Result files
+data/results/
+
+# Environment
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
